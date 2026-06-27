@@ -389,3 +389,781 @@ The current implementation creates `cl.Buffer` per call. To eliminate this overh
 2. Reuse buffers across SCF iterations (upload only when `dm` changes)
 3. Pipeline AO evaluation (CPU) with matmul (GPU) using events
 4. Move XC functional eval to GPU (PBE kernel already in [kernels.cl](cci:7://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/kernels.cl:0:0-0:0))
+
+---
+
+# USER
+
+OK, now analyse deeply possible performance problems, divide it to two categories
+1) kernels - care especially aboug local memory managment, branching etc. 
+
+I see immediately horrible things
+
+WHAT THE HELL IS THSI CRAP ?!?!?!? 
+``
+        float fac = 1.0f;
+        if (l == 0)      fac = 1.0f;
+        else if (l == 1) fac = 1.0f;
+        else if (l == 2) fac = 3.0f;  // CINTcommon_fac_sp(2) = 3
+        else if (l == 3) fac = 15.0f;
+        else if (l == 4) fac = 105.0f;
+        else if (l == 5) fac = 945.0f;
+        else if (l == 6) fac = 10395.0f;
+        else if (l == 7) fac = 135135.0f;
+`
+this can be just local array!
+
+also thin about how to use group local memory efficiently, you are not using local memroy and tiled desing at all now?
+
+---
+
+2) python harness overhead
+
+- on the fly allocation/deallocation is pretty bad. Once we initialize the system the size of all matrixes is fixed, so within SCF loop we do not need to reallocate matrixes, we do not need to create or destroy buffers
+
+- GPU/CPU transfer is qute costly, we should try to minimize it and do as much work on GPU before we need to download or upload something
+
+- python has huge overhead, loops in python are bad. Can we do instead thing in one numpy array operation 
+
+I see there netest loops
+
+`
+        for k in range(nset):
+            dm_sym = dms[k] + dms[k].conj().T
+            dmtril[k] = _pack_tril_cpu(dm_sym.astype(np.float32))
+            dmtril[k, idx*(idx+1)//2+idx] *= 0.5
+
+        # tmp = dmtril * cderi^T  -> [nset, naux]
+        # vj_packed = tmp * cderi -> [nset, nao_pair]
+        vj_packed = np.zeros((nset, nao_pair), dtype=np.float32)
+        for k in range(nset):
+            tmp = matmul_gpu(dmtril[k:k+1], cderi, transpose_B=True)  # [1, naux]
+            vj_packed[k] = matmul_gpu(tmp, cderi)[0]  # [1, nao_pair] -> [nao_pair]
+
+        # Unpack triangular to full
+        vj = np.zeros((nset, nao, nao), dtype=np.float64)
+        for k in range(nset):
+            vj_full = _unpack_tril_gpu(prg, queue, ctx, vj_packed[k], nao)
+            vj[k] = vj_full.astype(np.float64)
+
+``
+@df_jk.py 
+
+
+``
+ for ip0 in range(0, ngrids, BLK):
+        ip1 = min(ip0 + BLK, ngrids)
+        nblk = ip1 - ip0
+        coords_blk = grids.coords[ip0:ip1]
+        weight_blk = np.ascontiguousarray(grids.weights[ip0:ip1], dtype=np.float64)
+
+        if xctype == 'LDA':
+            ao = ni.eval_ao(mol, coords_blk, deriv=0)  # [nblk, nao] CPU
+
+            ao32 = np.ascontiguousarray(ao, dtype=np.float32)
+            ao_dm = matmul_gpu(ao32, dm32)  # [nblk, nao]
+            rho = np.sum(ao_dm * ao32, axis=1).astype(np.float64)
+
+            exc, vxc = ni.eval_xc_eff(xc_code, rho, deriv=1, xctype='LDA', spin=0)[:2]
+
+            den = rho * weight_blk
+            nelec += float(den.sum())
+            excsum += float(np.dot(den, exc))
+
+            wv = np.ascontiguousarray(weight_blk * vxc, dtype=np.float32)
+            aow = ao32 * wv[:, np.newaxis]  # [nblk, nao]
+            vmat_blk = matmul_gpu(aow, ao32, transpose_A=True)
+            vmat += vmat_blk.astype(np.float64)
+
+        elif xctype == 'GGA':
+            ao = ni.eval_ao(mol, coords_blk, deriv=1)  # [4, nblk, nao] CPU
+
+            ao0_32 = np.ascontiguousarray(ao[0], dtype=np.float32)  # [nblk, nao]
+            ao_dm0 = matmul_gpu(ao0_32, dm32)  # [nblk, nao]
+
+            rho = np.zeros((4, nblk), dtype=np.float64)
+            rho[0] = np.sum(ao_dm0 * ao0_32, axis=1).astype(np.float64)
+
+            for c in range(1, 4):
+                ao_c_32 = np.ascontiguousarray(ao[c], dtype=np.float32)
+                ao_dm_c = matmul_gpu(ao_c_32, dm32)  # [nblk, nao]
+                rho[c] = (np.sum(ao_dm0 * ao_c_32, axis=1) +
+                          np.sum(ao_dm_c * ao0_32, axis=1)).astype(np.float64)
+``
+@xc_grid.py 
+
+I hate this! it is really necessary? Canno we move this also to GPU?
+
+what I hate the most is crating new arrays inside nested loops!!!! THIS IS REAL CRAP!!!!
+
+``
+            for c in range(4):
+                wv[c] = w32 * np.ascontiguousarray(vxc[c], dtype=np.float32)
+            wv[0] *= 0.5
+``
+
+this is not data oriented desing for high-performance numerical code this is some cral like from some stupid web developer without collage degree!!!
+
+do not program now. Spot these crap, and suggest how to correct it and improve it one by one
+
+---
+
+# GLM 5.2
+
+Let me read all the relevant files carefully before giving the analysis.
+
+
+
+
+
+
+
+
+
+
+
+Here's the full analysis. No code changes, just identification and suggested fixes.
+
+---
+
+# Category 1: Kernels ([kernels.cl](cci:7://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/kernels.cl:0:0-0:0))
+
+## 1.1 — `fac` if-else chain (you spotted this)
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/kernels.cl:73-81` and `:254-262` (duplicated in both `eval_gto_sph` and `eval_gto_sph_deriv1`)
+
+**Problem**: 8-branch if-else chain for angular momentum normalization factor. Causes warp divergence. Duplicated in two kernels.
+
+**Fix**: `__constant` array lookup:
+```c
+__constant float CINT_FAC[MAX_L+1] = {1.0f, 1.0f, 3.0f, 15.0f, 105.0f, 945.0f, 10395.0f, 135135.0f};
+float fac = CINT_FAC[l];
+```
+Zero branching, one global→constant read.
+
+## 1.2 — Massive branching for Cartesian-to-spherical conversion
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/kernels.cl:94-183`
+
+**Problem**: Completely different code paths for l=0, l=1, l=2, l=3, l>=4. Each work-item in a workgroup may take a different branch (different `ibas` shells have different `l`). This causes:
+- **Warp divergence**: threads in same warp execute different branches serially
+- **Register pressure**: compiler allocates registers for ALL branches simultaneously, even though only one executes. The l=3 branch alone uses ~10 local variables (`c_xxx` through `c_zzz`, `sqrt3`, `sqrt5`, `sqrt15`). This kills occupancy.
+- **l=3 formulas are wrong** (lines 171-175 use division by `c_yzz`, `c_zzz` which can be zero → NaN)
+
+**Fix**: Precompute a Cartesian-to-spherical transformation matrix `c2s[l]` on host, pass as `__constant` array. Then the kernel just does a small matrix-vector multiply for each shell — uniform control flow, no branching on `l`.
+
+## 1.3 — `eval_gto_sph_deriv1` writes zeros for l>=2
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/kernels.cl:293-304`
+
+**Problem**: For l>=2, all 4 components (val + 3 gradients) are set to zero. This is both a correctness bug and a waste — the kernel still runs through the full primitive contraction loop (lines 239-252) computing `ectr`, `dectr_dx/dy/dz`, then throws them away.
+
+**Note**: These kernels are currently **unused** (AO eval moved to CPU), but they still get compiled, wasting build time and potentially affecting other kernels through shared `#define` constants.
+
+## 1.4 — No local memory in `eval_gto` kernels
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/kernels.cl:39-184`
+
+**Problem**: Each work-item (grid point) independently reads `bas[ibas]`, `atm[atm_id]`, and `env[...]` from global memory for every shell. All 32 threads in a workgroup read the **same** shell data. That's 32x redundant global memory reads.
+
+**Fix**: Load shell metadata into `__local` (or `__constant`) memory cooperatively:
+```c
+__local int s_l, s_nprim, s_nctr, s_ao_off;
+__local float s_rx, s_ry, s_rz;
+if (get_local_id(0) == 0) {
+    s_l = bas[ibas * BAS_SLOTS + ANG_OF];
+    // ... etc
+}
+barrier(CLK_LOCAL_MEM_FENCE);
+```
+Or better: precompute a compact shell info array on host and pass as `__constant`.
+
+## 1.5 — `contract_rho`: O(nao²) per work-item, `dm` in global memory
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/kernels.cl:468-487`
+
+**Problem**: Each grid point reads the **entire** `dm` matrix (nao×nao floats) from global memory. For 8192 grid points, that's 8192 × 576 × 4 = ~18MB of global reads for a 2.3KB matrix. No local memory, no tiling.
+
+**Fix**: Load `dm` into `__local` memory cooperatively (nao=24 → 576 floats → 2.3KB, fits easily in local memory). Or use `__constant` memory (cached, broadcast to all work-items). Then each work-item reads `dm` from fast local/constant memory.
+
+## 1.6 — `contract_rho_grad`: Recomputes `aodm0` twice
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/kernels.cl:516-547`
+
+**Problem**: The kernel has two separate loops over `j`. In the first loop (lines 516-530), it computes `aodm0_j` and `aodm1_j`. In the second loop (lines 533-547), it recomputes `aodm0_j` again (plus `aodm2_j`, `aodm3_j`). This doubles the global memory reads of `ao[0]` and `dm`.
+
+**Fix**: Single loop computing all 4 `aodm` components simultaneously. Also load `dm` into local memory (see 1.5).
+
+## 1.7 — `matmul_tiled`: No register tiling
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/kernels.cl:317-361`
+
+**Problem**: Each thread computes one output element: `sum += Asub[tx][i] * Bsub[i][ty]` for i=0..31. That's 32 FMAs per tile iteration, with 2 local memory reads per FMA. The compute-to-local-memory ratio is 1:2.
+
+**Fix**: Register tiling — each thread computes a small block (e.g., 4×4 or 8×8) of output. This reduces local memory reads by 4-8x while increasing register usage. Classic optimization for tiled GEMM. For TILE=32 with 4×4 register tiles, each thread does 16 FMAs per tile iteration with only 2 local memory reads (one Asub row, one Bsub column).
+
+## 1.8 — `matmul_tiled`: No double buffering
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/kernels.cl:335-355`
+
+**Problem**: Load and compute are strictly sequential:
+```
+load tile t → barrier → compute tile t → barrier → load tile t+1 → ...
+```
+The GPU is idle during the load phase and the load is idle during compute.
+
+**Fix**: Double buffer with 2 local memory tiles:
+```
+load tile 0 into bufA → barrier → 
+  load tile 1 into bufB || compute from bufA → barrier →
+  load tile 2 into bufA || compute from bufB → ...
+```
+
+## 1.9 — `pbe_xc`: Expensive `pow()` calls
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/kernels.cl:578-579, 586-587, 615`
+
+**Problem**: `pow(rho, 1.0f/3.0f)` is called multiple times per grid point. `pow` is a slow transcendental on GPU (~10-20 cycles).
+
+**Fix**: Use `native_powr(rho, 1.0f/3.0f)` (NVIDIA OpenCL extension, ~4 cycles, less accurate). Or precompute `rho13 = native_powr(rho, 0.333333f)` once and reuse. Also `pbe_c` has `pow(rho, 4.0f/3.0f)` which is just `rho13 * rho`.
+
+## 1.10 — `pbe_xc`: Early return causes warp divergence
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/kernels.cl:571-676, 584, 613`
+
+**Problem**: `if (rho < 1e-20f) { ...; return; }` — if some threads in a warp have rho≈0 and others don't, the entire warp executes both paths.
+
+**Fix**: Compute everything unconditionally, then mask: `exc[igrid] = (rho > 1e-20f) ? exc_val : 0.0f;`
+
+## 1.11 — [unpack_tril](cci:1://file:///home/prokophapala/git/pyscf/pyscf/lib/numpy_helper.py:368:0-452:18): Branching for triangular index
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/kernels.cl:819-825`
+
+**Problem**: `if (i >= j) ... else ...` causes warp divergence.
+
+**Fix**: Branchless:
+```c
+int maxi = max(i, j), mini = min(i, j);
+int idx = maxi * (maxi + 1) / 2 + mini;
+full[i * nao + j] = tril[idx];
+```
+
+## 1.12 — Dead/unused kernels still compiled
+
+**Where**: All of [kernels.cl](cci:7://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/kernels.cl:0:0-0:0)
+
+**Problem**: Since AO eval moved to CPU, these kernels are never called: `eval_gto_sph`, `eval_gto_sph_deriv1`, `contract_rho`, `contract_rho_grad`, `pbe_xc`, `scale_ao_gga`, `vxc_mat_gga`, `compute_wv_gga`, `compute_nelec_exc`. They waste compilation time and create maintenance burden.
+
+**Fix**: Either remove them (and keep only `matmul_tiled*`, [unpack_tril](cci:1://file:///home/prokophapala/git/pyscf/pyscf/lib/numpy_helper.py:368:0-452:18), [pack_tril](cci:1://file:///home/prokophapala/git/pyscf/pyscf/lib/numpy_helper.py:327:0-365:18), `reduce_sum`) or move them to a separate file that's only compiled when needed. The `pbe_xc` kernel could be useful later if we move XC eval to GPU.
+
+---
+
+# Category 2: Python harness overhead
+
+## 2.1 — Buffer alloc/dealloc per [matmul_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:17:0-72:39) call
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:54-60`
+
+**Problem**: Every [matmul_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:17:0-72:39) call creates 2-3 `cl.Buffer` objects. For GGA path: 7 matmuls per block × ~5 blocks = ~35 buffer allocations per SCF iteration. `cl.Buffer` creation involves OpenCL runtime calls — expensive.
+
+**Fix**: Preallocate persistent buffers at function entry (or in a class), sized to max block dimensions. Reuse across all blocks and all SCF iterations. The [CLBuffer](cci:2://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/buffers.py:3:0-34:30) class already exists but isn't used.
+
+## 2.2 — `dm32` uploaded to GPU every matmul call
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:55-57` (via `COPY_HOST_PTR`)
+
+**Problem**: `dm32` is identical for every block and every matmul. But [matmul_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:17:0-72:39) creates a new buffer with `COPY_HOST_PTR` each time. For GGA: 7 matmuls/block × 5 blocks = 35 uploads of the same 24×24 matrix.
+
+**Fix**: Upload `dm32` to a persistent `cl.Buffer` once at function entry. Pass as `bufA` or `bufB` to all subsequent matmul calls.
+
+## 2.3 — `np.ascontiguousarray` called repeatedly on same data
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:125, 132, 143, 150, 155`
+
+**Problem**: Inside the block loop, `np.ascontiguousarray(ao[c], dtype=np.float32)` is called for c=0..3, creating a new array each time. `ao[c]` is a float64 slice — this always copies. Then `ao[0]` is converted again at line 125 and again at line 155.
+
+**Fix**: Preallocate a single `ao32` array of shape `(4, BLK, nao)` dtype float32. Fill it once per block: `ao32[:] = ao.astype(np.float32)`. Then use `ao32[c]` views — already contiguous, no copy.
+
+## 2.4 — Python for-loops with array creation inside
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:149-156`
+
+**Problem**:
+```python
+for c in range(4):
+    wv[c] = w32 * np.ascontiguousarray(vxc[c], dtype=np.float32)
+# ...
+for c in range(4):
+    ao_c_32 = np.ascontiguousarray(ao[c], dtype=np.float32)
+    aow += wv[c:c+1].T * ao_c_32
+```
+Two Python loops, each creating 4 temporary arrays. The `aow` accumulation does 4 separate `+=` operations with broadcasting.
+
+**Fix**: Vectorize with a single numpy operation:
+```python
+wv = w32[None, :] * vxc.astype(np.float32)  # (4, nblk) one op
+wv[0] *= 0.5
+aow = (ao32 * wv[:, :, None]).sum(axis=0)  # (nblk, nao) one op
+```
+No Python loop, no temporary arrays per iteration.
+
+## 2.5 — [queue.finish()](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/buffers.py:29:4-30:27) after every matmul
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:72`
+
+**Problem**: [matmul_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:17:0-72:39) calls [queue.finish()](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/buffers.py:29:4-30:27) after every kernel launch. This forces a full CPU-GPU synchronization barrier — CPU blocks until GPU is completely done. No overlap between CPU AO evaluation and GPU computation is possible.
+
+**Fix**: Remove [queue.finish()](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/buffers.py:29:4-30:27) from [matmul_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:17:0-72:39). Only synchronize when actually downloading results that the CPU needs. Use `cl.enqueue_copy` (which is blocking by default) for downloads, or use events for fine-grained sync. The CPU can start computing the next block's AO while the GPU computes the current block's matmul.
+
+## 2.6 — Every matmul result downloaded to CPU
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:70-71`
+
+**Problem**: Every [matmul_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:17:0-72:39) call downloads the result to a numpy array. But `aow` is computed on CPU, then immediately uploaded back to GPU for the vmat matmul. That's a pointless download+upload cycle.
+
+**Fix**: Keep `aow` on GPU. The vmat matmul can read directly from the `aow` buffer. Only download `vmat_blk` (the final result per block).
+
+## 2.7 — [df_jk.py](cci:7://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:0:0-0:0): Python loop over `naux` for unpacking cderi
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:70-72`
+
+**Problem**:
+```python
+for p in range(naux):
+    cderi_full[p] = _unpack_tril_gpu(prg, queue, ctx, cderi[p], nao)
+```
+This is the **worst** performance issue in df_jk. For naux=100, this launches 100 tiny kernels, each with buffer alloc + upload + download + finish + buffer release. That's ~600 OpenCL runtime calls for something that should be one kernel launch.
+
+**Fix**: Write a batched `unpack_tril_batched` kernel that takes `cderi[naux, nao_pair]` and outputs `cderi_full[naux, nao, nao]` in a single launch. Or just unpack on CPU with numpy — `np.tril_indices` + broadcasting would be faster than 100 kernel launches.
+
+## 2.8 — [df_jk.py](cci:7://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:0:0-0:0): cderi uploaded to GPU multiple times
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:59-60, 80-81, 87-89`
+
+**Problem**: In the J path, `cderi` is uploaded twice per nset (once as bufB for `dmtril @ cderi^T`, once as bufB for `tmp @ cderi`). In the K path, `cderi_full` is uploaded twice per nset (as `cderi_2d` and as `cderi_r` — which are the **same data** reshaped). For nao=24, naux=100, that's 4 × 100 × 24 × 24 × 4 = ~2.3MB of redundant uploads per SCF iteration.
+
+**Fix**: Upload cderi/cderi_full once. Reuse the buffer for all matmuls.
+
+## 2.9 — [df_jk.py](cci:7://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:0:0-0:0): K contraction creates huge reshaped contiguous arrays
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:80, 87-88`
+
+**Problem**:
+```python
+cderi_2d = np.ascontiguousarray(cderi_full.reshape(naux * nao, nao))
+buf1_r = np.ascontiguousarray(buf1.transpose(1, 0, 2).reshape(nao, naux * nao))
+cderi_r = np.ascontiguousarray(cderi_full.reshape(naux * nao, nao))
+```
+Three `ascontiguousarray` calls, each copying the full cderi_full tensor. The transpose+reshape creates a new contiguous copy. `cderi_r` is literally the same as `cderi_2d`.
+
+**Fix**: 
+- `cderi_2d` and `cderi_r` are the same — compute once, reuse.
+- Avoid the transpose by using [matmul_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:17:0-72:39) with `transpose_A`/`transpose_B` flags instead of reshaping.
+- Keep `cderi_full` on GPU and use the same buffer for both matmuls.
+
+## 2.10 — [df_jk.py](cci:7://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:0:0-0:0): Python loops over `nset`
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:50-53, 58-60, 64-66, 75-89`
+
+**Problem**: Multiple Python for-loops over `nset`. For nset=1 (typical SCF), this is just overhead. For nset>1 (e.g., TDDFT), it's sequential when it could be batched.
+
+**Fix**: Batch all nset together. [matmul_gpu(dmtril, cderi, transpose_B=True)](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:17:0-72:39) → `[nset, naux]` in one call. [matmul_gpu(tmp, cderi)](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:17:0-72:39) → `[nset, nao_pair]` in one call. The [unpack_tril](cci:1://file:///home/prokophapala/git/pyscf/pyscf/lib/numpy_helper.py:368:0-452:18) can also be batched.
+
+## 2.11 — No CPU/GPU pipelining
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:98-163`
+
+**Problem**: The block loop is strictly sequential:
+```
+CPU: eval_ao → CPU: astype → GPU: matmul → CPU: download → CPU: eval_xc → CPU: wv → GPU: matmul → CPU: download
+```
+No overlap between CPU and GPU. While CPU evaluates AO for block i+1, GPU could be computing matmul for block i.
+
+**Fix**: Double-buffered pipeline:
+1. Start AO eval for block 0 on CPU
+2. Upload block 0 AO to GPU, start matmul
+3. While GPU computes block 0, CPU evaluates AO for block 1
+4. Download block 0 result, upload block 1, start matmul
+5. etc.
+
+This requires removing [queue.finish()](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/buffers.py:29:4-30:27) (see 2.5) and using events for synchronization.
+
+## 2.12 — Array allocations inside the block loop
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:102, 107, 117, 118, 128, 132, 147, 148, 153, 159`
+
+**Problem**: ~12+ numpy array allocations per block iteration:
+- `weight_blk`, `ao32`, `ao_dm`, `rho`, `wv`, `w32`, `aow`, `vmat_blk`, plus 3× `ao_c_32` and 3× `ao_dm_c`
+
+For 5 blocks: ~60 allocations. Python's memory allocator is not designed for this.
+
+**Fix**: Preallocate all arrays before the loop, sized to `BLK × nao`. Overwrite contents each iteration. Only the last block may be smaller — handle with slicing or zero-padding.
+
+## 2.13 — `weight_blk` double conversion
+
+**Where**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:102, 148`
+
+**Problem**: `weight_blk = np.ascontiguousarray(grids.weights[ip0:ip1], dtype=np.float64)` then later `w32 = weight_blk.astype(np.float32)`. Two copies of the same data.
+
+**Fix**: `w32 = grids.weights[ip0:ip1].astype(np.float32)` directly. Keep `weight_blk` as a view (already float64).
+
+---
+
+# Priority ranking
+
+**Critical** (order-of-magnitude slowdowns):
+1. **2.7** — naux Python loop for cderi unpacking (100+ kernel launches)
+2. **2.1 + 2.2** — buffer alloc/dealloc + dm re-upload per matmul (35× per SCF iter)
+3. **2.5** — [queue.finish()](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/buffers.py:29:4-30:27) blocking all CPU/GPU overlap
+4. **2.11** — no pipelining (CPU idle while GPU works, GPU idle while CPU works)
+
+**High** (2-5x slowdowns):
+5. **2.3 + 2.4 + 2.12** — array allocations and Python loops inside block loop
+6. **2.8 + 2.9** — cderi re-uploaded and reshaped multiple times in df_jk
+7. **2.6** — aow downloaded then re-uploaded pointlessly
+
+**Medium** (kernel-level, matters for larger systems):
+8. **1.7** — matmul no register tiling (2-8x kernel speedup possible)
+9. **1.5 + 1.6** — contract_rho dm in global memory (if these kernels get used)
+10. **1.1** — fac if-else chain (easy fix, small gain)
+11. **1.8** — matmul no double buffering (1.5-2x kernel speedup)
+
+**Low** (unused or minor):
+12. **1.2-1.4, 1.9-1.12** — eval_gto and pbe_xc kernels (currently unused)
+13. **1.12** — dead kernels (cleanup)
+
+---
+
+# USER
+
+yes, in general I agree that we should explore approach which exploit gPU paralleism. Instread of lunching 100 small kernels, we pack the data in one big array and run one large kernel which each small progrem is processed by one workgroup, or something like that. This is most important. I think curently we have biggest inefficincy on the side of hraness (together with the reallocation of CPU/memory buffers and unnecessayr sync/finish upload/downlod, that cost a lot!)
+
+plese go over it once more focusin on these issule and making more polished plan what to change and how
+
+---
+
+# GLM 5.2
+
+Let me re-read the current state of all files to make sure the plan is accurate.
+
+Now let me check how these are called from the PySCF side to understand the full call chain.
+
+Here's the polished plan, focused on the harness/launch overhead and GPU parallelism exploitation.
+
+# Polished Plan: Eliminate Harness Overhead and Exploit GPU Parallelism
+
+## Guiding principles
+
+1. **One allocation per SCF run, not per call** — all buffer sizes are fixed once `mol` and `grids` are known
+2. **One upload per changed input, not per kernel launch** — `dm` changes once per SCF iteration, `ao` changes once per block
+3. **One download per final result, not per intermediate** — keep intermediates on GPU
+4. **One kernel launch per logical operation, not per element** — batch over `naux`, `nset`, `nblk` using workgroup-per-problem design
+5. **No [queue.finish()](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/buffers.py:29:4-30:27) except at true data dependencies** — let the queue run asynchronously
+
+## Phase 1: Persistent buffer manager (`CLContext`)
+
+**Problem**: [matmul_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:62:0-116:12) creates+destroys 2-3 `cl.Buffer` per call. [nr_rks_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:64:0-157:30) calls it 7× per block × 5 blocks = 35× per SCF iteration. [df_jk_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:9:0-95:17) calls it 4× per nset + 100× for unpacking. Total: ~200+ buffer alloc/dealloc per SCF iteration.
+
+**Solution**: A `CLContext` class (not to be confused with `cl.Context`) that preallocates all buffers once and reuses them:
+
+```
+class CLWorkspace:
+    '''Persistent GPU workspace. Allocated once, reused across SCF iterations.'''
+    
+    def __init__(self, nao, ngrids_max, naux_max, nset_max, xctype):
+        # Upload-once buffers (change rarely)
+        self.buf_dm      # [nset_max, nao, nao]     — uploaded once per SCF iter
+        self.buf_cderi   # [naux_max, nao_pair]    — uploaded once per SCF run  
+        self.buf_weights # [ngrids_max]            — uploaded once per SCF run
+        
+        # Per-block buffers (overwritten each block)
+        self.buf_ao      # [4, BLK, nao]           — uploaded each block
+        self.buf_ao_dm   # [4, BLK, nao]           — GPU output, stays on GPU
+        self.buf_rho     # [4, BLK]                — GPU output, downloaded for XC
+        self.buf_aow     # [BLK, nao]              — GPU output, stays on GPU
+        self.buf_vmat_blk# [nao, nao]              — GPU output, downloaded per block
+        
+        # DF J/K buffers
+        self.buf_dmtril  # [nset_max, nao_pair]    — CPU compute, upload once
+        self.buf_tmp     # [nset_max, naux_max]    — GPU intermediate
+        self.buf_vj_packed # [nset_max, nao_pair]  — GPU output
+        self.buf_cderi_full # [naux_max, nao, nao] — GPU intermediate (if needed)
+```
+
+**Key**: All buffers are `cl.Buffer` with `READ_WRITE` flags. Upload via `cl.enqueue_copy(queue, buf, host_arr)` (non-blocking). Download only when CPU needs the data.
+
+**File**: [pyscf/OpenCL/buffers.py](cci:7://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/buffers.py:0:0-0:0) — extend [CLBuffer](cci:2://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/buffers.py:3:0-34:30) or replace with `CLWorkspace`
+
+## Phase 2: Remove [queue.finish()](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/buffers.py:29:4-30:27) and minimize sync points
+
+**Problem**: [matmul_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:62:0-116:12) calls [queue.finish()](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/buffers.py:29:4-30:27) at `@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:72`. This blocks the CPU until the GPU is completely idle. Called 35+ times per SCF iteration. Each [finish()](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/buffers.py:29:4-30:27) is a full pipeline stall.
+
+**Solution**: Remove [queue.finish()](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/buffers.py:29:4-30:27) from [matmul_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:62:0-116:12) entirely. The only synchronization needed is:
+- **Before download**: `cl.enqueue_copy(queue, host, buf)` is already blocking — it waits for all prior queued commands to complete. No explicit [finish()](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/buffers.py:29:4-30:27) needed.
+- **Before upload to same buffer**: `cl.enqueue_copy(queue, buf, host)` is also blocking from the host perspective — it enqueues and the queue ordering guarantees correctness.
+
+So the only [finish()](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/buffers.py:29:4-30:27) should be at the very end of [nr_rks_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:64:0-157:30) / [df_jk_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:9:0-95:17) before returning to PySCF, and even that is only needed if PySCF code after the call reads the result arrays (which it does, so keep one final [finish()](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/buffers.py:29:4-30:27)).
+
+**Change in [matmul_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:62:0-116:12)**: Delete line 72 ([queue.finish()](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/buffers.py:29:4-30:27)). When caller provides `bufC`, no download happens — kernel just launches and returns. When caller doesn't provide `bufC`, `cl.enqueue_copy` (line 71) is blocking, so the result is ready.
+
+## Phase 3: Keep intermediates on GPU in [nr_rks_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:64:0-157:30)
+
+**Problem**: Current flow per block (GGA):
+```
+CPU: eval_ao → CPU: astype → GPU: matmul(ao, dm) → CPU: download ao_dm
+CPU: compute rho → CPU: eval_xc → CPU: compute wv → CPU: compute aow
+GPU: matmul(aow, ao, transpose_A) → CPU: download vmat_blk
+```
+That's 2 downloads + 2 uploads per block for intermediates that could stay on GPU.
+
+**Solution**: Two approaches depending on whether we move XC eval to GPU:
+
+### Option A (minimal, keep XC on CPU):
+```
+CPU: eval_ao → upload ao to GPU (once per block)
+GPU: matmul(ao[c], dm) → ao_dm stays on GPU for all c
+GPU: element-wise: rho[c] = sum(ao_dm[c] * ao[c])  ← new kernel, pointwise
+CPU: download rho → CPU: eval_xc → upload wv to GPU
+GPU: element-wise: aow = sum_c ao[c] * wv[c]  ← existing scale_ao_gga kernel
+GPU: matmul(aow, ao[0], transpose_A) → download vmat_blk
+```
+Downloads: 1 (rho) + 1 (vmat_blk) = 2 per block (was 4+).
+Uploads: 1 (ao) + 1 (wv) = 2 per block (was 4+).
+
+### Option B (move XC to GPU, eliminate CPU roundtrip):
+```
+CPU: eval_ao → upload ao to GPU (once per block)
+GPU: matmul(ao[c], dm) → ao_dm on GPU
+GPU: contract_rho_grad kernel → rho on GPU
+GPU: pbe_xc kernel → exc, vxc on GPU
+GPU: compute_wv_gga kernel → wv on GPU
+GPU: scale_ao_gga kernel → aow on GPU
+GPU: matmul(aow, ao[0], transpose_A) → vmat_blk on GPU
+GPU: reduce_sum → nelec, excsum on GPU
+Download: vmat_blk + nelec + excsum (once per block)
+```
+Downloads: 1 per block (vmat_blk) + scalar reduction.
+Uploads: 1 per block (ao).
+**This is the target** — but requires fixing the PBE kernel first.
+
+**For now, implement Option A.** It already eliminates most transfers.
+
+## Phase 4: Batched kernels — one launch instead of N
+
+### 4a: Batched [unpack_tril](cci:1://file:///home/prokophapala/git/pyscf/pyscf/lib/numpy_helper.py:368:0-452:18) (critical for [df_jk_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:9:0-95:17))
+
+**Problem**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:70-72` — Python loop over `naux`, each iteration: buffer alloc + upload + kernel launch + download + finish + buffer release. For naux=100: **600 OpenCL runtime calls**.
+
+**Solution**: New kernel `unpack_tril_batched`:
+```c
+// One workgroup unpacks one (p, i, j) block
+// Global: (round_up(nao, TILE), round_up(nao, TILE), naux)
+// Local: (TILE, TILE, 1)
+__kernel void unpack_tril_batched(
+    __global const float *tril,   // [naux, nao_pair]
+    __global float       *full,   // [naux, nao, nao]
+    int nao, int nao_pair)
+{
+    int p = get_global_id(2);     // which auxiliary index
+    int i = get_global_id(0);     // row
+    int j = get_global_id(1);     // col
+    if (p >= naux || i >= nao || j >= nao) return;
+    
+    int maxi = max(i, j), mini = min(i, j);
+    int idx = p * nao_pair + maxi * (maxi + 1) / 2 + mini;
+    full[p * nao * nao + i * nao + j] = tril[idx];
+}
+```
+**One kernel launch** for all naux matrices. Upload `tril[naux, nao_pair]` once, download `full[naux, nao, nao]` once.
+
+### 4b: Batched [unpack_tril](cci:1://file:///home/prokophapala/git/pyscf/pyscf/lib/numpy_helper.py:368:0-452:18) for J result
+
+Same kernel, different data. `vj_packed[nset, nao_pair]` → `vj[nset, nao, nao]` in one launch. Replace the Python loop at `df_jk.py:64-66`.
+
+### 4c: Batched matmul over nset in [df_jk_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:9:0-95:17)
+
+**Problem**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:58-60` — Python loop over `nset`, each iteration calls [matmul_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:62:0-116:12) twice (alloc + upload + launch + download + finish × 2).
+
+**Solution**: Batch the matmul. [matmul_gpu(dmtril, cderi, transpose_B=True)](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:62:0-116:12) with `dmtril` shape `[nset, nao_pair]` and `cderi` shape `[naux, nao_pair]` → result `[nset, naux]` in one launch. Then [matmul_gpu(tmp, cderi)](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:62:0-116:12) → `[nset, nao_pair]` in one launch. The existing tiled matmul kernel already handles arbitrary M — just pass `M=nset` (typically 1, but the kernel doesn't care).
+
+Actually this already works with the current [matmul_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:62:0-116:12) — just remove the for-loop and pass the full batched arrays. The kernel treats it as a single `[nset, naux]` matmul.
+
+### 4d: Eliminate cderi_full unpacking for K contraction
+
+**Problem**: The K path at `df_jk.py:68-89` unpacks all `naux` triangular matrices to full `[naux, nao, nao]`, then does two huge matmuls with reshaped copies. This is O(naux × nao²) memory and 3 full copies.
+
+**Alternative**: Write a specialized kernel `df_k_contraction` that does the K contraction directly from packed triangular format:
+```
+vk[i,j] = sum_P sum_k cderi[P, pack(i,k)] * dm[k,j] * cderi[P, pack(j,k)]
+```
+One workgroup computes one `(i,j)` pair. Each workgroup iterates over P and k, reading from packed `cderi` directly. No unpacking needed at all.
+
+This is a bigger kernel to write but eliminates:
+- 100 unpack kernel launches
+- `cderi_full` allocation (naux × nao × nao × 4 bytes)
+- 3 `ascontiguousarray` copies
+- 2 huge matmul launches with reshaped arrays
+
+**If this is too complex for now**, the fallback is: unpack on CPU with numpy (faster than 100 GPU kernel launches for small nao), then do the two matmuls on GPU with preallocated buffers.
+
+## Phase 5: Preallocate all CPU arrays in [nr_rks_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:64:0-157:30)
+
+**Problem**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:98-163` — ~12 numpy array allocations per block iteration inside the loop.
+
+**Solution**: Preallocate before the loop:
+```python
+# Before loop:
+ao32_buf   = np.zeros((4, BLK, nao), dtype=np.float32)  # if GGA, else (1, BLK, nao)
+ao_dm_buf  = np.zeros((4, BLK, nao), dtype=np.float32)
+rho_buf    = np.zeros((4, BLK), dtype=np.float64)
+wv_buf     = np.zeros((4, BLK), dtype=np.float32)
+aow_buf    = np.zeros((BLK, nao), dtype=np.float32)
+vmat_blk   = np.zeros((nao, nao), dtype=np.float32)
+w32_buf    = np.zeros(BLK, dtype=np.float32)
+
+# Inside loop: overwrite, never allocate
+ao32_buf[:, :nblk, :] = ao.astype(np.float32)  # one cast, one copy
+# ... use slices [:nblk] everywhere
+```
+
+## Phase 6: Vectorize Python loops in [nr_rks_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:64:0-157:30)
+
+**Problem**: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:149-156` — two Python for-loops, each creating 4 temporary arrays.
+
+**Solution** (already identified in 2.4, here's the concrete form):
+```python
+# Replace lines 147-156 with:
+wv_buf[:, :nblk] = w32_buf[:nblk] * vxc.astype(np.float32)  # (4, nblk) broadcast
+wv_buf[0, :nblk] *= 0.5
+aow_buf[:nblk] = (ao32_buf[:, :nblk] * wv_buf[:, :nblk, None]).sum(axis=0)  # (nblk, nao)
+```
+Two numpy operations instead of 8+ with Python loop overhead.
+
+Similarly for the GGA rho computation (lines 131-135):
+```python
+# Replace for c in range(1,4) loop with:
+ao_dm_buf[1:4] = [matmul_gpu(ao32_buf[c, :nblk], dm_buf) for c in range(1,4)]  # still 3 matmuls but no ascontiguousarray
+rho_buf[0, :nblk] = np.sum(ao_dm_buf[0, :nblk] * ao32_buf[0, :nblk], axis=1)
+rho_buf[1:4, :nblk] = (np.sum(ao_dm_buf[0:1, :nblk] * ao32_buf[1:4, :nblk], axis=(2)) +
+                       np.sum(ao_dm_buf[1:4, :nblk] * ao32_buf[0:1, :nblk], axis=(2))).astype(np.float64)
+```
+Actually the 3 matmuls for ao_dm[1..3] are unavoidable unless we write a custom kernel. But we can at least eliminate the `ascontiguousarray` calls by using preallocated `ao32_buf`.
+
+## Phase 7: Upload `dm` once, reuse across all blocks and matmuls
+
+**Problem**: [matmul_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:62:0-116:12) creates a new buffer with `COPY_HOST_PTR` for `dm32` every call. For GGA: 7 matmuls/block × 5 blocks = 35 uploads of the same 24×24 matrix.
+
+**Solution**: In [nr_rks_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:64:0-157:30), upload `dm32` to a persistent `cl.Buffer` once before the block loop:
+```python
+buf_dm = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, dm32.nbytes, dm32)
+# Pass buf_dm as bufB to every matmul_gpu call
+```
+Same for [df_jk_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:9:0-95:17): upload `cderi` once, pass to all matmul calls.
+
+## Phase 8: Remove `ascontiguousarray` calls
+
+**Problem**: `np.ascontiguousarray(ao[c], dtype=np.float32)` is called 7+ times per block in the GGA path. Each call: check contiguity → allocate new array → copy + cast.
+
+**Solution**: Preallocate `ao32_buf` as float32 C-contiguous. Fill once per block:
+```python
+ao32_buf[:, :nblk, :] = ao  # numpy handles dtype conversion + contiguity in one shot
+```
+Then `ao32_buf[c, :nblk]` is already a contiguous float32 view (since the first axis is indexed with a scalar, the remaining slice is contiguous in the last two dims... actually no, it's a slice of a 3D array so it's not contiguous). 
+
+Better: use `np.ascontiguousarray(ao32_buf[c, :nblk])` once and cache, or restructure `ao32_buf` as 4 separate 2D arrays:
+```python
+ao0_32 = np.zeros((BLK, nao), dtype=np.float32)
+ao1_32 = np.zeros((BLK, nao), dtype=np.float32)
+ao2_32 = np.zeros((BLK, nao), dtype=np.float32)
+ao3_32 = np.zeros((BLK, nao), dtype=np.float32)
+# Fill: ao0_32[:nblk] = ao[0]; ao1_32[:nblk] = ao[1]; etc.
+```
+Each is independently contiguous. No `ascontiguousarray` needed when passing to [matmul_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:62:0-116:12).
+
+## Implementation order (by impact)
+
+| Step | What | Effort | Expected speedup |
+|------|------|--------|-----------------|
+| 1 | Remove [queue.finish()](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/buffers.py:29:4-30:27) from [matmul_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:62:0-116:12) | 1 line | 2-3× (enables async) |
+| 2 | Upload `dm` once, pass buffer to all matmuls | ~10 lines | 1.5× (eliminates 35 re-uploads) |
+| 3 | Batched `unpack_tril_batched` kernel | ~20 lines CL + ~10 lines Python | 10-50× for df_jk K path |
+| 4 | Preallocate all CPU arrays before block loop | ~30 lines | 1.5-2× (eliminates 60 allocs/iter) |
+| 5 | Vectorize wv/aow computation | ~5 lines | 1.2× (eliminates Python loops) |
+| 6 | Keep `ao_dm` on GPU, download only `rho` | ~20 lines + new kernel | 1.5× (eliminates intermediate downloads) |
+| 7 | Batch nset in df_jk (remove for-loops) | ~10 lines | 2× for nset>1 |
+| 8 | Upload cderi once in df_jk | ~10 lines | 1.5× (eliminates re-uploads) |
+| 9 | Persistent `CLWorkspace` across SCF iters | ~50 lines | 1.3× (eliminates all per-call allocs) |
+| 10 | Custom `df_k_contraction` kernel | ~50 lines CL | 5-10× for K path (eliminates unpack+reshape+2 matmuls) |
+
+Steps 1-5 are quick wins with minimal code changes. Steps 6-10 are structural improvements. Step 3 is the single biggest win for [df_jk_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:9:0-95:17).
+
+Shall I start implementing? I'd suggest starting with steps 1-5 (the quick wins), then running the test to verify correctness before moving to the structural changes.
+
+---
+
+# GPT 5.5 High
+
+# Completed
+
+I implemented the OpenCL performance cleanup and followed the read-only backup memory for `@/home/prokophapala/git/pyscf/pyscf/OpenCL-bak:1`.
+
+## What changed
+
+- **Buffer-only GEMM path**: Added [matmul_gpu_buf()](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:17:0-32:15) so callers can launch GEMM directly on existing `cl.Buffer` objects without creating/downloading host arrays `@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:18-33`.
+
+- **Removed global queue stalls**: Replaced per-GEMM [queue.finish()](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/buffers.py:29:4-30:27) with explicit copy wait only when a host result is needed `@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:81-89`.
+
+- **XC harness optimized**:
+  - Uploads `dm` once per [nr_rks_gpu()](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:66:0-160:30).
+  - Preallocates AO, AO-DM, rho, wv, aow, vmat buffers once per call.
+  - Computes `rho` and `aow` on GPU.
+  - Downloads only `rho` for CPU libxc and final `vmat_blk`.
+  - Main implementation: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:114-228`.
+
+- **DF J/K optimized**:
+  - Uploads `cderi` once.
+  - Batches J GEMMs over `nset`.
+  - Uses batched triangular unpack instead of many tiny unpack kernels.
+  - Keeps K-path `cderi_full`, `buf1`, transpose, and final GEMM on GPU.
+  - Main implementation: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:39-115`.
+
+- **New/updated kernels**:
+  - Branchless `unpack_tril`.
+  - `unpack_tril_batched`.
+  - `transpose_k_buf1`.
+  - `contract_rho_lda_from_aodm`.
+  - `contract_rho_gga_from_aodm`.
+  - `scale_aow_lda`.
+  - `scale_aow_gga_split`.
+  - Kernel definitions: `@/home/prokophapala/git/pyscf/pyscf/OpenCL/kernels.cl:810-955`.
+
+## Tests run after major steps
+
+Ran after:
+- **Quick-win harness changes**
+- **Batched triangular unpack**
+- **DF buffer reuse**
+- **XC preallocation**
+- **XC rho/aow GPU kernels**
+
+Final command passed:
+
+```bash
+PYTHONPATH=/home/prokophapala/git/pyscf OMP_NUM_THREADS=1 python3 expamples_prokop/test_opencl.py
+```
+
+Final summary:
+- **Vxc max abs error**: `4.14e-06`
+- **J max abs error**: `4.30e-06`
+- **K max abs error**: `8.42e-06`
+
+These are still within expected float32 precision.
+
+## Sanity checks
+
+- **OpenCL code whitespace check** passed:
+  - `@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:1`
+  - `@/home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:1`
+  - `@/home/prokophapala/git/pyscf/pyscf/OpenCL/kernels.cl:1`
+
+Status: **performance improvements implemented and validated by tests**.

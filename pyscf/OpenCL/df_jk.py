@@ -3,7 +3,7 @@ import pyopencl as cl
 import pyopencl.array as cl_array
 
 from . import get_ctx, get_queue, get_prg, round_up
-from .xc_grid import matmul_gpu, _knl
+from .xc_grid import matmul_gpu, matmul_gpu_buf, _knl
 
 TILE = 32
 
@@ -36,9 +36,12 @@ def df_jk_gpu(dfobj, dm, hermi=0, with_j=True, with_k=True):
         else:
             cderi = np.asarray(feri[:], dtype=np.float32)
 
+    cderi = np.ascontiguousarray(cderi, dtype=np.float32)
     nao_pair = cderi.shape[1]
     naux = cderi.shape[0]
     assert nao_pair == nao * (nao + 1) // 2, f'nao_pair mismatch: {nao_pair} vs {nao*(nao+1)//2}'
+    fbytes = np.dtype(np.float32).itemsize
+    bufCderi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, cderi.nbytes, cderi)
 
     vj = None
     vk = None
@@ -54,39 +57,55 @@ def df_jk_gpu(dfobj, dm, hermi=0, with_j=True, with_k=True):
 
         # tmp = dmtril * cderi^T  -> [nset, naux]
         # vj_packed = tmp * cderi -> [nset, nao_pair]
-        vj_packed = np.zeros((nset, nao_pair), dtype=np.float32)
-        for k in range(nset):
-            tmp = matmul_gpu(dmtril[k:k+1], cderi, transpose_B=True)  # [1, naux]
-            vj_packed[k] = matmul_gpu(tmp, cderi)[0]  # [1, nao_pair] -> [nao_pair]
+        bufDmtril = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, dmtril.nbytes, dmtril)
+        bufTmp = cl.Buffer(ctx, cl.mem_flags.READ_WRITE, nset * naux * fbytes)
+        bufVjPacked = cl.Buffer(ctx, cl.mem_flags.READ_WRITE, nset * nao_pair * fbytes)
+        matmul_gpu_buf(bufDmtril, bufCderi, bufTmp, nset, naux, nao_pair, transpose_B=True)
+        matmul_gpu_buf(bufTmp, bufCderi, bufVjPacked, nset, nao_pair, naux)
 
         # Unpack triangular to full
-        vj = np.zeros((nset, nao, nao), dtype=np.float64)
-        for k in range(nset):
-            vj_full = _unpack_tril_gpu(prg, queue, ctx, vj_packed[k], nao)
-            vj[k] = vj_full.astype(np.float64)
+        vj = _unpack_tril_batched_from_buf_gpu(prg, queue, ctx, bufVjPacked, nset, nao, nao_pair).astype(np.float64)
+        bufDmtril.release()
+        bufTmp.release()
+        bufVjPacked.release()
 
     if with_k:
         # Unpack cderi on GPU
-        cderi_full = np.zeros((naux, nao, nao), dtype=np.float32)
-        for p in range(naux):
-            cderi_full[p] = _unpack_tril_gpu(prg, queue, ctx, cderi[p], nao)
+        bufCderiFull = cl.Buffer(ctx, cl.mem_flags.READ_WRITE, naux * nao * nao * fbytes)
+        _unpack_tril_batched_to_buf_gpu(prg, queue, ctx, bufCderi, bufCderiFull, naux, nao, nao_pair)
 
         vk = np.zeros((nset, nao, nao), dtype=np.float64)
+        vk_tmp = np.empty((nao, nao), dtype=np.float32)
+        bufDm = cl.Buffer(ctx, cl.mem_flags.READ_ONLY, nao * nao * fbytes)
+        bufBuf1 = cl.Buffer(ctx, cl.mem_flags.READ_WRITE, naux * nao * nao * fbytes)
+        bufBuf1R = cl.Buffer(ctx, cl.mem_flags.READ_WRITE, nao * naux * nao * fbytes)
+        bufVk = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, nao * nao * fbytes)
         for k in range(nset):
             dm32 = np.ascontiguousarray(dms[k], dtype=np.float32)
+            cl.enqueue_copy(queue, bufDm, dm32).wait()
 
             # buf1[p, i, k] = sum_j cderi_full[p, i, j] * dm[j, k]
             # Reshape cderi_full [naux, nao, nao] -> [naux*nao, nao], matmul with dm
-            cderi_2d = np.ascontiguousarray(cderi_full.reshape(naux * nao, nao))
-            buf1_2d = matmul_gpu(cderi_2d, dm32)  # [naux*nao, nao]
-            buf1 = buf1_2d.reshape(naux, nao, nao)  # [p, i, k]
+            matmul_gpu_buf(bufCderiFull, bufDm, bufBuf1, naux * nao, nao, nao)
 
             # vk = einsum('ipk,pkj->ij', buf1, cderi_full)
             # buf1_reshaped[i, p*nao+k] = buf1[i, p, k]
             # cderi_reshaped[p*nao+k, j] = cderi_full[p, k, j]
-            buf1_r = np.ascontiguousarray(buf1.transpose(1, 0, 2).reshape(nao, naux * nao))
-            cderi_r = np.ascontiguousarray(cderi_full.reshape(naux * nao, nao))
-            vk[k] = matmul_gpu(buf1_r, cderi_r).astype(np.float64)
+            _knl(prg, 'transpose_k_buf1')(
+                queue, (round_up(nao, TILE), round_up(naux * nao, TILE)), (TILE, TILE),
+                bufBuf1, bufBuf1R,
+                np.int32(naux), np.int32(nao)
+            )
+            matmul_gpu_buf(bufBuf1R, bufCderiFull, bufVk, nao, nao, naux * nao)
+            cl.enqueue_copy(queue, vk_tmp, bufVk).wait()
+            vk[k] = vk_tmp.astype(np.float64)
+        bufCderiFull.release()
+        bufDm.release()
+        bufBuf1.release()
+        bufBuf1R.release()
+        bufVk.release()
+
+    bufCderi.release()
 
     if vj is not None:
         vj = vj.reshape(dm_shape)
@@ -103,17 +122,30 @@ def _pack_tril_cpu(mat):
 
 def _unpack_tril_gpu(prg, queue, ctx, tril, nao):
     '''Unpack triangular packed to full symmetric matrix on GPU.'''
+    return _unpack_tril_batched_gpu(prg, queue, ctx, tril, nao)[0]
+
+def _unpack_tril_batched_gpu(prg, queue, ctx, tril, nao):
     tril_f32 = np.ascontiguousarray(tril, dtype=np.float32)
-    full = np.zeros((nao, nao), dtype=np.float32)
+    if tril_f32.ndim == 1:
+        tril_f32 = tril_f32.reshape(1, -1)
+    nbatch, nao_pair = tril_f32.shape
     bufTril = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, tril_f32.nbytes, tril_f32)
-    bufFull = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, full.nbytes)
-    _knl(prg, 'unpack_tril')(
-        queue, (round_up(nao, TILE), round_up(nao, TILE)), (TILE, TILE),
-        bufTril, bufFull,
-        np.int32(nao)
-    )
-    cl.enqueue_copy(queue, full, bufFull)
-    queue.finish()
+    full = _unpack_tril_batched_from_buf_gpu(prg, queue, ctx, bufTril, nbatch, nao, nao_pair)
     bufTril.release()
+    return full
+
+def _unpack_tril_batched_from_buf_gpu(prg, queue, ctx, bufTril, nbatch, nao, nao_pair):
+    full = np.empty((nbatch, nao, nao), dtype=np.float32)
+    bufFull = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, full.nbytes)
+    _unpack_tril_batched_to_buf_gpu(prg, queue, ctx, bufTril, bufFull, nbatch, nao, nao_pair)
+    cl.enqueue_copy(queue, full, bufFull).wait()
     bufFull.release()
     return full
+
+def _unpack_tril_batched_to_buf_gpu(prg, queue, ctx, bufTril, bufFull, nbatch, nao, nao_pair):
+    _knl(prg, 'unpack_tril_batched')(
+        queue, (round_up(nao, TILE), round_up(nao, TILE), nbatch), (TILE, TILE, 1),
+        bufTril, bufFull,
+        np.int32(nbatch), np.int32(nao), np.int32(nao_pair)
+    )
+    return bufFull

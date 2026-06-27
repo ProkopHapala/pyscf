@@ -816,13 +816,26 @@ __kernel void unpack_tril(
     int j = get_global_id(1);
     if (i >= nao || j >= nao) return;
 
-    int idx;
-    if (i >= j) {
-        idx = i * (i + 1) / 2 + j;
-    } else {
-        idx = j * (j + 1) / 2 + i;
-    }
+    int maxi = max(i, j);
+    int mini = min(i, j);
+    int idx = maxi * (maxi + 1) / 2 + mini;
     full[i * nao + j] = tril[idx];
+}
+
+__kernel void unpack_tril_batched(
+    __global const float *tril,
+    __global float       *full,
+    int nbatch, int nao, int nao_pair)
+{
+    int i = get_global_id(0);
+    int j = get_global_id(1);
+    int p = get_global_id(2);
+    if (p >= nbatch || i >= nao || j >= nao) return;
+
+    int maxi = max(i, j);
+    int mini = min(i, j);
+    int idx = p * nao_pair + maxi * (maxi + 1) / 2 + mini;
+    full[p * nao * nao + i * nao + j] = tril[idx];
 }
 
 // ============================================================
@@ -840,6 +853,105 @@ __kernel void pack_tril(
 
     int idx = i * (i + 1) / 2 + j;
     tril[idx] = full[i * nao + j];
+}
+
+__kernel void transpose_k_buf1(
+    __global const float *buf1,
+    __global float       *buf1_r,
+    int naux, int nao)
+{
+    int i = get_global_id(0);
+    int pk = get_global_id(1);
+    if (i >= nao || pk >= naux * nao) return;
+
+    int p = pk / nao;
+    int k = pk - p * nao;
+    buf1_r[i * naux * nao + pk] = buf1[(p * nao + i) * nao + k];
+}
+
+__kernel void contract_rho_lda_from_aodm(
+    __global const float *ao0,
+    __global const float *aodm0,
+    __global float       *rho,
+    int nao, int ngrids)
+{
+    int g = get_global_id(0);
+    if (g >= ngrids) return;
+
+    float s0 = 0.0f;
+    int base = g * nao;
+    for (int i = 0; i < nao; i++) {
+        s0 += aodm0[base + i] * ao0[base + i];
+    }
+    rho[g] = s0;
+}
+
+__kernel void contract_rho_gga_from_aodm(
+    __global const float *ao0,
+    __global const float *ao1,
+    __global const float *ao2,
+    __global const float *ao3,
+    __global const float *aodm0,
+    __global const float *aodm1,
+    __global const float *aodm2,
+    __global const float *aodm3,
+    __global float       *rho,
+    int nao, int ngrids)
+{
+    int g = get_global_id(0);
+    if (g >= ngrids) return;
+
+    float s0 = 0.0f;
+    float s1 = 0.0f;
+    float s2 = 0.0f;
+    float s3 = 0.0f;
+    int base = g * nao;
+    for (int i = 0; i < nao; i++) {
+        float v0 = ao0[base + i];
+        float v1 = ao1[base + i];
+        float v2 = ao2[base + i];
+        float v3 = ao3[base + i];
+        float d0 = aodm0[base + i];
+        s0 += d0 * v0;
+        s1 += d0 * v1 + aodm1[base + i] * v0;
+        s2 += d0 * v2 + aodm2[base + i] * v0;
+        s3 += d0 * v3 + aodm3[base + i] * v0;
+    }
+    rho[g] = s0;
+    rho[ngrids + g] = s1;
+    rho[2 * ngrids + g] = s2;
+    rho[3 * ngrids + g] = s3;
+}
+
+__kernel void scale_aow_lda(
+    __global const float *ao0,
+    __global const float *wv,
+    __global float       *aow,
+    int nao, int ngrids)
+{
+    int g = get_global_id(0);
+    int i = get_global_id(1);
+    if (g >= ngrids || i >= nao) return;
+
+    int idx = g * nao + i;
+    aow[idx] = ao0[idx] * wv[g];
+}
+
+__kernel void scale_aow_gga_split(
+    __global const float *ao0,
+    __global const float *ao1,
+    __global const float *ao2,
+    __global const float *ao3,
+    __global const float *wv,
+    __global float       *aow,
+    int nao, int ngrids)
+{
+    int g = get_global_id(0);
+    int i = get_global_id(1);
+    if (g >= ngrids || i >= nao) return;
+
+    int idx = g * nao + i;
+    aow[idx] = ao0[idx] * wv[g] + ao1[idx] * wv[ngrids + g] + ao2[idx] * wv[2 * ngrids + g] + ao3[idx] * wv[3 * ngrids + g];
 }
 
 // ============================================================

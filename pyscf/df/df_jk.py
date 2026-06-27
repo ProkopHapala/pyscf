@@ -279,6 +279,25 @@ class _DFHF:
 
 def get_jk(dfobj, dm, hermi=0, with_j=True, with_k=True, direct_scf_tol=1e-13):
     assert (with_j or with_k)
+    backend = getattr(dfobj, 'backend', 1)  # 1=CPU, 2=GPU, 3=both
+    if backend & 2:
+        from pyscf.OpenCL.df_jk import df_jk_gpu
+        vj_gpu, vk_gpu = df_jk_gpu(dfobj, dm, hermi, with_j, with_k)
+    if backend & 1:
+        vj_cpu, vk_cpu = _get_jk_cpu(dfobj, dm, hermi, with_j, with_k, direct_scf_tol)
+    if backend == 3:
+        if vj_cpu is not None and vj_gpu is not None:
+            logger.info(dfobj, 'GPU/CPU J max discrepancy: %.2e', numpy.abs(vj_cpu - vj_gpu).max())
+        if vk_cpu is not None and vk_gpu is not None:
+            logger.info(dfobj, 'GPU/CPU K max discrepancy: %.2e', numpy.abs(vk_cpu - vk_gpu).max())
+        return vj_cpu, vk_cpu
+    elif backend == 2:
+        return vj_gpu, vk_gpu
+    return vj_cpu, vk_cpu
+
+
+def _get_jk_cpu(dfobj, dm, hermi=0, with_j=True, with_k=True, direct_scf_tol=1e-13):
+    assert (with_j or with_k)
     if (not with_k and not dfobj.mol.incore_anyway and
         # 3-center integral tensor is not initialized
         dfobj._cderi is None):

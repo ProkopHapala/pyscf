@@ -74,11 +74,24 @@ def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
     ground_state = (isinstance(dm, numpy.ndarray) and dm.ndim == 2)
 
     ni = ks._numint
+    backend = getattr(ks, 'backend', 1)  # 1=CPU, 2=GPU, 3=both
     if hermi == 2:  # because rho = 0
         n, exc, vxc = 0, 0, 0
     else:
         max_memory = ks.max_memory - lib.current_memory()[0]
-        n, exc, vxc = ni.nr_rks(mol, ks.grids, ks.xc, dm, max_memory=max_memory)
+        if backend & 2:
+            from pyscf.OpenCL.xc_grid import nr_rks_gpu
+            n_gpu, exc_gpu, vxc_gpu = nr_rks_gpu(mol, ks.grids, ks.xc, dm, max_memory=max_memory)
+        if backend & 1:
+            n, exc, vxc = ni.nr_rks(mol, ks.grids, ks.xc, dm, max_memory=max_memory)
+        if backend == 3:
+            err_n = abs(n - n_gpu) / max(abs(n), 1e-10)
+            err_exc = abs(exc - exc_gpu) / max(abs(exc), 1e-10)
+            err_vxc = numpy.abs(vxc - vxc_gpu).max()
+            logger.info(ks, 'GPU/CPU comparison: nelec_err=%.2e exc_err=%.2e vxc_max_err=%.2e',
+                        err_n, err_exc, err_vxc)
+        elif backend == 2:
+            n, exc, vxc = n_gpu, exc_gpu, vxc_gpu
         logger.debug(ks, 'nelec by numeric integration = %s', n)
         if ks.do_nlc():
             if ni.libxc.is_nlc(ks.xc):
@@ -325,10 +338,11 @@ class KohnShamDFT:
     -76.415443079840458
     '''
 
-    _keys = {'xc', 'nlc', 'grids', 'disp', 'nlcgrids', 'small_rho_cutoff'}
+    _keys = {'xc', 'nlc', 'grids', 'disp', 'nlcgrids', 'small_rho_cutoff', 'backend'}
 
     # Use rho to filter grids
     small_rho_cutoff = getattr(__config__, 'dft_rks_RKS_small_rho_cutoff', 0)
+    backend = 1  # 1=CPU, 2=GPU(OpenCL), 3=both(compare)
 
     def __init__(self, xc='LDA,VWN'):
         # By default, self.nlc = '' and self.disp = None

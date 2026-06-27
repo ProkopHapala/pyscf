@@ -88,3 +88,4 @@ tmp/
 # mypy
 .mypy_cache/
 
+debug/

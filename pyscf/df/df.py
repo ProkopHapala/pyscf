@@ -98,7 +98,7 @@ class DF(lib.StreamObject):
     _compatible_format = getattr(__config__, 'df_df_DF_compatible_format', False)
     _dataname = 'j3c'
 
-    _keys = {'mol', 'auxmol'}
+    _keys = {'mol', 'auxmol', 'backend'}
 
     def __init__(self, mol, auxbasis=None):
         self.mol = mol
@@ -116,6 +116,7 @@ class DF(lib.StreamObject):
         self._cderi = None
         self._vjopt = None
         self._rsh_df = {}  # Range separated Coulomb DF objects
+        self.backend = 1  # 1=CPU, 2=GPU(OpenCL), 3=both(compare)
 
     __getstate__, __setstate__ = lib.generate_pickle_methods(
             excludes=('_cderi_to_save', '_cderi', '_vjopt', '_rsh_df'),

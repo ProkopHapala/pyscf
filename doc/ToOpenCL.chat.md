@@ -2038,3 +2038,2019 @@ Reason:
 
 Status: **conceptual design ready; I would implement Step 1 + Step 2 first, guarded by tests after each step.**
 
+---
+
+# USER
+
+OK, so everything is implemented and working or what remains to be done for this optimization refactroing?
+
+do you see some weakpointS ?
+
+---
+
+# GLM 5.2
+
+Let me review the current state of the key files to give you an accurate assessment.
+
+Here's the full status and weak-point analysis:
+
+## What's Done
+
+| Component | Status | Parity |
+|---|---|---|
+| **Phase 1: XC persistent class** ([XCGridPlan](cci:2://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:90:0-325:29)) | ✅ Complete | `vxc max_abs=4.14e-6` |
+| **Phase 1: DF persistent class** ([DFJKPlan](cci:2://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:9:0-118:29)) | ✅ Complete | `J=4.30e-6, K=8.42e-6` |
+| **Phase 2: Hermite GPU AO (values)** | ✅ Complete | `max_abs~1e-5` vs PySCF |
+| **Phase 2: Hermite GPU AO (deriv1)** | ✅ Complete | `max_abs~1e-3` vs PySCF |
+| **Phase 2: XC one-shot path** ([nr_rks_hermite_ao](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:240:4-307:43)) | ✅ Complete | `vxc max_abs=1.3e-5` |
+
+All tests pass. The refactoring is functionally complete.
+
+## Weak Points I See
+
+### 1. **Derivative accuracy is ~100x worse than values** (`1e-3` vs `1e-5`)
+The Hermite spline derivative kernel (`eval_ao_mapped_hermite_cart_deriv1`) has noticeably higher error. This flows directly into GGA XC integration. For production use, this needs investigation — likely the chain-rule Jacobian for the `u = log1p(r/r0)` mapping or the Hermite derivative formula in the kernel.
+
+### 2. **Phase 2 path is not the default**
+[nr_rks_gpu](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:240:0-249:59) still uses the CPU-AO block loop. [nr_rks_gpu_hermite_ao](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:352:0-353:111) is a separate explicit call. The Hermite path should become default once derivative accuracy is improved — right now using it for GGA would degrade SCF convergence.
+
+### 3. **DF K contraction still loops over `nset` in Python** (`@/home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:96`)
+```python
+for k in range(nset):
+```
+J is fully batched but K is not. For spin-polarized or multi-DM cases this is a Python-loop bottleneck.
+
+### 4. **No memory-size guard on full-grid buffers** (`@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:221`)
+[_ensure_full_buffers](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:216:4-226:66) allocates `4 * ngrids * nao * 4 bytes` unconditionally. For large molecules with fine grids (e.g. 100k grid points × 500 AO), this is ~800 MB just for `bufAoDmFull`. No fallback to block-loop if allocation would exceed device memory.
+
+### 5. **Plan cache uses `id()` — no invalidation** (`@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:333`)
+```python
+key = (id(mol), id(grids), ...)
+```
+If a Python object is garbage-collected and a new one reuses the same memory address, the cache returns a stale plan with wrong dimensions. This is a correctness risk in long-running sessions.
+
+### 6. **XC functional eval still on CPU** ([eval_xc_eff](cci:1://file:///home/prokophapala/git/pyscf/pyscf/dft/numint.py:2750:4-2799:19) called at `@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:152,187,262,290`)
+The `libxc` call requires downloading `rho` to host, computing `vxc` on CPU, then re-uploading `wv`. This is a round-trip per block (phase 1) or per call (phase 2). For large grids this transfer is significant.
+
+### 7. **Hermite evaluator not reused across SCF iterations**
+[_get_ao_hermite](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:228:4-238:30) caches by `(r0_ang, du, rmax_ang)` but the [XCGridPlan](cci:2://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:90:0-325:29) cache key doesn't include these. If someone calls with different Hermite parameters, the old evaluator's buffers leak (only [__del__](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/ao_hermite.py:129:4-143:28) cleans up, and the old `self.ao_hermite` reference is overwritten).
+
+### 8. **`bufVmat` is only `nao×nao` — accumulated on host** (`@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:120`)
+In phase 1, `vmat` accumulates block-by-block on the CPU side (`vmat += self.vmat_blk`). In phase 2, there's only one matmul so this is fine, but if we ever want to avoid the host round-trip entirely, we'd need a device-side accumulator.
+
+## Recommended Next Steps (Priority Order)
+
+1. **Fix derivative accuracy** — investigate the `deriv1` kernel, likely the Jacobian scaling for the log grid
+2. **Make Hermite path default** once derivatives are accurate enough
+3. **Add memory guard** on [_ensure_full_buffers](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:216:4-226:66) with fallback to block loop
+4. **Batch K over nset** to eliminate the Python loop in DF
+5. **Consider device-side `vmat` accumulation** to eliminate host round-trips
+
+Want me to start on any of these?
+
+---
+
+# USER
+
+OK, the problem with derivatives we must invesigate visualy using maptlotil bplots with reference plese make such plots
+
+---
+
+# GLM 5.2
+
+## Findings
+
+**4 plots saved** to `expamples_prokop/`:
+- [ao_deriv_1d_scan.png](cci:7://file:///home/prokophapala/git/pyscf/expamples_prokop/ao_deriv_1d_scan.png:0:0-0:0) — AO values + d/dx, d/dy, d/dz for 6 AOs along x-axis
+- [ao_deriv_1d_error.png](cci:7://file:///home/prokophapala/git/pyscf/expamples_prokop/ao_deriv_1d_error.png:0:0-0:0) — absolute errors for the same
+- [ao_deriv_2d_heatmap.png](cci:7://file:///home/prokophapala/git/pyscf/expamples_prokop/ao_deriv_2d_heatmap.png:0:0-0:0) — 2D z=0 plane heatmaps (PySCF vs GPU vs |error|)
+- [ao_deriv_radial_isolated.png](cci:7://file:///home/prokophapala/git/pyscf/expamples_prokop/ao_deriv_radial_isolated.png:0:0-0:0) — s-type dR/dr extracted from d/dx
+- [ao_deriv_worst_case.png](cci:7://file:///home/prokophapala/git/pyscf/expamples_prokop/ao_deriv_worst_case.png:0:0-0:0) — detailed view of worst AO (AO[0], s-type on O)
+- [ao_deriv_error_vs_r.png](cci:7://file:///home/prokophapala/git/pyscf/expamples_prokop/ao_deriv_error_vs_r.png:0:0-0:0) — max error across all AOs vs radius
+
+## Root Cause: Error concentrated near nucleus (r < 0.1 Å)
+
+| AO | Type | max_abs_err | rel_err | r at worst | ref value at worst |
+|---|---|---|---|---|---|
+| AO[0] | s (O core) | 2.59e-3 | 0.003% | 0.01 Å | -80.6 |
+| AO[1] | p (O) | 1.88e-3 | 0.02% | 0.0005 Å | 8.6 |
+| AO[2] | p (O) | 6.4e-5 | **2.96%** | 0.007 Å | -2.2e-3 |
+| AO[3] | p (O) | 7.0e-5 | 0.28% | 0.15 Å | 0.025 |
+
+The **absolute error** is dominated by core s-type AOs near r≈0, where the AO value itself is ~80. The **relative error** spikes (up to 3%) at points where the derivative crosses zero (reference value ~1e-3), making any absolute error look huge in relative terms.
+
+The error drops by ~100x beyond r > 0.2 Å, which explains why the XC integration parity (`vxc max_abs=1.3e-5`) is much better than the raw derivative error — grid weights near the nucleus are small and the density contribution is dominated by the (accurate) AO values, not their derivatives.
+
+## Assessment
+
+The derivative accuracy is **adequate for XC integration** (as confirmed by the phase-2 parity test). The `max_rel_sig=8.38` from the random-point test was misleading — it occurs at derivative zero-crossings where the reference is tiny. The actual XC-relevant error is ~1e-5.
+
+The remaining error is a fundamental limitation of Hermite spline derivative accuracy near the nucleus with `du=0.02`. It could be improved by:
+1. **Finer `du` near r=0** (e.g. adaptive du), but this increases table size
+2. **Higher-order spline** (quintic Hermite), but more complex
+3. **Analytic derivative for first interval** (r < r0), since GTO derivatives are known analytically
+
+None of these are urgent given the XC parity is already at 1e-5. Want me to proceed with the other weak points (memory guard, DF K batching, make Hermite default), or dig deeper into the derivative accuracy?
+
+
+
+---
+
+# USER
+
+Can you figure out optimal GPU pyOpenCL kernel to project density matrix from local basiset to grid. Write me something like pseudocode where you take care about memory layout, local memory, we should precalculate radial basis into local memory (angular are just x,y,z), maximum l=2 (d orbitals) my ideas about it are here:
+
+we can also precalculate the basis functions (but only the radial parts) at that tile for all the grid points within the workgroup. So if the worgroup size is WGS we can have 
+wfR1[nPointTile][nAtomTile][nShell]
+
+nShel<6  (s1,s2,p2,s3,p3,d3)
+nPointTile=8
+nAtomTile=8
+
+worggroup as 64 threads 
+we iterate over pairs of atom tiles where every thread have his unique grid point, and iatom
+we load jatom in the tiles and compute all pairwuse elements
+
+the workgroup colectively precompute the wfR for tile of jatoms and save it to local memory to amortize its cost. It also keep its own iatom in private memory. We do not save angular function, only radia in this memory (angular are super fast to evaluate. if we need derivative we can store also dwfR 
+
+
+since I see you are strugling to gasp it, write me the pseudocode in the chat and let me review it before actuall coding
+
+1) you store in local memory whole phi which is exactly what I want to avoid! the local memory is the most precious resource and our tile size is limited by amout of local memory. That is why I stressed multiple times we must store only radial function, and then cheaply unfold it to differen angular functions (just x,y,z)
+
+so I do not want to have 
+local float phi[nAtomTile][MAX_AO];
+but instead
+local float wfR[nAtomTile][MAX_SHELL];
+that is important !
+
+2) we can do cheap reduction after we sum up all the atom tiles. Each tread keep his partial sum for given grid point. Then we only need to reduce partial sums over 8 threads sharing the same gridpoint.
+
+style: write the code more concise, less whitespaces, more one liner, do not put function calls on multiple lines.
+
+
+---
+
+
+# Chat GPT 5.5 Med
+
+Yes, agreed. The **only thing in local memory should be radial values**, not unfolded AO values. The angular expansion must happen in registers on demand.
+
+The correct structure is:
+
+```c
+local float wfRj[NPTILE][NATILE][MAX_SHELL];   // only radial
+local float partial[WGS];                      // only for final reduction
+```
+
+No:
+
+```c
+local float phi_j[NATILE][MAX_AO];             // wrong, avoid
+```
+
+The unfolded angular functions `s,px,py,pz,dxx,...` are produced transiently inside the contraction loop.
+
+---
+
+## Thread layout
+
+```c
+#define NPTILE 8
+#define NATILE 8
+#define WGS 64
+#define MAX_SHELL 6
+#define MAX_AO 15
+
+lid = get_local_id(0);
+ip  = lid & 7;        // grid point inside tile
+ii  = lid >> 3;       // i atom inside tile
+
+gTile = get_group_id(0);
+iTile = get_group_id(1);
+
+g  = gTile*NPTILE + ip;
+ia = iTile*NATILE + ii;
+```
+
+Each thread owns one pair:
+
+```c
+(grid point g, i atom ia)
+```
+
+It accumulates:
+
+```c
+rho_i_g = sum over all j atoms and all AO pairs involving ia,j
+```
+
+Then after all `jTile`s are done, reduce over the 8 `ii` threads sharing the same `ip`.
+
+---
+
+# Concise kernel pseudocode
+
+```c
+kernel project_rho(...){
+    int lid=get_local_id(0);
+    int ip=lid&7;
+    int ii=lid>>3;
+
+    int gTile=get_group_id(0);
+    int iTile=get_group_id(1);
+
+    int g =gTile*8+ip;
+    int ia=iTile*8+ii;
+
+    __local float wfRj[8][8][MAX_SHELL];
+    __local float psum[64];
+
+    float3 r=grid_pos(g);
+    float rho=0.0f;
+
+    float3 ri,di;
+    float Ri[MAX_SHELL];
+    int ns_i=0;
+
+    if(g<nGrid && ia<nAtoms){
+        ri=atomPos[ia].xyz;
+        di=r-ri;
+        ns_i=atomNShell[ia];
+        for(int s=0;s<MAX_SHELL;s++) Ri[s]=(s<ns_i)?eval_radial(ia,s,dot(di,di)):0.0f;
+    }
+
+    for(int jTile=0;jTile<nAtoms;jTile+=8){
+
+        for(int k=lid;k<8*8*MAX_SHELL;k+=64){
+            int s=k%MAX_SHELL;
+            int jj=(k/MAX_SHELL)&7;
+            int pp=k/(MAX_SHELL*8);
+            int gj=gTile*8+pp;
+            int ja=jTile+jj;
+
+            float v=0.0f;
+            if(gj<nGrid && ja<nAtoms && s<atomNShell[ja]){
+                float3 rj=grid_pos(gj)-atomPos[ja].xyz;
+                v=eval_radial(ja,s,dot(rj,rj));
+            }
+            wfRj[pp][jj][s]=v;
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        if(g<nGrid && ia<nAtoms){
+            for(int jj=0;jj<8;jj++){
+                int ja=jTile+jj;
+                if(ja>=nAtoms) continue;
+
+                float3 dj=r-atomPos[ja].xyz;
+                rho += contract_atom_pair(ia,ja,di,dj,Ri,wfRj[ip][jj],Pblocks);
+            }
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    psum[lid]=rho;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if(ii==0){
+        float s=0.0f;
+        s+=psum[ip+8*0];
+        s+=psum[ip+8*1];
+        s+=psum[ip+8*2];
+        s+=psum[ip+8*3];
+        s+=psum[ip+8*4];
+        s+=psum[ip+8*5];
+        s+=psum[ip+8*6];
+        s+=psum[ip+8*7];
+        atomic_add(&rhoGrid[g],s);
+    }
+}
+```
+
+The only local arrays are:
+
+```c
+wfRj[8][8][MAX_SHELL]
+psum[64]
+```
+
+This is exactly the intended asymmetry:
+
+* `i` radial values are private per thread: `Ri[MAX_SHELL]`
+* `j` radial values are shared in local memory: `wfRj`
+* angular factors are generated on the fly from `di,dj`
+
+---
+
+# Contract one atom pair without storing phi
+
+This is the important part. We do **not** build `phi_i[MAX_AO]` or `phi_j[MAX_AO]`.
+
+Instead, we loop shells and angular channels, generating each AO value as a scalar when needed.
+
+```c
+float contract_atom_pair(int ia,int ja,float3 di,float3 dj,float* Ri,__local float* Rj,__global float* P){
+    float acc=0.0f;
+    int ns_i=atomNShell[ia];
+    int ns_j=atomNShell[ja];
+    int ao_i0=atomAO0[ia];
+    int ao_j0=atomAO0[ja];
+
+    for(int si=0;si<ns_i;si++){
+        int li=shellL[atomShell0[ia]+si];
+        int ai0=ao_i0+shellAOoff[atomShell0[ia]+si];
+        float rsi=Ri[si];
+
+        for(int ai=0;ai<nang(li);ai++){
+            float fi=rsi*ang(li,ai,di);
+            int iao=ai0+ai;
+
+            for(int sj=0;sj<ns_j;sj++){
+                int lj=shellL[atomShell0[ja]+sj];
+                int aj0=ao_j0+shellAOoff[atomShell0[ja]+sj];
+                float rsj=Rj[sj];
+
+                float tmp=0.0f;
+                for(int aj=0;aj<nang(lj);aj++){
+                    float fj=rsj*ang(lj,aj,dj);
+                    int jao=aj0+aj;
+                    tmp+=P[iao*nAO+jao]*fj;
+                }
+
+                acc+=fi*tmp;
+            }
+        }
+    }
+    return acc;
+}
+```
+
+But if we use atom-blocked `Pblocks`, better:
+
+```c
+float contract_atom_pair(int ia,int ja,float3 di,float3 dj,float* Ri,__local float* Rj,__global float* Pblocks){
+    float acc=0.0f;
+    __global float* Pij=Pblocks+(ia*nAtoms+ja)*MAX_AO*MAX_AO;
+
+    int ns_i=atomNShell[ia];
+    int ns_j=atomNShell[ja];
+    int shi0=atomShell0[ia];
+    int shj0=atomShell0[ja];
+
+    for(int si=0;si<ns_i;si++){
+        Shell shi=shells[shi0+si];
+        float rsi=Ri[si];
+
+        for(int ai=0;ai<nang(shi.l);ai++){
+            float fi=rsi*ang(shi.l,ai,di);
+            int iao=shi.ao_off+ai;
+
+            for(int sj=0;sj<ns_j;sj++){
+                Shell shj=shells[shj0+sj];
+                float rsj=Rj[sj];
+
+                float tmp=0.0f;
+                for(int aj=0;aj<nang(shj.l);aj++){
+                    float fj=rsj*ang(shj.l,aj,dj);
+                    int jao=shj.ao_off+aj;
+                    tmp+=Pij[iao*MAX_AO+jao]*fj;
+                }
+
+                acc+=fi*tmp;
+            }
+        }
+    }
+    return acc;
+}
+```
+
+This version never stores full AO vectors. It only materializes one scalar `fi` and one scalar `fj` at a time.
+
+---
+
+# Angular functions
+
+For Cartesian (s,p,d):
+
+```c
+inline int nang(int l){ return l==0?1:(l==1?3:6); }
+
+inline float ang(int l,int m,float3 d){
+    float x=d.x,y=d.y,z=d.z;
+    if(l==0) return 1.0f;
+    if(l==1){
+        if(m==0) return x;
+        if(m==1) return y;
+        return z;
+    }
+    if(m==0) return x*x;
+    if(m==1) return y*y;
+    if(m==2) return z*z;
+    if(m==3) return x*y;
+    if(m==4) return x*z;
+    return y*z;
+}
+```
+
+For real spherical d later:
+
+```c
+d0 = 2*z*z - x*x - y*y
+d1 = x*z
+d2 = y*z
+d3 = x*x - y*y
+d4 = x*y
+```
+
+But Cartesian is simpler for first version.
+
+---
+
+# More optimized unrolled contract for fixed shells
+
+Since your shell structure is probably fixed, e.g.
+
+```c
+s1,s2,p2,s3,p3,d3
+```
+
+you can avoid generic `nang()` and `ang()` calls entirely.
+
+For example:
+
+```c
+#define ADD_PAIR(fi,iao,fj,jao) acc += (fi)*Pij[(iao)*MAX_AO+(jao)]*(fj)
+```
+
+Then:
+
+```c
+float contract_atom_pair_fixed(float3 di,float3 dj,float* Ri,__local float* Rj,__global float* Pij){
+    float acc=0.0f;
+
+    float xi=di.x, yi=di.y, zi=di.z;
+    float xj=dj.x, yj=dj.y, zj=dj.z;
+
+    float is1=Ri[0];
+    float is2=Ri[1];
+    float ipx=Ri[2]*xi, ipy=Ri[2]*yi, ipz=Ri[2]*zi;
+    float is3=Ri[3];
+    float j_s1=Rj[0];
+    float j_s2=Rj[1];
+    float j_px=Rj[2]*xj, j_py=Rj[2]*yj, j_pz=Rj[2]*zj;
+    float j_s3=Rj[3];
+
+    // do not store arrays; just named registers
+    // example only, full version expands all active AO channels
+
+    ADD_PAIR(is1,0,j_s1,0);
+    ADD_PAIR(is1,0,j_s2,1);
+    ADD_PAIR(is1,0,j_px,2);
+    ADD_PAIR(is1,0,j_py,3);
+    ADD_PAIR(is1,0,j_pz,4);
+
+    ADD_PAIR(is2,1,j_s1,0);
+    ADD_PAIR(is2,1,j_s2,1);
+    ADD_PAIR(is2,1,j_px,2);
+    ADD_PAIR(is2,1,j_py,3);
+    ADD_PAIR(is2,1,j_pz,4);
+
+    ADD_PAIR(ipx,2,j_s1,0);
+    ADD_PAIR(ipy,3,j_s1,0);
+    ADD_PAIR(ipz,4,j_s1,0);
+
+    return acc;
+}
+```
+
+This is less elegant but faster. It keeps all angular-unfolded values in registers, not local memory. For `MAX_AO=15`, this is acceptable, but it may increase register pressure. The generic scalar-on-demand version uses fewer registers.
+
+---
+
+# Better compromise: unfold one shell at a time
+
+Instead of full `phi[MAX_AO]`, use tiny private shell buffers:
+
+```c
+float fi[6];
+float fj[6];
+```
+
+This is still not local memory. It is registers/private memory.
+
+```c
+float contract_atom_pair_shellwise(...){
+    float acc=0.0f;
+    __global float* Pij=Pblocks+(ia*nAtoms+ja)*MAX_AO*MAX_AO;
+
+    for(int si=0;si<ns_i;si++){
+        Shell shi=shells[shi0+si];
+        float fi[6];
+        int ni=unfold_shell(shi.l,Ri[si],di,fi);
+
+        for(int sj=0;sj<ns_j;sj++){
+            Shell shj=shells[shj0+sj];
+            float fj[6];
+            int nj=unfold_shell(shj.l,Rj[sj],dj,fj);
+
+            for(int ai=0;ai<ni;ai++){
+                float tmp=0.0f;
+                int iao=shi.ao_off+ai;
+                for(int aj=0;aj<nj;aj++){
+                    int jao=shj.ao_off+aj;
+                    tmp+=Pij[iao*MAX_AO+jao]*fj[aj];
+                }
+                acc+=fi[ai]*tmp;
+            }
+        }
+    }
+    return acc;
+}
+```
+
+This is probably the best readable version:
+
+* local memory stores only radial `Rj`
+* private memory/registers store at most `Ri[6]`, `fi[6]`, `fj[6]`
+* no `phi_atom[MAX_AO]`
+* angular expansion is local to one shell
+
+---
+
+# Shell unfolding
+
+```c
+inline int unfold_shell(int l,float R,float3 d,float* f){
+    float x=d.x,y=d.y,z=d.z;
+    if(l==0){ f[0]=R; return 1; }
+    if(l==1){ f[0]=R*x; f[1]=R*y; f[2]=R*z; return 3; }
+    f[0]=R*x*x; f[1]=R*y*y; f[2]=R*z*z; f[3]=R*x*y; f[4]=R*x*z; f[5]=R*y*z; return 6;
+}
+```
+
+Again: this is private/register storage, not local memory.
+
+---
+
+# Final corrected structure
+
+The kernel should be conceptually:
+
+```c
+for each workgroup:
+    owns 8 grid points and 8 i-atoms
+
+    each thread:
+        compute Ri[MAX_SHELL] for its own iatom/gridpoint
+
+    for each jTile:
+        workgroup fills local wfRj[8][8][MAX_SHELL]
+
+        each thread:
+            for each jatom in jTile:
+                contract ia,ja using:
+                    private Ri
+                    local Rj
+                    angular factors from di,dj
+                    P block
+                accumulate rho
+
+    reduce 8 iatom threads per grid point
+    atomic_add rhoGrid[g]
+```
+
+So the only substantial local memory is:
+
+[
+8 \times 8 \times 6 = 384
+]
+
+floats, i.e. only about **1.5 kB**.
+
+With derivatives:
+
+[
+2 \times 384 = 768
+]
+
+floats, about **3 kB**.
+
+That leaves local memory free to increase tile size later, for example:
+
+```c
+NPTILE=8, NATILE=16
+```
+
+or
+
+```c
+NPTILE=16, NATILE=8
+```
+
+depending on whether you want more grid-point parallelism or atom-tile parallelism.
+
+---
+
+# USER
+
+other llm correctly pointed out that vmat works very differently. 
+
+The problem is simple: **vmat needs to accumulate a matrix, not a scalar.**
+
+For rho, each thread produces one scalar per grid point — easy to reduce.
+
+For vmat, each grid point contributes a full outer product `phi_i * phi_j` for every atom pair. That's `natoms*natoms * 15*15` values per grid point. You can't just accumulate that in one private variable.
+
+So the question is: **how do you want to parallelize vmat?**
+
+Options I see:
+1. **One thread per atom pair** — each thread loops over all grid points strided, accumulates `vmat_priv[15][15]` privately. Output = `n_pairs * n_threads * 225` floats. For pentacene: `1296 * 64 * 225 * 4 = 75 MB`. Manageable.
+2. **Same 2D layout as rho** — `(NPTILE, NATILE)` threads, each thread accumulates its atom pair's `15x15` block over grid points. But then you need to reduce the `15x15` blocks across grid-point tiles.
+
+Which approach do you want? Or do you have a different idea?
+I suggest this:
+
+yes in a way this is even simpler because it is more symmetric. 
+
+workgroup should not iterate over different atom pair tiles, it should load one DM tile at the start 4x4 block, and then iterate over tiles of points always colaborativly evaluating radial functions on the points from nw tile, storing to local memory, and then evalutin all combination for all points in the tile. 
+this way we do not have to write partial sum but final sum
+
+plese elaborate on it
+
+---
+
+# chat GPT 5.5
+
+Yes, for `vmat` I agree: the natural loop order should be almost the **transpose** of the rho kernel.
+
+For rho, output index is grid point:
+
+[
+\rho(g)=\sum_{\mu\nu}\phi_\mu(g)P_{\mu\nu}\phi_\nu(g)
+]
+
+so workgroup should own a grid tile and stream through atom-pair tiles.
+
+For vmat, output index is AO pair:
+
+[
+V_{\mu\nu}=\sum_g w(g),v_\mathrm{xc}(g),\phi_\mu(g)\phi_\nu(g)
+]
+
+or for LDA:
+
+[
+V_{\mu\nu}=\sum_g W(g)\phi_\mu(g)\phi_\nu(g)
+]
+
+where:
+
+[
+W(g)=dV,v_\mathrm{xc}(\rho(g))
+]
+
+So for `vmat`, workgroup should own an **atom-pair tile**, keep its matrix block private/local, and stream through grid-point tiles.
+
+That is much more symmetric and avoids writing huge partial sums per grid tile.
+
+---
+
+## Correct vmat workgroup ownership
+
+For `rho`:
+
+```c
+workgroup = (grid tile, i atom tile)
+loop over j atom tiles
+output rho[grid]
+```
+
+For `vmat`:
+
+```c
+workgroup = (i atom tile, j atom tile)
+loop over grid tiles
+output vmat block
+```
+
+So launch geometry:
+
+```c
+global/local:
+    local_id.x = ip   // grid point inside point tile
+    local_id.y = something for AO-pair or atom-pair work
+
+group_id.x = iTile
+group_id.y = jTile
+```
+
+The workgroup computes:
+
+```c
+Vblk[NATILE][NATILE][MAX_AO_ATOM][MAX_AO_ATOM]
+```
+
+for one fixed `(iTile,jTile)` atom block pair.
+
+Then it loops over all grid tiles:
+
+```c
+for(gTile=0; gTile<nGrid; gTile+=NPTILE)
+```
+
+For each grid tile, it evaluates radial basis functions for both the `iTile` and `jTile` atoms at those grid points, then accumulates:
+
+[
+V_{i a, j b} \mathrel{+}= \sum_{p \in \text{point tile}}
+W_p,\phi_{i a}(p),\phi_{j b}(p)
+]
+
+At the end, this workgroup writes the final matrix block directly to global memory.
+
+No global partial reduction over grid tiles is needed.
+
+---
+
+# Key difference from rho
+
+For rho, each thread naturally owns:
+
+```c
+one scalar rho_priv
+```
+
+For vmat, each atom-pair block owns:
+
+```c
+NATILE*NATILE*MAX_AO_ATOM*MAX_AO_ATOM
+```
+
+matrix elements.
+
+So the natural parallelization is not:
+
+```c
+thread = one grid point + one atom
+```
+
+but rather something closer to:
+
+```c
+thread = one AO-pair element, or one small group of AO-pair elements
+```
+
+and the workgroup streams over grid points.
+
+---
+
+# Proposed constants
+
+I would define:
+
+```c
+#define NPTILE      16
+#define NATILE      4
+#define WGS         256
+
+#define MAX_SHELL   6
+#define MAX_AO_ATOM 15
+
+#define NPAIR_ATOM  (NATILE*NATILE)
+#define NAO_TILE    (NATILE*MAX_AO_ATOM)
+#define VBLK_SIZE   (NATILE*NATILE*MAX_AO_ATOM*MAX_AO_ATOM)
+#define WFI_SIZE    (NPTILE*NATILE*MAX_SHELL)
+#define WFJ_SIZE    (NPTILE*NATILE*MAX_SHELL)
+```
+
+For `NATILE=4`, `MAX_AO_ATOM=15`:
+
+```c
+VBLK_SIZE = 4*4*15*15 = 3600 floats
+```
+
+That is too many values for one workgroup to hold entirely in local memory **and reduce efficiently** if every value is actively accumulated by many threads.
+
+But it is manageable if each thread owns several matrix elements privately/locally.
+
+There are two good designs.
+
+---
+
+# Design A: one workgroup computes one full `NATILE × NATILE` atom block
+
+This is the most direct version of your idea.
+
+Local memory:
+
+```c
+__local float wfRi[NPTILE][NATILE][MAX_SHELL];
+__local float wfRj[NPTILE][NATILE][MAX_SHELL];
+__local float vblk[VBLK_SIZE];
+```
+
+Sizes:
+
+```c
+wfRi = NPTILE*NATILE*MAX_SHELL = 16*4*6 = 384 floats = 1.5 KB
+wfRj = NPTILE*NATILE*MAX_SHELL = 16*4*6 = 384 floats = 1.5 KB
+vblk = NATILE*NATILE*MAX_AO_ATOM*MAX_AO_ATOM = 3600 floats = 14.4 KB
+total ≈ 17.4 KB
+```
+
+This matches your earlier local-memory scale. The important difference is that `vblk` is now an **accumulator**, not just a temporary tile.
+
+But there is a problem: many threads need to add to the same `vblk` entries from different grid points. If you let all `ip` threads update the same `vblk[a,b]`, you need local atomics or a reduction.
+
+So better mapping:
+
+```c
+thread linear id lid
+for q=lid; q<VBLK_SIZE; q+=WGS:
+    this thread owns vblk[q]
+```
+
+Each thread owns one or more AO-pair elements and accumulates them over all grid points. Then there is no local atomic.
+
+This means each thread does:
+
+```c
+for all grid tiles:
+    load radial tiles collaboratively
+    barrier
+    for each owned AO-pair q:
+        for ip in 0..NPTILE-1:
+            v += W[ip] * phi_i(ip,a) * phi_j(ip,b)
+```
+
+This is very clean.
+
+The downside is that every thread now loops over `NPTILE` grid points for each AO-pair element. But that is exactly the mathematical operation.
+
+---
+
+## Design A pseudocode
+
+```c
+#define NPTILE      16
+#define NATILE      4
+#define WGS         256
+#define MAX_SHELL   6
+#define MAX_AO_ATOM 15
+
+#define VBLK_SIZE   (NATILE*NATILE*MAX_AO_ATOM*MAX_AO_ATOM)
+#define WFI_SIZE    (NPTILE*NATILE*MAX_SHELL)
+#define WFJ_SIZE    (NPTILE*NATILE*MAX_SHELL)
+
+__kernel void vmat_lda_atomtile(...){
+    int lid=get_local_id(0);
+
+    int iTile=get_group_id(0);
+    int jTile=get_group_id(1);
+
+    __local float wfRi[NPTILE][NATILE][MAX_SHELL];
+    __local float wfRj[NPTILE][NATILE][MAX_SHELL];
+
+    float vacc[ACC_PER_THREAD];
+
+    for(int t=0;t<ACC_PER_THREAD;t++) vacc[t]=0.0f;
+
+    int q0[ACC_PER_THREAD];
+    for(int t=0;t<ACC_PER_THREAD;t++) q0[t]=lid+t*WGS;
+
+    for(int gTile=0;gTile<ngrids;gTile+=NPTILE){
+
+        for(int k=lid;k<WFI_SIZE;k+=WGS){
+            int s = k%MAX_SHELL;
+            int iaLocal = (k/MAX_SHELL)%NATILE;
+            int ip = k/(MAX_SHELL*NATILE);
+            int g = gTile+ip;
+            int ia = iTile*NATILE+iaLocal;
+
+            float v=0.0f;
+            if(g<ngrids && ia<natoms && s<atom_nshell[ia]){
+                float3 d=grid_pos(g)-atom_pos[ia].xyz;
+                v=eval_radial(ia,s,dot(d,d));
+            }
+            wfRi[ip][iaLocal][s]=v;
+        }
+
+        for(int k=lid;k<WFJ_SIZE;k+=WGS){
+            int s = k%MAX_SHELL;
+            int jaLocal = (k/MAX_SHELL)%NATILE;
+            int ip = k/(MAX_SHELL*NATILE);
+            int g = gTile+ip;
+            int ja = jTile*NATILE+jaLocal;
+
+            float v=0.0f;
+            if(g<ngrids && ja<natoms && s<atom_nshell[ja]){
+                float3 d=grid_pos(g)-atom_pos[ja].xyz;
+                v=eval_radial(ja,s,dot(d,d));
+            }
+            wfRj[ip][jaLocal][s]=v;
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for(int t=0;t<ACC_PER_THREAD;t++){
+            int q=q0[t];
+            if(q>=VBLK_SIZE) continue;
+
+            int ab=q%(MAX_AO_ATOM*MAX_AO_ATOM);
+            int pair=q/(MAX_AO_ATOM*MAX_AO_ATOM);
+
+            int a=ab/MAX_AO_ATOM;
+            int b=ab%MAX_AO_ATOM;
+            int il=pair/NATILE;
+            int jl=pair%NATILE;
+
+            int ia=iTile*NATILE+il;
+            int ja=jTile*NATILE+jl;
+
+            if(ia>=natoms || ja>=natoms || a>=atom_nao[ia] || b>=atom_nao[ja]) continue;
+
+            float s=0.0f;
+
+            for(int ip=0;ip<NPTILE;ip++){
+                int g=gTile+ip;
+                if(g>=ngrids) continue;
+
+                float3 ri=grid_pos(g)-atom_pos[ia].xyz;
+                float3 rj=grid_pos(g)-atom_pos[ja].xyz;
+
+                float fi=eval_ao_from_radials(a,ia,ri,wfRi[ip][il]);
+                float fj=eval_ao_from_radials(b,ja,rj,wfRj[ip][jl]);
+
+                s+=weight[g]*fi*fj;
+            }
+
+            vacc[t]+=s;
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    for(int t=0;t<ACC_PER_THREAD;t++){
+        int q=q0[t];
+        if(q>=VBLK_SIZE) continue;
+
+        int ab=q%(MAX_AO_ATOM*MAX_AO_ATOM);
+        int pair=q/(MAX_AO_ATOM*MAX_AO_ATOM);
+
+        int a=ab/MAX_AO_ATOM;
+        int b=ab%MAX_AO_ATOM;
+        int il=pair/NATILE;
+        int jl=pair%NATILE;
+
+        int ia=iTile*NATILE+il;
+        int ja=jTile*NATILE+jl;
+
+        if(ia<natoms && ja<natoms && a<atom_nao[ia] && b<atom_nao[ja]){
+            int iao=atom_ao0[ia]+a;
+            int jao=atom_ao0[ja]+b;
+            vmat[iao*nAO+jao]=vacc[t];
+        }
+    }
+}
+```
+
+This is the cleanest conceptual kernel.
+
+But with:
+
+```c
+VBLK_SIZE=3600
+WGS=256
+```
+
+you need:
+
+```c
+ACC_PER_THREAD = ceil(VBLK_SIZE/WGS) = ceil(3600/256) = 15
+```
+
+So each thread keeps ~15 accumulators. That is not insane, but it is quite a lot of registers. Also `q0[15]` can be computed on the fly.
+
+I would write:
+
+```c
+for(int q=lid;q<VBLK_SIZE;q+=WGS){
+    float acc=0.0f;
+    for(all grid tiles) ...
+}
+```
+
+But then the radial tile would be reloaded for each `q`, which is bad.
+
+So better structure is:
+
+```c
+float acc0, acc1, ... acc14;
+for all grid tiles:
+    load wfRi/wfRj
+    accumulate all q assigned to this thread
+write accs
+```
+
+In C/OpenCL, `ACC_PER_THREAD` can be a compile-time constant.
+
+---
+
+# Design B: one workgroup computes one atom pair, not one atom-pair tile
+
+This may actually be better.
+
+Instead of one workgroup computing `NATILE×NATILE` atom pairs, each workgroup computes one atom pair `(ia,ja)` and its `MAX_AO_ATOM×MAX_AO_ATOM` block.
+
+Then:
+
+```c
+VBLK_SIZE = MAX_AO_ATOM*MAX_AO_ATOM = 225
+```
+
+Use:
+
+```c
+WGS = 256
+```
+
+Then each thread maps naturally to one AO-pair element:
+
+```c
+lid = a*MAX_AO_ATOM+b
+```
+
+or `lid < 225`.
+
+Local memory:
+
+```c
+__local float wfRi[NPTILE][MAX_SHELL];
+__local float wfRj[NPTILE][MAX_SHELL];
+```
+
+Tiny:
+
+```c
+2*16*6*4 = 768 bytes
+```
+
+Each workgroup:
+
+```c
+group_id.x = atom pair index
+```
+
+or:
+
+```c
+group_id.x = ia
+group_id.y = ja
+```
+
+Then each active thread accumulates one `vmat[iao,jao]` element over all grid points.
+
+Pseudocode:
+
+```c
+#define NPTILE      16
+#define WGS         256
+#define MAX_SHELL   6
+#define MAX_AO_ATOM 15
+#define VPAIR_SIZE  (MAX_AO_ATOM*MAX_AO_ATOM)
+#define WFR_SIZE    (NPTILE*MAX_SHELL)
+
+__kernel void vmat_lda_atompair(...){
+    int lid=get_local_id(0);
+
+    int ia=get_group_id(0);
+    int ja=get_group_id(1);
+
+    int a=lid/MAX_AO_ATOM;
+    int b=lid%MAX_AO_ATOM;
+
+    __local float wfRi[NPTILE][MAX_SHELL];
+    __local float wfRj[NPTILE][MAX_SHELL];
+
+    float acc=0.0f;
+
+    for(int gTile=0;gTile<ngrids;gTile+=NPTILE){
+
+        for(int k=lid;k<WFR_SIZE;k+=WGS){
+            int s=k%MAX_SHELL;
+            int ip=k/MAX_SHELL;
+            int g=gTile+ip;
+
+            float vi=0.0f;
+            float vj=0.0f;
+
+            if(g<ngrids){
+                if(s<atom_nshell[ia]){
+                    float3 d=grid_pos(g)-atom_pos[ia].xyz;
+                    vi=eval_radial(ia,s,dot(d,d));
+                }
+                if(s<atom_nshell[ja]){
+                    float3 d=grid_pos(g)-atom_pos[ja].xyz;
+                    vj=eval_radial(ja,s,dot(d,d));
+                }
+            }
+
+            wfRi[ip][s]=vi;
+            wfRj[ip][s]=vj;
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        if(lid<VPAIR_SIZE && a<atom_nao[ia] && b<atom_nao[ja]){
+            float s=0.0f;
+
+            for(int ip=0;ip<NPTILE;ip++){
+                int g=gTile+ip;
+                if(g>=ngrids) continue;
+
+                float3 di=grid_pos(g)-atom_pos[ia].xyz;
+                float3 dj=grid_pos(g)-atom_pos[ja].xyz;
+
+                float fi=eval_ao_from_radials(a,ia,di,wfRi[ip]);
+                float fj=eval_ao_from_radials(b,ja,dj,wfRj[ip]);
+
+                s+=weight[g]*fi*fj;
+            }
+
+            acc+=s;
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if(lid<VPAIR_SIZE && ia<natoms && ja<natoms && a<atom_nao[ia] && b<atom_nao[ja]){
+        int iao=atom_ao0[ia]+a;
+        int jao=atom_ao0[ja]+b;
+        vmat[iao*nAO+jao]=acc;
+    }
+}
+```
+
+This is much simpler and probably more robust.
+
+---
+
+# Which one is better?
+
+## Atom-tile workgroup
+
+```c
+workgroup = NATILE × NATILE atom-pair block
+```
+
+Pros:
+
+* fewer workgroups
+* reuses grid point coordinates and maybe atom metadata
+* more similar to rho tiling
+* could exploit local reuse across multiple atom pairs
+
+Cons:
+
+* `VBLK_SIZE=3600`, so each thread needs many accumulators
+* more register pressure
+* more complex indexing
+* inactive/invalid AO channels waste work
+* harder to debug
+
+## Atom-pair workgroup
+
+```c
+workgroup = one atom pair
+```
+
+Pros:
+
+* extremely simple
+* one thread ≈ one matrix element
+* no local matrix accumulator needed
+* no reduction
+* no atomics
+* tiny local memory
+* final value written directly
+
+Cons:
+
+* more workgroups
+* radial functions for the same atom are recomputed across many atom-pair workgroups
+* for `natoms^2` atom pairs this can duplicate radial work a lot
+
+For small and medium molecules, I would honestly start with **atom-pair workgroup**. It is almost impossible to get wrong, and no giant partial buffer is needed.
+
+But your proposed atom-tile version is more elegant if radial evaluation is expensive and if we can control register pressure.
+
+---
+
+# Hybrid design: best compromise
+
+Use workgroup = one fixed atom-pair tile `(iTile,jTile)`, but do **not** accumulate the whole `VBLK_SIZE` in local memory. Instead, split the AO-pair block into chunks.
+
+Add a third grid dimension:
+
+```c
+group_id.x = iTile
+group_id.y = jTile
+group_id.z = abTile
+```
+
+where `abTile` indexes a chunk of AO-pair elements.
+
+For example:
+
+```c
+#define ABTILE 256
+```
+
+Then each workgroup computes only `ABTILE` AO-pair elements of the full atom-pair tile.
+
+For `NATILE=4`:
+
+```c
+VBLK_SIZE=3600
+NABTILES=ceil(VBLK_SIZE/ABTILE)=15
+```
+
+Then:
+
+```c
+lid = 0..255
+q = abTile*ABTILE + lid
+```
+
+Each thread owns exactly one matrix element, accumulates over all grid points, and writes final value.
+
+This gives:
+
+* atom-tile structure,
+* no local `vblk`,
+* no local reduction,
+* no atomics,
+* one private scalar accumulator per thread,
+* local radial reuse for all atom pairs inside tile,
+* more workgroups by factor `NABTILES`.
+
+This is probably the best design.
+
+---
+
+# Hybrid vmat kernel
+
+```c
+#define NPTILE      16
+#define NATILE      4
+#define WGS         256
+#define ABTILE      WGS
+
+#define MAX_SHELL   6
+#define MAX_AO_ATOM 15
+
+#define VBLK_SIZE   (NATILE*NATILE*MAX_AO_ATOM*MAX_AO_ATOM)
+#define NABTILE     ((VBLK_SIZE+ABTILE-1)/ABTILE)
+#define WFI_SIZE    (NPTILE*NATILE*MAX_SHELL)
+#define WFJ_SIZE    (NPTILE*NATILE*MAX_SHELL)
+
+__kernel void vmat_lda_tile_ab(...){
+    int lid=get_local_id(0);
+
+    int iTile=get_group_id(0);
+    int jTile=get_group_id(1);
+    int abTile=get_group_id(2);
+
+    int q=abTile*ABTILE+lid;
+
+    int ab=q%(MAX_AO_ATOM*MAX_AO_ATOM);
+    int pair=q/(MAX_AO_ATOM*MAX_AO_ATOM);
+
+    int a=ab/MAX_AO_ATOM;
+    int b=ab%MAX_AO_ATOM;
+    int il=pair/NATILE;
+    int jl=pair%NATILE;
+
+    int ia=iTile*NATILE+il;
+    int ja=jTile*NATILE+jl;
+
+    __local float wfRi[NPTILE][NATILE][MAX_SHELL];
+    __local float wfRj[NPTILE][NATILE][MAX_SHELL];
+
+    float acc=0.0f;
+    int active=(q<VBLK_SIZE && ia<natoms && ja<natoms && a<atom_nao[ia] && b<atom_nao[ja]);
+
+    for(int gTile=0;gTile<ngrids;gTile+=NPTILE){
+
+        for(int k=lid;k<WFI_SIZE;k+=WGS){
+            int s = k%MAX_SHELL;
+            int il2 = (k/MAX_SHELL)%NATILE;
+            int ip = k/(MAX_SHELL*NATILE);
+            int g = gTile+ip;
+            int ia2 = iTile*NATILE+il2;
+
+            float v=0.0f;
+            if(g<ngrids && ia2<natoms && s<atom_nshell[ia2]){
+                float3 d=grid_pos(g)-atom_pos[ia2].xyz;
+                v=eval_radial(ia2,s,dot(d,d));
+            }
+            wfRi[ip][il2][s]=v;
+        }
+
+        for(int k=lid;k<WFJ_SIZE;k+=WGS){
+            int s = k%MAX_SHELL;
+            int jl2 = (k/MAX_SHELL)%NATILE;
+            int ip = k/(MAX_SHELL*NATILE);
+            int g = gTile+ip;
+            int ja2 = jTile*NATILE+jl2;
+
+            float v=0.0f;
+            if(g<ngrids && ja2<natoms && s<atom_nshell[ja2]){
+                float3 d=grid_pos(g)-atom_pos[ja2].xyz;
+                v=eval_radial(ja2,s,dot(d,d));
+            }
+            wfRj[ip][jl2][s]=v;
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        if(active){
+            float s=0.0f;
+
+            for(int ip=0;ip<NPTILE;ip++){
+                int g=gTile+ip;
+                if(g>=ngrids) continue;
+
+                float3 di=grid_pos(g)-atom_pos[ia].xyz;
+                float3 dj=grid_pos(g)-atom_pos[ja].xyz;
+
+                float fi=eval_ao_from_radials(a,ia,di,wfRi[ip][il]);
+                float fj=eval_ao_from_radials(b,ja,dj,wfRj[ip][jl]);
+
+                s+=weight[g]*fi*fj;
+            }
+
+            acc+=s;
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if(active){
+        int iao=atom_ao0[ia]+a;
+        int jao=atom_ao0[ja]+b;
+        vmat[iao*nAO+jao]=acc;
+    }
+}
+```
+
+This is the version I like most.
+
+---
+
+# Why this hybrid is better than full local `vblk`
+
+The full local accumulator approach would need either:
+
+```c
+__local float vblk[VBLK_SIZE]
+```
+
+plus reductions/ownership rules, or many private accumulators per thread.
+
+But the hybrid `abTile` version does:
+
+```c
+one thread = one AO-pair matrix element
+one private float acc
+```
+
+No reduction. No atomic. No partial output.
+
+Each workgroup produces final values for one chunk of the matrix block.
+
+This matches the nature of `vmat`.
+
+---
+
+# Memory usage of hybrid vmat
+
+Local memory:
+
+```c
+wfRi = NPTILE*NATILE*MAX_SHELL floats
+wfRj = NPTILE*NATILE*MAX_SHELL floats
+```
+
+With constants:
+
+```c
+wfRi = 16*4*6 = 384 floats = 1.5 KB
+wfRj = 16*4*6 = 384 floats = 1.5 KB
+total = 3.0 KB
+```
+
+No local `vblk`.
+
+Private per thread:
+
+```c
+float acc
+```
+
+plus a few integers and coordinates.
+
+This is much lighter than the local accumulator version.
+
+---
+
+# Cost tradeoff
+
+The price is that the same radial tiles are recomputed for every `abTile`.
+
+For `NATILE=4`, `MAX_AO_ATOM=15`:
+
+```c
+VBLK_SIZE = 3600
+ABTILE = 256
+NABTILE = 15
+```
+
+So each `(iTile,jTile)` pair reloads/recomputes radial tiles 15 times.
+
+That sounds bad, but radial tile is small:
+
+```c
+2*NPTILE*NATILE*MAX_SHELL = 768 radial values
+```
+
+whereas AO-pair accumulation is:
+
+```c
+ABTILE*NPTILE = 256*16 = 4096 multiply-add contributions
+```
+
+per grid tile.
+
+So depending on radial cost, this may still be fine. If radial is expensive, the full-local-accumulator version may win. If radial is cheap or table-based, hybrid wins.
+
+---
+
+# Alternative: increase ABTILE and use fewer abTiles
+
+If hardware supports:
+
+```c
+WGS=512
+```
+
+then:
+
+```c
+NABTILE=ceil(3600/512)=8
+```
+
+fewer radial recomputations. But 512-thread workgroups may reduce occupancy or not be supported well on all devices.
+
+With:
+
+```c
+NATILE=2
+```
+
+you get:
+
+```c
+VBLK_SIZE=2*2*15*15=900
+NABTILE=ceil(900/256)=4
+```
+
+Then radial recomputation is much smaller, and local memory tiny.
+
+This is why for `vmat`, `NATILE=2` may be better than `NATILE=4`, even if rho likes `NATILE=4`.
+
+---
+
+# Recommended practical plan
+
+I would implement two vmat kernels:
+
+## vmat kernel 1: atom-pair workgroup
+
+Simplest and best for debugging:
+
+```c
+group = one atom pair
+thread = one AO-pair element
+loop over grid tiles
+write final vmat
+```
+
+No tiling over atom pairs.
+
+## vmat kernel 2: atom-tile + abTile hybrid
+
+Optimized version:
+
+```c
+group = one atom-pair tile + AO-block tile
+thread = one AO-pair element
+loop over grid tiles
+write final vmat
+```
+
+Then benchmark:
+
+```c
+NATILE=2, ABTILE=256
+NATILE=4, ABTILE=256
+NATILE=4, ABTILE=512 if possible
+```
+
+I would not use local `vblk` accumulator first. It is elegant on paper, but the ownership/reduction logic is awkward and register/local-memory pressure can easily dominate.
+
+---
+
+# Final conceptual distinction
+
+For rho:
+
+```c
+thread owns scalar rho(g,ia)
+atom-pair data streamed/cached
+reduce over ia
+```
+
+For vmat:
+
+```c
+thread owns matrix element V(iao,jao)
+grid data streamed/cached
+no reduction needed
+```
+
+That is the clean mental model.
+
+So yes, your revised idea is right in spirit:
+
+> fix one atom-pair tile, stream through point tiles, cache radial values, accumulate final matrix block.
+
+I would only refine it by not storing the whole matrix accumulator in local memory. Instead:
+
+```c
+one thread owns one AO-pair element
+one private acc
+```
+
+and use an `abTile` grid dimension when the atom-pair tile contains more AO-pair elements than threads.
+
+---
+
+# USER
+
+I think the other LLM implemented it in stupid way because it is horendouly slow, chan you correct it / optimize it?
+
+---
+
+# ChatGPT 5.5 High
+
+Yes, the other implementation made the bad tradeoff: it avoided local matrix accumulation, but paid for it by recomputing radial + angular + derivative work for every `abTile`. For `VBLK_SIZE=3600`, `WGS=64`, that means about `57x` redundant radial/derivative evaluation. That is exactly why `vmat` is catastrophic.
+
+For `vmat`, the better structure is:
+
+```c
+workgroup = one (iTile,jTile) atom-pair tile
+thread    = one or several AO-pair matrix elements
+loop      = over grid-point tiles
+local     = AO values on current point tile
+private   = accumulator(s) for V[a,b]
+```
+
+So instead of local radial-only cache, for `vmat` I would cache the **unfolded AO values**:
+
+```c
+aoI[ip][local_ao_i] = w0*phi_i + wx*dphi_i/dx + wy*dphi_i/dy + wz*dphi_i/dz
+aoJ[ip][local_ao_j] = phi_j
+```
+
+This is different from `rho`. For `rho`, storing full AO values was wasteful. For `vmat`, storing full AO values is exactly what removes the horrible redundant angular/derivative evaluation.
+
+---
+
+## Better constants
+
+I would use something like this first:
+
+```c
+#define NPTILE       32
+#define NATILE       4
+#define MAX_SHELL    6
+#define MAX_AO_ATOM  15
+#define AO_TILE      (NATILE*MAX_AO_ATOM)
+#define VBLK_SIZE    (AO_TILE*AO_TILE)
+#define WGS_VMAT     256
+#define QPT          ((VBLK_SIZE+WGS_VMAT-1)/WGS_VMAT)
+#define PT_ATOM_SIZE (NPTILE*NATILE)
+```
+
+For these values:
+
+```c
+AO_TILE   = 4*15 = 60
+VBLK_SIZE = 60*60 = 3600
+QPT       = ceil(3600/256) = 15
+```
+
+Local memory:
+
+```c
+aoI = NPTILE*AO_TILE = 32*60 = 1920 floats = 7.5 KB
+aoJ = NPTILE*AO_TILE = 32*60 = 1920 floats = 7.5 KB
+total = 15 KB
+```
+
+Private per thread:
+
+```c
+acc[QPT] = 15 floats
+```
+
+This is much better than the previous `abTile` version because radial and derivative evaluation is done once per `(grid point, atom)` instead of once per `(grid point, atom, abTile)`.
+
+---
+
+# New kernel structure
+
+```c
+__kernel void vmat_gga_tiled_fast(
+    __global const float4 *coords,
+    __global const float4 *atom_coords,
+    __global const float *rad_val,
+    __global const float *rad_du,
+    __global const float *rad_dy,
+    __global const int *radial_l,
+    __global const int *radial_cart0,
+    __global const int *atom_radial_offset,
+    __global const int *atom_radial_list,
+    __global const int *atom_ao0,
+    __global const int *atom_nao,
+    __global const float *wv,
+    __global float *vmat,
+    float r0,float du,int nrad,int ncart,int ngrids,int natoms
+){
+    int lid=get_local_id(0);
+    int iTile=get_group_id(0);
+    int jTile=get_group_id(1);
+
+    __local float aoI[NPTILE][AO_TILE];
+    __local float aoJ[NPTILE][AO_TILE];
+
+    float acc[QPT];
+    for(int t=0;t<QPT;t++) acc[t]=0.0f;
+
+    for(int gTile=0;gTile<ngrids;gTile+=NPTILE){
+
+        for(int k=lid;k<PT_ATOM_SIZE;k+=WGS_VMAT){
+            int il=k%NATILE;
+            int ip=k/NATILE;
+            int ia=iTile*NATILE+il;
+            int g=gTile+ip;
+            int base=il*MAX_AO_ATOM;
+
+            for(int a=0;a<MAX_AO_ATOM;a++) aoI[ip][base+a]=0.0f;
+
+            if(g<ngrids && ia<natoms){
+                float4 d=coords[g]-atom_coords[ia];
+                float w0=wv[g], wx=wv[ngrids+g], wy=wv[2*ngrids+g], wz=wv[3*ngrids+g];
+                fill_atom_aow_gga(ia,d,w0,wx,wy,wz,base,aoI[ip],r0,du,nrad,rad_val,rad_du,rad_dy,radial_l,atom_radial_offset,atom_radial_list);
+            }
+        }
+
+        for(int k=lid;k<PT_ATOM_SIZE;k+=WGS_VMAT){
+            int jl=k%NATILE;
+            int ip=k/NATILE;
+            int ja=jTile*NATILE+jl;
+            int g=gTile+ip;
+            int base=jl*MAX_AO_ATOM;
+
+            for(int b=0;b<MAX_AO_ATOM;b++) aoJ[ip][base+b]=0.0f;
+
+            if(g<ngrids && ja<natoms){
+                float4 d=coords[g]-atom_coords[ja];
+                fill_atom_ao_lda(ja,d,base,aoJ[ip],r0,du,nrad,rad_val,rad_du,rad_dy,radial_l,atom_radial_offset,atom_radial_list);
+            }
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for(int t=0;t<QPT;t++){
+            int q=lid+t*WGS_VMAT;
+            if(q>=VBLK_SIZE) continue;
+
+            int iao_l=q/AO_TILE;
+            int jao_l=q-iao_l*AO_TILE;
+
+            int il=iao_l/MAX_AO_ATOM;
+            int jl=jao_l/MAX_AO_ATOM;
+            int a =iao_l-il*MAX_AO_ATOM;
+            int b =jao_l-jl*MAX_AO_ATOM;
+
+            int ia=iTile*NATILE+il;
+            int ja=jTile*NATILE+jl;
+
+            if(ia>=natoms || ja>=natoms || a>=atom_nao[ia] || b>=atom_nao[ja]) continue;
+
+            float s=0.0f;
+            for(int ip=0;ip<NPTILE;ip++) s+=aoI[ip][iao_l]*aoJ[ip][jao_l];
+            acc[t]+=s;
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    for(int t=0;t<QPT;t++){
+        int q=lid+t*WGS_VMAT;
+        if(q>=VBLK_SIZE) continue;
+
+        int iao_l=q/AO_TILE;
+        int jao_l=q-iao_l*AO_TILE;
+
+        int il=iao_l/MAX_AO_ATOM;
+        int jl=jao_l/MAX_AO_ATOM;
+        int a =iao_l-il*MAX_AO_ATOM;
+        int b =jao_l-jl*MAX_AO_ATOM;
+
+        int ia=iTile*NATILE+il;
+        int ja=jTile*NATILE+jl;
+
+        if(ia<natoms && ja<natoms && a<atom_nao[ia] && b<atom_nao[ja]){
+            int iao=atom_ao0[ia]+a;
+            int jao=atom_ao0[ja]+b;
+            vmat[iao*ncart+jao]=acc[t];
+        }
+    }
+}
+```
+
+This has no `abTile` dimension.
+
+Launch:
+
+```python
+gsize = (nITile,nJTile)
+lsize = (WGS_VMAT,)
+```
+
+where:
+
+```python
+nITile = (natoms+NATILE-1)//NATILE
+nJTile = (natoms+NATILE-1)//NATILE
+```
+
+For benzene:
+
+```c
+nITile*nJTile = 3*3 = 9 workgroups
+```
+
+instead of:
+
+```c
+3*3*57 = 513 workgroups
+```
+
+That alone removes the huge serial overhead.
+
+---
+
+# AO fill functions
+
+The essential fix is that `fill_atom_aow_gga()` unfolds **all AO components once** and stores them in local memory.
+
+```c
+inline void fill_atom_aow_gga(
+    int ia,float4 d,float w0,float wx,float wy,float wz,int base,__local float *ao,
+    float r0,float du,int nrad,
+    __global const float *rad_val,__global const float *rad_du,__global const float *rad_dy,
+    __global const int *radial_l,
+    __global const int *atom_radial_offset,__global const int *atom_radial_list
+){
+    float R[MAX_SHELL],dR[MAX_SHELL];
+    eval_atom_radials_deriv(ia,d,r0,du,nrad,rad_val,rad_du,rad_dy,atom_radial_offset,atom_radial_list,R,dR);
+
+    float rr=sqrt(d.x*d.x+d.y*d.y+d.z*d.z);
+    float invr=(rr>1e-20f)?1.0f/rr:0.0f;
+
+    int off=atom_radial_offset[ia];
+    int ns=atom_radial_offset[ia+1]-off;
+    int ao0=0;
+
+    for(int s=0;s<ns;s++){
+        int ir=atom_radial_list[off+s];
+        int l=radial_l[ir];
+
+        float f0[6],fx[6],fy[6],fz[6];
+        int n=unfold_shell_deriv(l,R[s],dR[s],d,invr,f0,fx,fy,fz);
+
+        for(int a=0;a<n;a++) ao[base+ao0+a]=w0*f0[a]+wx*fx[a]+wy*fy[a]+wz*fz[a];
+        ao0+=n;
+    }
+}
+```
+
+For the right side:
+
+```c
+inline void fill_atom_ao_lda(
+    int ia,float4 d,int base,__local float *ao,
+    float r0,float du,int nrad,
+    __global const float *rad_val,__global const float *rad_du,__global const float *rad_dy,
+    __global const int *radial_l,
+    __global const int *atom_radial_offset,__global const int *atom_radial_list
+){
+    float R[MAX_SHELL];
+    eval_atom_radials(ia,d,r0,du,nrad,rad_val,rad_du,rad_dy,atom_radial_offset,atom_radial_list,R);
+
+    int off=atom_radial_offset[ia];
+    int ns=atom_radial_offset[ia+1]-off;
+    int ao0=0;
+
+    for(int s=0;s<ns;s++){
+        int ir=atom_radial_list[off+s];
+        int l=radial_l[ir];
+
+        float f[6];
+        int n=unfold_shell(l,R[s],d,f);
+
+        for(int a=0;a<n;a++) ao[base+ao0+a]=f[a];
+        ao0+=n;
+    }
+}
+```
+
+The important difference from the slow kernel is that `unfold_shell_deriv()` is called once per shell per `(grid point, atom)`, not once per shell per `(grid point, atom, AO-pair element)`.
+
+---
+
+# Why this should be much faster
+
+Old kernel:
+
+```c
+for abTile in 57:
+    for gTile in 8973:
+        recompute radial tiles
+        each AO-pair thread recomputes derivative/angular for one component
+```
+
+New kernel:
+
+```c
+for gTile in 4487:        // if NPTILE=32
+    compute AO tiles once
+    all AO-pair threads reuse local aoI/aoJ
+```
+
+The main removed costs are:
+
+```c
+57x radial recomputation
+57x derivative radial recomputation
+many redundant unfold_shell_deriv calls
+many redundant coords[g]-atom_coords[ia] recomputations
+```
+
+The new arithmetic is mostly the unavoidable contraction:
+
+[
+V_{ab} += \sum_g A_a(g)B_b(g)
+]
+
+which is just a tiled outer product.
+
+This is basically a tiny GEMM:
+
+[
+V_{AO_i,AO_j} += A^T B
+]
+
+where:
+
+```c
+A = aoI[NPTILE][AO_TILE]
+B = aoJ[NPTILE][AO_TILE]
+```
+
+So the correct mental model for `vmat` is not “one thread evaluates one AO value repeatedly,” but:
+
+```c
+make local AO matrices A and B
+accumulate A^T B
+```
+
+---
+
+# Important: do not use local atomics here
+
+The tempting kernel:
+
+```c
+thread = grid point
+compute all AO products
+atomic_add local vblk[a,b]
+```
+
+will probably be slower or nonportable, because local float atomics are not guaranteed to be efficient in OpenCL.
+
+The private-accumulator version above is better:
+
+```c
+thread owns several matrix elements
+thread loops over ip
+no atomics
+no reductions
+one final write
+```
+
+---
+
+# Recommended variants to benchmark
+
+I would compile three variants:
+
+```c
+NPTILE=16, NATILE=4, WGS_VMAT=256
+NPTILE=32, NATILE=4, WGS_VMAT=256
+NPTILE=32, NATILE=2, WGS_VMAT=256
+```
+
+Expected behavior:
+
+```c
+NPTILE=16,NATILE=4:
+    less local memory, more barriers
+
+NPTILE=32,NATILE=4:
+    likely best first try
+
+NPTILE=32,NATILE=2:
+    less register pressure / fewer invalid AO entries, but more atom-tile workgroups
+```
+
+I would not start with `NPTILE=64` unless local memory occupancy is still good:
+
+```c
+aoI+aoJ = 2*64*60*4 = 30 KB
+```
+
+It may be fast on some GPUs but can reduce occupancy.
+
+---
+
+# One more optimization: precompute AO shell mapping
+
+The old kernel repeatedly did this:
+
+```c
+find which shell AO a belongs to
+find which shell AO b belongs to
+```
+
+Remove that entirely.
+
+The new kernel uses local AO index directly:
+
+```c
+iao_l = il*MAX_AO_ATOM+a
+jao_l = jl*MAX_AO_ATOM+b
+```
+
+The fill functions place AO values in that same order. No per-thread shell search.
+
+That alone removes another bad inner-loop cost.
+
+---
+
+# Final verdict
+
+Yes, correct the vmat kernel by replacing the `abTile` design with:
+
+```c
+one workgroup per (iTile,jTile)
+local aoI[NPTILE][AO_TILE]
+local aoJ[NPTILE][AO_TILE]
+private acc[QPT] per thread
+loop over grid tiles
+write final vmat block
+```
+
+This is the version that matches the actual operation:
+
+[
+V_{ij} = A_i^T W A_j
+]
+
+It should be dramatically faster than the current 5.17 s kernel because it removes the `57x` radial/derivative recomputation and changes the inner loop into a small local-memory outer-product accumulation.

@@ -17,26 +17,34 @@ class OpenCLAOHermiteEvaluator:
         self.queue = get_queue()
         self.prg = get_prg()
         mf = cl.mem_flags
-        self.rad_val = np.ascontiguousarray(self.plan.values, dtype=np.float32)
-        self.rad_du = np.ascontiguousarray(self.plan.du_values, dtype=np.float32)
-        self.atom_coords = np.ascontiguousarray(self.plan.atom_coords, dtype=np.float32)
-        self.cart_shell = np.ascontiguousarray(self.plan.cart_shell, dtype=np.int32)
-        self.cart_ctr = np.ascontiguousarray(self.plan.cart_ctr, dtype=np.int32)
-        self.cart_ixyz = np.ascontiguousarray(self.plan.cart_ixyz, dtype=np.int32)
-        self.shell_atom = np.ascontiguousarray(self.plan.shell_atom, dtype=np.int32)
+        if self.plan.lmax > 3:
+            raise NotImplementedError('OpenCL atom-block Hermite AO kernel currently supports angular momentum l<=3')
+        self.rad_val = np.ascontiguousarray(self.plan.radial_values, dtype=np.float32)
+        self.rad_du = np.ascontiguousarray(self.plan.radial_du_values, dtype=np.float32)
+        self.rad_dy = np.ascontiguousarray(self.plan.radial_dy_values, dtype=np.float32)
+        self.atom_coords = np.zeros((self.plan.atom_coords.shape[0], 4), dtype=np.float32)
+        self.atom_coords[:, :3] = self.plan.atom_coords
+        self.radial_l = np.ascontiguousarray(self.plan.radial_l, dtype=np.int32)
+        self.radial_cart0 = np.ascontiguousarray(self.plan.radial_cart0, dtype=np.int32)
+        self.atom_radial_offset = np.ascontiguousarray(self.plan.atom_radial_offset, dtype=np.int32)
+        self.atom_radial_list = np.ascontiguousarray(self.plan.atom_radial_list, dtype=np.int32)
+        self.natoms = self.plan.natoms
         self.buf_rad_val = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, self.rad_val.nbytes, self.rad_val)
         self.buf_rad_du = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, self.rad_du.nbytes, self.rad_du)
+        self.buf_rad_dy = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, self.rad_dy.nbytes, self.rad_dy)
         self.buf_atom_coords = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, self.atom_coords.nbytes, self.atom_coords)
-        self.buf_cart_shell = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, self.cart_shell.nbytes, self.cart_shell)
-        self.buf_cart_ctr = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, self.cart_ctr.nbytes, self.cart_ctr)
-        self.buf_cart_ixyz = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, self.cart_ixyz.nbytes, self.cart_ixyz)
-        self.buf_shell_atom = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, self.shell_atom.nbytes, self.shell_atom)
+        self.buf_radial_l = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, self.radial_l.nbytes, self.radial_l)
+        self.buf_radial_cart0 = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, self.radial_cart0.nbytes, self.radial_cart0)
+        self.buf_atom_radial_offset = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, self.atom_radial_offset.nbytes, self.atom_radial_offset)
+        self.buf_atom_radial_list = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, self.atom_radial_list.nbytes, self.atom_radial_list)
         self.c2s = np.ascontiguousarray(mol.cart2sph_coeff(normalized='sp'), dtype=np.float32)
         self.buf_c2s = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, self.c2s.nbytes, self.c2s)
         self.ngrid_alloc = 0
         self.buf_coords = None
         self.buf_cart = None
         self.buf_sph = None
+        self.buf_cart_deriv = [None, None, None, None]
+        self.buf_sph_deriv = [None, None, None, None]
 
     def _ensure_grid_buffers(self, ngrids):
         if ngrids <= self.ngrid_alloc:
@@ -46,23 +54,33 @@ class OpenCLAOHermiteEvaluator:
             buf = getattr(self, name)
             if buf is not None:
                 buf.release()
+        for bufs in (self.buf_cart_deriv, self.buf_sph_deriv):
+            for buf in bufs:
+                if buf is not None:
+                    buf.release()
         self.ngrid_alloc = int(ngrids)
-        self.buf_coords = cl.Buffer(self.ctx, mf.READ_ONLY, self.ngrid_alloc * 3 * np.dtype(np.float32).itemsize)
-        self.buf_cart = cl.Buffer(self.ctx, mf.READ_WRITE, self.ngrid_alloc * self.plan.ncart * np.dtype(np.float32).itemsize)
-        self.buf_sph = cl.Buffer(self.ctx, mf.READ_WRITE, self.ngrid_alloc * self.mol.nao_nr() * np.dtype(np.float32).itemsize)
+        fbytes = np.dtype(np.float32).itemsize
+        self.buf_coords = cl.Buffer(self.ctx, mf.READ_ONLY, self.ngrid_alloc * 4 * fbytes)
+        self.buf_cart = cl.Buffer(self.ctx, mf.READ_WRITE, self.ngrid_alloc * self.plan.ncart * fbytes)
+        self.buf_sph = cl.Buffer(self.ctx, mf.READ_WRITE, self.ngrid_alloc * self.mol.nao_nr() * fbytes)
+        self.buf_cart_deriv = [cl.Buffer(self.ctx, mf.READ_WRITE, self.ngrid_alloc * self.plan.ncart * fbytes) for _ in range(4)]
+        self.buf_sph_deriv = [cl.Buffer(self.ctx, mf.READ_WRITE, self.ngrid_alloc * self.mol.nao_nr() * fbytes) for _ in range(4)]
 
     def eval_cart_buf(self, coords):
         coords = np.ascontiguousarray(coords, dtype=np.float32)
         ngrids = coords.shape[0]
+        coords4 = np.zeros((ngrids, 4), dtype=np.float32)
+        coords4[:, :3] = coords
         self._ensure_grid_buffers(ngrids)
-        cl.enqueue_copy(self.queue, self.buf_coords, coords).wait()
-        _knl(self.prg, 'eval_ao_mapped_hermite_cart')(
-            self.queue, (round_up(ngrids, TILE), round_up(self.plan.ncart, TILE)), (TILE, TILE),
-            self.buf_coords, self.buf_atom_coords, self.buf_rad_val, self.buf_rad_du,
-            self.buf_cart_shell, self.buf_cart_ctr, self.buf_cart_ixyz, self.buf_shell_atom,
+        cl.enqueue_copy(self.queue, self.buf_coords, coords4).wait()
+        _knl(self.prg, 'eval_ao_mapped_hermite_cart_atom')(
+            self.queue, (round_up(ngrids, TILE), round_up(self.natoms, TILE)), (TILE, TILE),
+            self.buf_coords, self.buf_atom_coords, self.buf_rad_val, self.buf_rad_du, self.buf_rad_dy,
+            self.buf_radial_l, self.buf_radial_cart0,
+            self.buf_atom_radial_offset, self.buf_atom_radial_list,
             self.buf_cart,
             np.float32(self.plan.r0), np.float32(self.plan.du),
-            np.int32(self.plan.nrad), np.int32(self.rad_val.shape[1]), np.int32(self.plan.ncart), np.int32(ngrids)
+            np.int32(self.plan.nrad), np.int32(self.plan.ncart), np.int32(ngrids), np.int32(self.natoms)
         )
         return self.buf_cart, ngrids
 
@@ -83,11 +101,56 @@ class OpenCLAOHermiteEvaluator:
         cl.enqueue_copy(self.queue, out, self.buf_sph).wait()
         return out
 
+    def eval_cart_deriv1_buf(self, coords):
+        coords = np.ascontiguousarray(coords, dtype=np.float32)
+        ngrids = coords.shape[0]
+        coords4 = np.zeros((ngrids, 4), dtype=np.float32)
+        coords4[:, :3] = coords
+        self._ensure_grid_buffers(ngrids)
+        cl.enqueue_copy(self.queue, self.buf_coords, coords4).wait()
+        _knl(self.prg, 'eval_ao_mapped_hermite_cart_deriv1_atom')(
+            self.queue, (round_up(ngrids, TILE), round_up(self.natoms, TILE)), (TILE, TILE),
+            self.buf_coords, self.buf_atom_coords, self.buf_rad_val, self.buf_rad_du, self.buf_rad_dy,
+            self.buf_radial_l, self.buf_radial_cart0,
+            self.buf_atom_radial_offset, self.buf_atom_radial_list,
+            self.buf_cart_deriv[0], self.buf_cart_deriv[1], self.buf_cart_deriv[2], self.buf_cart_deriv[3],
+            np.float32(self.plan.r0), np.float32(self.plan.du),
+            np.int32(self.plan.nrad), np.int32(self.plan.ncart), np.int32(ngrids), np.int32(self.natoms)
+        )
+        return self.buf_cart_deriv, ngrids
+
+    def eval_cart_deriv1(self, coords):
+        _, ngrids = self.eval_cart_deriv1_buf(coords)
+        out = np.empty((4, ngrids, self.plan.ncart), dtype=np.float32)
+        for c in range(4):
+            cl.enqueue_copy(self.queue, out[c], self.buf_cart_deriv[c]).wait()
+        return out
+
+    def eval_sph_deriv1_buf(self, coords):
+        _, ngrids = self.eval_cart_deriv1_buf(coords)
+        for c in range(4):
+            matmul_gpu_buf(self.buf_cart_deriv[c], self.buf_c2s, self.buf_sph_deriv[c], ngrids, self.mol.nao_nr(), self.plan.ncart)
+        return self.buf_sph_deriv, ngrids
+
+    def eval_sph_deriv1(self, coords):
+        _, ngrids = self.eval_sph_deriv1_buf(coords)
+        out = np.empty((4, ngrids, self.mol.nao_nr()), dtype=np.float32)
+        for c in range(4):
+            cl.enqueue_copy(self.queue, out[c], self.buf_sph_deriv[c]).wait()
+        return out
+
     def __del__(self):
-        for name in ('buf_rad_val', 'buf_rad_du', 'buf_atom_coords', 'buf_cart_shell', 'buf_cart_ctr', 'buf_cart_ixyz', 'buf_shell_atom', 'buf_c2s', 'buf_coords', 'buf_cart', 'buf_sph'):
+        for name in ('buf_rad_val', 'buf_rad_du', 'buf_rad_dy', 'buf_atom_coords', 'buf_radial_l', 'buf_radial_cart0', 'buf_atom_radial_offset', 'buf_atom_radial_list', 'buf_c2s', 'buf_coords', 'buf_cart', 'buf_sph'):
             buf = getattr(self, name, None)
             if buf is not None:
                 try:
                     buf.release()
                 except Exception:
                     pass
+        for name in ('buf_cart_deriv', 'buf_sph_deriv'):
+            for buf in getattr(self, name, []):
+                if buf is not None:
+                    try:
+                        buf.release()
+                    except Exception:
+                        pass

@@ -83,3 +83,12 @@ def to_host(darr):
 
 def round_up(val, multiple):
     return ((val + multiple - 1) // multiple) * multiple
+
+def get_device_mem_info():
+    ctx = get_ctx()
+    dev = ctx.devices[0]
+    try:
+        info = dev.get_info(cl.device_info.GLOBAL_MEM_SIZE)
+        return int(info)
+    except Exception:
+        return 4 * 1024 * 1024 * 1024  # fallback 4GB

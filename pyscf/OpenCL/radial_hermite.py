@@ -60,6 +60,7 @@ class MappedHermiteRadialBasis:
         nctr_max = max(mol.bas_nctr(ib) for ib in range(nshell))
         self.values = np.zeros((nshell, nctr_max, self.nrad), dtype=np.float32)
         self.du_values = np.zeros_like(self.values)
+        self.dy_values = np.zeros_like(self.values)
         self.shell_nctr = np.empty(nshell, dtype=np.int32)
         self.shell_l = np.empty(nshell, dtype=np.int32)
         self.shell_atom = np.empty(nshell, dtype=np.int32)
@@ -80,14 +81,49 @@ class MappedHermiteRadialBasis:
                 dy_du = _midpoint_fit(y, dy_du, np.full(self.nrad - 1, self.du), ym)
             self.values[ib, :nctr] = y.T.astype(np.float32)
             self.du_values[ib, :nctr] = dy_du.T.astype(np.float32)
+            dy = np.diff(y, axis=0)  # y[i+1]-y[i] in float64
+            self.dy_values[ib, :nctr, :-1] = dy.T.astype(np.float32)
+            self.dy_values[ib, :nctr, -1] = 0.0  # padding
             self.shell_nctr[ib] = nctr
             self.shell_l[ib] = l
             self.shell_atom[ib] = mol.bas_atom(ib)
             self.shell_cart0[ib] = cart0
             cart0 += nctr * ((l + 1) * (l + 2) // 2)
         self.ncart = cart0
-        lmax = int(self.shell_l.max()) if nshell else 0
-        powers, power_offsets = cart_powers(lmax)
+        self.lmax = int(self.shell_l.max()) if nshell else 0
+        self.nradial = int(self.shell_nctr.sum())
+        self.radial_values = np.empty((self.nradial, self.nrad), dtype=np.float32)
+        self.radial_du_values = np.empty_like(self.radial_values)
+        self.radial_dy_values = np.empty_like(self.radial_values)
+        self.radial_l = np.empty(self.nradial, dtype=np.int32)
+        self.radial_atom = np.empty(self.nradial, dtype=np.int32)
+        self.radial_cart0 = np.empty(self.nradial, dtype=np.int32)
+        ir = 0
+        for ib in range(nshell):
+            l = self.shell_l[ib]
+            ncart_l = (l + 1) * (l + 2) // 2
+            for ic in range(self.shell_nctr[ib]):
+                self.radial_values[ir] = self.values[ib, ic]
+                self.radial_du_values[ir] = self.du_values[ib, ic]
+                self.radial_dy_values[ir] = self.dy_values[ib, ic]
+                self.radial_l[ir] = l
+                self.radial_atom[ir] = self.shell_atom[ib]
+                self.radial_cart0[ir] = self.shell_cart0[ib] + ic * ncart_l
+                ir += 1
+        atom_radial_offset = np.zeros(mol.natm + 1, dtype=np.int32)
+        for ir in range(self.nradial):
+            atom_radial_offset[self.radial_atom[ir] + 1] += 1
+        for ia in range(mol.natm):
+            atom_radial_offset[ia + 1] += atom_radial_offset[ia]
+        atom_radial_list = np.empty(self.nradial, dtype=np.int32)
+        count = np.zeros(mol.natm, dtype=np.int32)
+        for ir in range(self.nradial):
+            ia = self.radial_atom[ir]
+            atom_radial_list[atom_radial_offset[ia] + count[ia]] = ir
+            count[ia] += 1
+        self.atom_radial_offset = atom_radial_offset
+        self.atom_radial_list = atom_radial_list
+        powers, power_offsets = cart_powers(self.lmax)
         self.cart_ixyz = np.empty((self.ncart, 3), dtype=np.int32)
         self.cart_shell = np.empty(self.ncart, dtype=np.int32)
         self.cart_ctr = np.empty(self.ncart, dtype=np.int32)
@@ -102,6 +138,20 @@ class MappedHermiteRadialBasis:
                     self.cart_ixyz[iao] = p
                     iao += 1
         self.atom_coords = np.asarray(mol.atom_coords(), dtype=np.float32)
+        self.natoms = mol.natm
+        atom_shell_offset = np.zeros(self.natoms + 1, dtype=np.int32)
+        for ib in range(nshell):
+            atom_shell_offset[mol.bas_atom(ib) + 1] += 1
+        for ia in range(self.natoms):
+            atom_shell_offset[ia + 1] += atom_shell_offset[ia]
+        atom_shell_list = np.empty(nshell, dtype=np.int32)
+        count = np.zeros(self.natoms, dtype=np.int32)
+        for ib in range(nshell):
+            ia = mol.bas_atom(ib)
+            atom_shell_list[atom_shell_offset[ia] + count[ia]] = ib
+            count[ia] += 1
+        self.atom_shell_offset = atom_shell_offset
+        self.atom_shell_list = atom_shell_list
 
     def eval_cart(self, coords):
         coords = np.asarray(coords, dtype=np.double)

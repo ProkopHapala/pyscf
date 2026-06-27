@@ -7,6 +7,138 @@ from .xc_grid import matmul_gpu, matmul_gpu_buf, _knl
 
 TILE = 32
 
+class DFJKPlan:
+    def __init__(self, dfobj, nao):
+        self.dfobj = dfobj
+        self.nao = int(nao)
+        self.ctx = get_ctx()
+        self.queue = get_queue()
+        self.prg = get_prg()
+        self.fbytes = np.dtype(np.float32).itemsize
+        if dfobj._cderi is None:
+            dfobj.build()
+        from pyscf.df import addons
+        with addons.load(dfobj._cderi, dfobj._dataname) as feri:
+            if isinstance(feri, np.ndarray):
+                cderi = np.asarray(feri, dtype=np.float32)
+            else:
+                cderi = np.asarray(feri[:], dtype=np.float32)
+        self.cderi = np.ascontiguousarray(cderi, dtype=np.float32)
+        self.nao_pair = self.cderi.shape[1]
+        self.naux = self.cderi.shape[0]
+        assert self.nao_pair == self.nao * (self.nao + 1) // 2, f'nao_pair mismatch: {self.nao_pair} vs {self.nao*(self.nao+1)//2}'
+        self.bufCderi = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, self.cderi.nbytes, self.cderi)
+        self.tril_idx = np.tril_indices(self.nao)
+        idx = np.arange(self.nao)
+        self.diag_pack_idx = idx * (idx + 1) // 2 + idx
+        self.nset_alloc = 0
+        self.bufDmtril = None
+        self.bufTmp = None
+        self.bufVjPacked = None
+        self.bufVjFull = None
+        self.vj_full = None
+        self.bufCderiFull = None
+        self.bufDmAll = None
+        self.bufBuf1All = None
+        self.bufBuf1RAll = None
+        self.bufVkAll = None
+        self.vk_all = None
+        self.nset_k_alloc = 0
+
+    def ensure_nset(self, nset):
+        if nset <= self.nset_alloc:
+            return
+        for name in ('bufDmtril', 'bufTmp', 'bufVjPacked', 'bufVjFull'):
+            buf = getattr(self, name)
+            if buf is not None:
+                buf.release()
+        self.nset_alloc = int(nset)
+        self.bufDmtril = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY, self.nset_alloc * self.nao_pair * self.fbytes)
+        self.bufTmp = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, self.nset_alloc * self.naux * self.fbytes)
+        self.bufVjPacked = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, self.nset_alloc * self.nao_pair * self.fbytes)
+        self.bufVjFull = cl.Buffer(self.ctx, cl.mem_flags.WRITE_ONLY, self.nset_alloc * self.nao * self.nao * self.fbytes)
+        self.vj_full = np.empty((self.nset_alloc, self.nao, self.nao), dtype=np.float32)
+
+    def ensure_k_buffers(self, nset=1):
+        if self.bufCderiFull is None:
+            self.bufCderiFull = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, self.naux * self.nao * self.nao * self.fbytes)
+            _unpack_tril_batched_to_buf_gpu(self.prg, self.queue, self.ctx, self.bufCderi, self.bufCderiFull, self.naux, self.nao, self.nao_pair)
+        if nset <= self.nset_k_alloc:
+            return
+        for name in ('bufDmAll', 'bufBuf1All', 'bufBuf1RAll', 'bufVkAll'):
+            buf = getattr(self, name)
+            if buf is not None:
+                buf.release()
+        self.nset_k_alloc = int(nset)
+        ns = self.nset_k_alloc
+        self.bufDmAll = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY, ns * self.nao * self.nao * self.fbytes)
+        self.bufBuf1All = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, self.naux * self.nao * ns * self.nao * self.fbytes)
+        self.bufBuf1RAll = cl.Buffer(self.ctx, cl.mem_flags.READ_WRITE, ns * self.nao * self.naux * self.nao * self.fbytes)
+        self.bufVkAll = cl.Buffer(self.ctx, cl.mem_flags.WRITE_ONLY, ns * self.nao * self.nao * self.fbytes)
+        self.vk_all = np.empty((ns, self.nao, self.nao), dtype=np.float32)
+
+    def get_jk(self, dm, hermi=0, with_j=True, with_k=True):
+        dms = np.asarray(dm)
+        dm_shape = dms.shape
+        nao = dm_shape[-1]
+        assert nao == self.nao, f'nao mismatch: {nao} vs {self.nao}'
+        dms = dms.reshape(-1, nao, nao)
+        nset = dms.shape[0]
+        self.ensure_nset(nset)
+        vj = None
+        vk = None
+
+        if with_j:
+            dm_sym = dms + dms.conj().transpose(0, 2, 1)
+            dmtril = np.ascontiguousarray(dm_sym[:, self.tril_idx[0], self.tril_idx[1]], dtype=np.float32)
+            dmtril[:, self.diag_pack_idx] *= 0.5
+            cl.enqueue_copy(self.queue, self.bufDmtril, dmtril).wait()
+            matmul_gpu_buf(self.bufDmtril, self.bufCderi, self.bufTmp, nset, self.naux, self.nao_pair, transpose_B=True)
+            matmul_gpu_buf(self.bufTmp, self.bufCderi, self.bufVjPacked, nset, self.nao_pair, self.naux)
+            _unpack_tril_batched_to_buf_gpu(self.prg, self.queue, self.ctx, self.bufVjPacked, self.bufVjFull, nset, nao, self.nao_pair)
+            cl.enqueue_copy(self.queue, self.vj_full[:nset], self.bufVjFull).wait()
+            vj = self.vj_full[:nset].astype(np.float64)
+
+        if with_k:
+            self.ensure_k_buffers(nset)
+            dm_all = np.ascontiguousarray(dms.transpose(1, 0, 2).reshape(nao, nset * nao), dtype=np.float32)
+            cl.enqueue_copy(self.queue, self.bufDmAll, dm_all).wait()
+            matmul_gpu_buf(self.bufCderiFull, self.bufDmAll, self.bufBuf1All, self.naux * nao, nset * nao, nao)
+            _knl(self.prg, 'transpose_k_buf1_batched')(
+                self.queue, (round_up(nao, TILE), round_up(self.naux * nao, TILE), nset), (TILE, TILE, 1),
+                self.bufBuf1All, self.bufBuf1RAll,
+                np.int32(self.naux), np.int32(nao), np.int32(nset)
+            )
+            matmul_gpu_buf(self.bufBuf1RAll, self.bufCderiFull, self.bufVkAll, nset * nao, nao, self.naux * nao)
+            cl.enqueue_copy(self.queue, self.vk_all[:nset], self.bufVkAll).wait()
+            vk = self.vk_all[:nset].astype(np.float64)
+
+        if vj is not None:
+            vj = vj.reshape(dm_shape)
+        if vk is not None:
+            vk = vk.reshape(dm_shape)
+        return vj, vk
+
+    def release(self):
+        for name in ('bufCderi', 'bufDmtril', 'bufTmp', 'bufVjPacked', 'bufVjFull', 'bufCderiFull', 'bufDmAll', 'bufBuf1All', 'bufBuf1RAll', 'bufVkAll'):
+            buf = getattr(self, name, None)
+            if buf is not None:
+                buf.release()
+
+
+_df_plan_cache = {}
+
+
+def get_df_jk_plan(dfobj, nao):
+    key = (id(dfobj), int(nao))
+    plan = _df_plan_cache.get(key)
+    if plan is not None and plan.nao == int(nao):
+        return plan
+    plan = DFJKPlan(dfobj, nao)
+    _df_plan_cache[key] = plan
+    return plan
+
+
 def df_jk_gpu(dfobj, dm, hermi=0, with_j=True, with_k=True):
     '''DF J/K contraction on GPU using tiled GEMM.
 
@@ -16,103 +148,8 @@ def df_jk_gpu(dfobj, dm, hermi=0, with_j=True, with_k=True):
     K: vk = sum_P cderi_P[i,j] * dm[j,k] * cderi_P[k,i]
          = einsum('pij,jk->pki', cderi, dm) then einsum('pki,pkj->ij', ...)
     '''
-    ctx = get_ctx()
-    queue = get_queue()
-    prg = get_prg()
-
-    dms = np.asarray(dm)
-    dm_shape = dms.shape
-    nao = dm_shape[-1]
-    dms = dms.reshape(-1, nao, nao)
-    nset = dms.shape[0]
-
-    # Get cderi (the full Cholesky-decomposed 3-center integral tensor)
-    if dfobj._cderi is None:
-        dfobj.build()
-    from pyscf.df import addons
-    with addons.load(dfobj._cderi, dfobj._dataname) as feri:
-        if isinstance(feri, np.ndarray):
-            cderi = np.asarray(feri, dtype=np.float32)
-        else:
-            cderi = np.asarray(feri[:], dtype=np.float32)
-
-    cderi = np.ascontiguousarray(cderi, dtype=np.float32)
-    nao_pair = cderi.shape[1]
-    naux = cderi.shape[0]
-    assert nao_pair == nao * (nao + 1) // 2, f'nao_pair mismatch: {nao_pair} vs {nao*(nao+1)//2}'
-    fbytes = np.dtype(np.float32).itemsize
-    bufCderi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, cderi.nbytes, cderi)
-
-    vj = None
-    vk = None
-
-    if with_j:
-        # dmtril: packed triangular of (dm + dm^T)
-        idx = np.arange(nao)
-        dmtril = np.zeros((nset, nao_pair), dtype=np.float32)
-        for k in range(nset):
-            dm_sym = dms[k] + dms[k].conj().T
-            dmtril[k] = _pack_tril_cpu(dm_sym.astype(np.float32))
-            dmtril[k, idx*(idx+1)//2+idx] *= 0.5
-
-        # tmp = dmtril * cderi^T  -> [nset, naux]
-        # vj_packed = tmp * cderi -> [nset, nao_pair]
-        bufDmtril = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, dmtril.nbytes, dmtril)
-        bufTmp = cl.Buffer(ctx, cl.mem_flags.READ_WRITE, nset * naux * fbytes)
-        bufVjPacked = cl.Buffer(ctx, cl.mem_flags.READ_WRITE, nset * nao_pair * fbytes)
-        matmul_gpu_buf(bufDmtril, bufCderi, bufTmp, nset, naux, nao_pair, transpose_B=True)
-        matmul_gpu_buf(bufTmp, bufCderi, bufVjPacked, nset, nao_pair, naux)
-
-        # Unpack triangular to full
-        vj = _unpack_tril_batched_from_buf_gpu(prg, queue, ctx, bufVjPacked, nset, nao, nao_pair).astype(np.float64)
-        bufDmtril.release()
-        bufTmp.release()
-        bufVjPacked.release()
-
-    if with_k:
-        # Unpack cderi on GPU
-        bufCderiFull = cl.Buffer(ctx, cl.mem_flags.READ_WRITE, naux * nao * nao * fbytes)
-        _unpack_tril_batched_to_buf_gpu(prg, queue, ctx, bufCderi, bufCderiFull, naux, nao, nao_pair)
-
-        vk = np.zeros((nset, nao, nao), dtype=np.float64)
-        vk_tmp = np.empty((nao, nao), dtype=np.float32)
-        bufDm = cl.Buffer(ctx, cl.mem_flags.READ_ONLY, nao * nao * fbytes)
-        bufBuf1 = cl.Buffer(ctx, cl.mem_flags.READ_WRITE, naux * nao * nao * fbytes)
-        bufBuf1R = cl.Buffer(ctx, cl.mem_flags.READ_WRITE, nao * naux * nao * fbytes)
-        bufVk = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, nao * nao * fbytes)
-        for k in range(nset):
-            dm32 = np.ascontiguousarray(dms[k], dtype=np.float32)
-            cl.enqueue_copy(queue, bufDm, dm32).wait()
-
-            # buf1[p, i, k] = sum_j cderi_full[p, i, j] * dm[j, k]
-            # Reshape cderi_full [naux, nao, nao] -> [naux*nao, nao], matmul with dm
-            matmul_gpu_buf(bufCderiFull, bufDm, bufBuf1, naux * nao, nao, nao)
-
-            # vk = einsum('ipk,pkj->ij', buf1, cderi_full)
-            # buf1_reshaped[i, p*nao+k] = buf1[i, p, k]
-            # cderi_reshaped[p*nao+k, j] = cderi_full[p, k, j]
-            _knl(prg, 'transpose_k_buf1')(
-                queue, (round_up(nao, TILE), round_up(naux * nao, TILE)), (TILE, TILE),
-                bufBuf1, bufBuf1R,
-                np.int32(naux), np.int32(nao)
-            )
-            matmul_gpu_buf(bufBuf1R, bufCderiFull, bufVk, nao, nao, naux * nao)
-            cl.enqueue_copy(queue, vk_tmp, bufVk).wait()
-            vk[k] = vk_tmp.astype(np.float64)
-        bufCderiFull.release()
-        bufDm.release()
-        bufBuf1.release()
-        bufBuf1R.release()
-        bufVk.release()
-
-    bufCderi.release()
-
-    if vj is not None:
-        vj = vj.reshape(dm_shape)
-    if vk is not None:
-        vk = vk.reshape(dm_shape)
-
-    return vj, vk
+    dm_arr = np.asarray(dm)
+    return get_df_jk_plan(dfobj, dm_arr.shape[-1]).get_jk(dm_arr, hermi=hermi, with_j=with_j, with_k=with_k)
 
 def _pack_tril_cpu(mat):
     '''Pack lower triangular of a symmetric matrix.'''

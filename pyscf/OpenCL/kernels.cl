@@ -1006,3 +1006,52 @@ __kernel void compute_nelec_exc(
     nelec_exc[0 * ngrids + igrid] = den;
     nelec_exc[1 * ngrids + igrid] = den * exc[igrid];
 }
+
+__kernel void eval_ao_mapped_hermite_cart(
+    __global const float *coords,
+    __global const float *atom_coords,
+    __global const float *rad_val,
+    __global const float *rad_du,
+    __global const int   *cart_shell,
+    __global const int   *cart_ctr,
+    __global const int   *cart_ixyz,
+    __global const int   *shell_atom,
+    __global float       *ao,
+    float r0, float du,
+    int nrad, int nctr_max, int ncart, int ngrids)
+{
+    int g = get_global_id(0);
+    int iao = get_global_id(1);
+    if (g >= ngrids || iao >= ncart) return;
+
+    int sh = cart_shell[iao];
+    int ctr = cart_ctr[iao];
+    int at = shell_atom[sh];
+    int xyz0 = g * 3;
+    int at0 = at * 3;
+    float dx = coords[xyz0]     - atom_coords[at0];
+    float dy = coords[xyz0 + 1] - atom_coords[at0 + 1];
+    float dz = coords[xyz0 + 2] - atom_coords[at0 + 2];
+    float r = sqrt(dx*dx + dy*dy + dz*dz);
+    float uf = log1p(r / r0) / du;
+    int i = (int)floor(uf);
+    i = max(0, min(i, nrad - 2));
+    float t = clamp(uf - (float)i, 0.0f, 1.0f);
+    float t2 = t * t;
+    float t3 = t2 * t;
+    int base = (sh * nctr_max + ctr) * nrad + i;
+    float y0 = rad_val[base];
+    float y1 = rad_val[base + 1];
+    float d0 = rad_du[base];
+    float d1 = rad_du[base + 1];
+    float radial = (2.0f*t3 - 3.0f*t2 + 1.0f) * y0 + (t3 - 2.0f*t2 + t) * du * d0 + (-2.0f*t3 + 3.0f*t2) * y1 + (t3 - t2) * du * d1;
+    int p0 = iao * 3;
+    int ix = cart_ixyz[p0];
+    int iy = cart_ixyz[p0 + 1];
+    int iz = cart_ixyz[p0 + 2];
+    // note - there we should use bit-shift not stupid pow() !!!!!
+    float ax = ix == 0 ? 1.0f : (ix == 1 ? dx : (ix == 2 ? dx*dx : pow(dx, (float)ix)));
+    float ay = iy == 0 ? 1.0f : (iy == 1 ? dy : (iy == 2 ? dy*dy : pow(dy, (float)iy)));
+    float az = iz == 0 ? 1.0f : (iz == 1 ? dz : (iz == 2 ? dz*dz : pow(dz, (float)iz)));
+    ao[g * ncart + iao] = radial * ax * ay * az;
+}

@@ -1167,3 +1167,874 @@ These are still within expected float32 precision.
   - `@/home/prokophapala/git/pyscf/pyscf/OpenCL/kernels.cl:1`
 
 Status: **performance improvements implemented and validated by tests**.
+
+---
+
+# USER
+
+OK, I'm still not very satified how the code looks and especially the python harness. 
+
+One problem is that we use independnet functions, instead of class which can keep persistent arrays and buffers in memory (they should be pre-initialized, bked when the program start, and not rebuild every SCF cycle)
+
+perhaps it would be best to make singke pySCFocl.py with single class which manage the function centrally and build @kernels.cl with all kernels, this is majhor refactro but I think worth it
+
+still you are doing a lot in tight loops
+this looks pretty horrible when ngrid is large !
+``
+for ip0 in range(0, ngrids, BLK):
+        ip1 = min(ip0 + BLK, ngrids)
+        nblk = ip1 - ip0
+        coords_blk = grids.coords[ip0:ip1]
+        weight_blk = grids.weights[ip0:ip1]
+        if xctype == 'LDA':
+``
+@xc_grid.py 
+this should be batched! all grid point must run in parallel on GPU (each workgroup can process one grid point or something like that.
+
+here again we do some loop which should be pposible to batch possibly @df_jk.py 
+``
+        for k in range(nset):
+            dm32 = np.ascontiguousarray(dms[k], dtype=np.float32)
+            cl.enqueue_copy(queue, bufDm, dm32).wait()
+
+            # buf1[p, i, k] = sum_j cderi_full[p, i, j] * dm[j, k]
+            # Reshape cderi_full [naux, nao, nao] -> [naux*nao, nao], matmul with dm
+            matmul_gpu_buf(bufCderiFull, bufDm, bufBuf1, naux * nao, nao, nao)
+
+            # vk = einsum('ipk,pkj->ij', buf1, cderi_full)
+            # buf1_reshaped[i, p*nao+k] = buf1[i, p, k]
+            # cderi_reshaped[p*nao+k, j] = cderi_full[p, k, j]
+            _knl(prg, 'transpose_k_buf1')(
+                queue, (round_up(nao, TILE), round_up(naux * nao, TILE)), (TILE, TILE),
+                bufBuf1, bufBuf1R,
+                np.int32(naux), np.int32(nao)
+            )
+            matmul_gpu_buf(bufBuf1R, bufCderiFull, bufVk, nao, nao, naux * nao)
+            cl.enqueue_copy(queue, vk_tmp, bufVk).wait()
+            vk[k] = vk_tmp.astype(np.float64)
+``
+
+note - the main desing question is how to do the batching (packing data to GPU array and unpacking the results) with minimal python overhead. That means with minimal python loops. I think in general it can be done with pre-initialized index arrays and mask allowing us to do simple numpy array operations in runtime instead of costly python loops. These index arrays and masks should be baked at startup of the problem. Figure out how to do it, think deepluy about it is it chalange. only once you think it through concpetulaly providning some pseudocode, we start to implement it
+
+---
+
+# GPT 5.5 High
+
+I’m not going to implement yet. Here is the design I think is correct before touching the code again.# Design Direction
+
+You are right: the current code improves individual hot spots, but the **architecture is still wrong** for repeated SCF use.
+
+The right direction is a persistent OpenCL manager, probably `PySCFOCL`, owning:
+
+- **Context/program/queues**
+- **Compiled kernels**
+- **Reusable buffers**
+- **Problem-specific plans**
+- **Baked index/mask arrays**
+- **Batched execution paths**
+
+This should replace scattered standalone helpers in `@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:18-228` and `@/home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:39-152`.
+
+# Key Correction
+
+The goal is not literally “no loop over grid blocks” in all cases.
+
+For large grids, a block loop may still be necessary because:
+
+- **AO values** are currently evaluated by CPU PySCF.
+- Full `ao[4, ngrids, nao]` may be too large for memory.
+- `libxc` is still CPU-side, so `rho` must come back unless we port XC.
+- GPU memory limits require chunking for big molecules.
+
+But the loop must become a **persistent scheduled streaming loop**, not a Python loop that reallocates and rebuilds objects.
+
+So the design target is:
+
+- **No per-SCF allocation**
+- **No per-block allocation**
+- **Minimal Python scalar loops**
+- **All index/mask logic baked once**
+- **All runtime work = upload DM, launch batched kernels, download final results**
+
+# Proposed File Layout
+
+I would make one central manager:
+
+- `@/home/prokophapala/git/pyscf/pyscf/OpenCL/pyscfocl.py:1`
+
+Then keep thin compatibility wrappers:
+
+- `@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:1`
+- `@/home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:1`
+
+The wrappers just call the singleton/session object.
+
+Example structure:
+
+```python
+class PySCFOCL:
+    def __init__(self, device=None, dtype=np.float32):
+        self.ctx = ...
+        self.queue = ...
+        self.prg = build_all_kernels()
+        self.pool = CLBufferPool(self.ctx)
+        self.grid_plans = {}
+        self.df_plans = {}
+
+    def prepare_grid(self, mol, grids, xc_code, nao, max_memory):
+        key = GridKey(...)
+        if key not in self.grid_plans:
+            self.grid_plans[key] = GridPlan(self, mol, grids, xc_code, nao, max_memory)
+        return self.grid_plans[key]
+
+    def prepare_df(self, dfobj, nao, nset_max):
+        key = DFKey(...)
+        if key not in self.df_plans:
+            self.df_plans[key] = DFPlan(self, dfobj, nao, nset_max)
+        return self.df_plans[key]
+
+    def nr_rks(self, mol, grids, xc_code, dm):
+        plan = self.prepare_grid(...)
+        return plan.run(dm)
+
+    def df_jk(self, dfobj, dms, with_j=True, with_k=True):
+        plan = self.prepare_df(...)
+        return plan.run(dms, with_j, with_k)
+```
+
+# Persistent Buffer Pool
+
+The core primitive should be this:
+
+```python
+class CLBufferPool:
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.buf = {}
+
+    def ensure(self, name, nbytes, flags):
+        old = self.buf.get(name)
+        if old is None or old.nbytes < nbytes:
+            if old is not None:
+                old.release()
+            self.buf[name] = cl.Buffer(self.ctx, flags, nbytes)
+        return self.buf[name]
+```
+
+Then every plan does:
+
+```python
+buf_dm = pool.ensure("grid.dm", nao*nao*fbytes, READ_ONLY)
+buf_ao = pool.ensure("grid.ao", ncomp*blk*nao*fbytes, READ_WRITE)
+buf_rho = pool.ensure("grid.rho", ncomp*blk*fbytes, READ_WRITE)
+buf_vmat = pool.ensure("grid.vmat", nao*nao*fbytes, WRITE_ONLY)
+```
+
+Important: allocation only occurs when shape grows.
+
+# Grid Plan Design
+
+## Current Problem
+
+In `@/home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:133-213`, the loop does:
+
+- Slice coordinates
+- Slice weights
+- Evaluate AO on CPU
+- Upload AO
+- GEMM
+- Launch rho kernel
+- Download rho
+- Call libxc
+- Upload weights/XC potential
+- Launch aow kernel
+- GEMM
+- Download vmat block
+
+This is better than before but still too much orchestration in Python.
+
+## Better Design
+
+Create a `GridPlan` once per molecule/grid/xc type.
+
+It stores:
+
+- `ngrids`
+- `nao`
+- `xctype`
+- `ncomp = 1 or 4`
+- `BLK`
+- `nblk_total`
+- `block_starts`
+- `block_sizes`
+- `padded_blk`
+- Persistent host arrays:
+  - `ao_h`
+  - `rho_h`
+  - `wv_h`
+  - `vmat_h`
+- Persistent GPU arrays:
+  - `dm_g`
+  - `ao_g`
+  - `aodm_g`
+  - `rho_g`
+  - `wv_g`
+  - `aow_g`
+  - `vmat_g`
+  - `vmat_accum_g`
+- Optional pinned/mapped host arrays if PyOpenCL platform supports them.
+
+Pseudocode:
+
+```python
+class GridPlan:
+    def __init__(self, ocl, mol, grids, xc_code, nao, max_memory):
+        self.ocl = ocl
+        self.mol = mol
+        self.grids = grids
+        self.xc_code = xc_code
+        self.xctype = detect_xctype(xc_code)
+        self.nao = nao
+        self.ngrids = len(grids.coords)
+
+        self.BLK = choose_blk(nao, ngrids, gpu_mem, max_memory)
+        self.starts = np.arange(0, ngrids, self.BLK, dtype=np.int32)
+        self.sizes = np.minimum(self.BLK, ngrids - self.starts).astype(np.int32)
+
+        self.prepare_host_workspaces()
+        self.prepare_device_workspaces()
+        self.prepare_static_device_arrays()
+
+    def prepare_static_device_arrays(self):
+        self.weight_g = upload_once(grids.weights.astype(float32))
+        self.coords_h = grids.coords
+```
+
+Runtime:
+
+```python
+def run(self, dm):
+    upload dm once
+    zero vmat_accum_g
+
+    for block_id in baked_block_ids:
+        nblk = self.sizes[block_id]
+
+        ao_h = eval_ao_cpu_into_reused_array(block_id)
+
+        upload ao_h into ao_g
+        launch all rho kernels for this block
+        download rho_h only
+        call libxc on rho_h
+        upload wv_h
+        launch aow kernel
+        launch GEMM contribution
+        launch vmat_accum kernel OR download block and accumulate CPU
+
+    download final vmat
+    symmetrize if GGA
+    return nelec, excsum, vmat
+```
+
+This still has a block loop, but it is now a scheduler over preallocated buffers. No allocations. No dynamic indexing. No temporary arrays.
+
+# Can We Process All Grid Points in One GPU Launch?
+
+Only if we move **AO evaluation** and **XC functional evaluation** to GPU.
+
+Otherwise the true dependency is:
+
+```text
+coords -> CPU AO eval -> GPU rho -> CPU libxc -> GPU vmat
+```
+
+So with current PySCF AO/libxc, full GPU grid parallelism is blocked by CPU stages.
+
+## Option A: Near-Term Practical
+
+Keep CPU AO and CPU libxc, but reduce overhead:
+
+```text
+CPU AO block -> GPU rho/aow/GEMM block
+```
+
+This is what we should polish now.
+
+## Option B: Full GPU Grid
+
+Port or call GPU kernels for:
+
+- AO basis evaluation
+- Becke/grid weights if needed
+- XC functional evaluation
+
+Then runtime becomes:
+
+```text
+coords_g, weights_g, dm_g -> rho_g -> exc_g/wv_g -> vmat_g
+```
+
+Then all grids can run in one or a few global kernels.
+
+This is the real “all grid points in parallel” design, but it is much larger.
+
+# Better Grid Batching Without Python Scalar Logic
+
+Use baked arrays:
+
+```python
+self.block_starts = np.arange(0, ngrids, BLK, dtype=np.int32)
+self.block_sizes = np.minimum(BLK, ngrids - self.block_starts).astype(np.int32)
+self.valid_mask = np.arange(BLK)[None, :] < self.block_sizes[:, None]
+```
+
+Then runtime avoids repeated Python shape/index decisions.
+
+For GPU kernels, use padded block size:
+
+```python
+padded_ngrid = nblocks * BLK
+```
+
+Store AO as:
+
+```text
+ao_g[ncomp, nblocks, BLK, nao]
+rho_g[ncomp, nblocks, BLK]
+wv_g[ncomp, nblocks, BLK]
+```
+
+Then kernels use:
+
+```c
+block = get_global_id(0)
+g_local = get_global_id(1)
+i = get_global_id(2)
+
+valid = g_local < block_sizes[block]
+global_grid = block_starts[block] + g_local
+```
+
+This lets one kernel cover all blocks:
+
+```c
+__kernel void contract_rho_gga_batched(
+    ao_g, aodm_g, rho_g,
+    block_starts, block_sizes,
+    int nao, int BLK)
+{
+    int b = get_global_id(0);
+    int g = get_global_id(1);
+
+    if (g >= block_sizes[b]) return;
+
+    ...
+}
+```
+
+But this requires all AO blocks to be resident on GPU. If AO is CPU-generated, we can still fill `ao_g` block-by-block, but then launch one batched rho/aow/GEMM after uploading many blocks.
+
+# Recommended Grid Refactor Stages
+
+## Stage 1: Persistent `GridPlan`
+
+No algorithm change yet.
+
+- Move all buffers from [nr_rks_gpu()](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:90:0-227:30) into a persistent class.
+- [nr_rks_gpu()](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:90:0-227:30) becomes wrapper.
+- No per-call allocation except if `nao/ngrids/BLK` grows.
+
+## Stage 2: Pinned host buffers
+
+Use pinned host arrays for:
+
+- AO
+- rho
+- wv
+- vmat block
+
+Pseudocode:
+
+```python
+self.ao_h = cl.array.empty(queue, shape, dtype, allocator=pinned_allocator)
+```
+
+This reduces transfer overhead and avoids NumPy allocation churn.
+
+## Stage 3: Batched multiple AO blocks
+
+Instead of:
+
+```text
+eval AO block
+upload AO block
+compute block
+```
+
+Use a ring buffer:
+
+```text
+CPU fills AO slot 0
+GPU computes slot 0 while CPU fills slot 1
+GPU computes slot 1 while CPU fills slot 0
+```
+
+Pseudo:
+
+```python
+for b in blocks:
+    slot = b % NSTREAM
+    wait_until_slot_free(slot)
+
+    fill_ao_host(slot, b)
+    ev_upload = enqueue_upload(slot)
+    ev_compute = enqueue_compute(slot, wait_for=[ev_upload])
+    mark_slot_busy(slot, ev_compute)
+```
+
+This is probably the best near-term win because AO/libxc are CPU bottlenecks.
+
+## Stage 4: GPU accumulation
+
+Instead of downloading `vmat_blk` every block, accumulate on GPU:
+
+```c
+atomic_add(vmat_accum[i,j], vmat_blk[i,j])
+```
+
+or better:
+
+```text
+one vmat per block -> reduction kernel
+```
+
+Avoid atomics if possible:
+
+```text
+vmat_blocks[nblocks, nao, nao]
+reduce_vmat_blocks -> vmat
+```
+
+Memory permitting.
+
+# DF Plan Design
+
+## Current Problem
+
+In `@/home/prokophapala/git/pyscf/pyscf/OpenCL/df_jk.py:83-101`, K still loops over `nset`:
+
+```text
+for each density matrix:
+    upload dm
+    cderi_full @ dm
+    transpose
+    buf1_r @ cderi_full
+    download vk
+```
+
+This should be batched over `nset`.
+
+## Correct Batched K Math
+
+For each density matrix `s`:
+
+```text
+buf1[s, p, i, k] = sum_j cderi[p, i, j] * dm[s, j, k]
+vk[s, i, j] = sum_{p,k} buf1[s, p, i, k] * cderi[p, k, j]
+```
+
+Pack all density matrices:
+
+```text
+dms_g[nset, nao, nao]
+```
+
+Then treat first GEMM as a batched operation.
+
+Current GEMM helper is 2D only. Need either:
+
+## Option A: Use strided batched GEMM kernel
+
+Add kernel:
+
+```c
+batched_matmul_tiled(
+    A, B, C,
+    strideA, strideB, strideC,
+    M, N, K,
+    nbatch)
+```
+
+Global dimensions:
+
+```text
+global = (ceil(M/TILE)*TILE, ceil(N/TILE)*TILE, nbatch)
+local  = (TILE, TILE, 1)
+```
+
+Then:
+
+```python
+batched_matmul(
+    A = cderi_full,        # same for all batches
+    B = dms,               # batch-varying
+    C = buf1,              # batch-varying
+    M = naux*nao,
+    N = nao,
+    K = nao,
+    batch = nset,
+    strideA = 0,
+    strideB = nao*nao,
+    strideC = naux*nao*nao,
+)
+```
+
+Use `strideA=0` to broadcast `cderi_full` over all density matrices.
+
+Then transpose batched:
+
+```c
+buf1_r[s, i, p, k] = buf1[s, p, i, k]
+```
+
+Then second batched GEMM:
+
+```python
+batched_matmul(
+    A = buf1_r,            # batch-varying
+    B = cderi_full,        # same for all batches
+    C = vk,                # batch-varying
+    M = nao,
+    N = nao,
+    K = naux*nao,
+    batch = nset,
+    strideA = nao*naux*nao,
+    strideB = 0,
+    strideC = nao*nao,
+)
+```
+
+This removes the Python loop over `nset`.
+
+## Option B: Fuse K contraction
+
+A custom kernel computes:
+
+```text
+vk[s, i, j] = sum_p sum_k cderi[p,i,k] * dm[s,k,l?] ...
+```
+
+But this is basically a large tensor contraction. GEMM-based is simpler and likely faster.
+
+So I recommend **batched GEMM first**, not a hand-fused K kernel.
+
+# DF Baked Index Arrays
+
+For J, packing triangular density matrices still has Python loop:
+
+```python
+for k in range(nset):
+    dm_sym = dms[k] + dms[k].T
+    dmtril[k] = pack_tril(dm_sym)
+```
+
+This can be vectorized with baked indices:
+
+At plan init:
+
+```python
+tril_i, tril_j = np.tril_indices(nao)
+diag_mask = tril_i == tril_j
+tril_i_g = upload(tril_i)
+tril_j_g = upload(tril_j)
+diag_mask_g = upload(diag_mask)
+```
+
+Runtime CPU vectorized version:
+
+```python
+dmtril = dms[:, tril_i, tril_j] + dms[:, tril_j, tril_i]
+dmtril[:, diag_mask] *= 0.5
+```
+
+Better GPU version:
+
+```c
+__kernel void pack_dmtril_batched(
+    dms, dmtril, tril_i, tril_j, diag_mask,
+    nset, nao, nao_pair)
+{
+    int s = get_global_id(0);
+    int q = get_global_id(1);
+    int i = tril_i[q];
+    int j = tril_j[q];
+
+    float v = dms[s*nao*nao + i*nao + j] + dms[s*nao*nao + j*nao + i];
+    if (i == j) v *= 0.5f;
+    dmtril[s*nao_pair + q] = v;
+}
+```
+
+Then J becomes fully batched:
+
+```text
+upload dms once
+pack_dmtril_batched
+batched or normal GEMM: dmtril @ cderi.T
+batched or normal GEMM: tmp @ cderi
+unpack_tril_batched
+download vj
+```
+
+Actually J can use normal 2D GEMM because `dmtril` is already `[nset, nao_pair]`.
+
+# Proposed `DFPlan`
+
+```python
+class DFPlan:
+    def __init__(self, ocl, dfobj, nao, nset_max):
+        self.ocl = ocl
+        self.nao = nao
+        self.nao_pair = nao * (nao + 1) // 2
+        self.naux = ...
+        self.nset_max = nset_max
+
+        self.cderi_h = load_cderi_once(dfobj)
+        self.cderi_g = upload_once(cderi_h)
+
+        self.tril_i, self.tril_j = np.tril_indices(nao)
+        self.tril_i_g = upload_once(self.tril_i.astype(int32))
+        self.tril_j_g = upload_once(self.tril_j.astype(int32))
+
+        self.cderi_full_g = alloc(naux * nao * nao)
+        launch unpack_tril_batched(cderi_g -> cderi_full_g)
+
+        self.dms_g = alloc(nset_max * nao * nao)
+        self.dmtril_g = alloc(nset_max * nao_pair)
+        self.tmp_j_g = alloc(nset_max * naux)
+        self.vj_pack_g = alloc(nset_max * nao_pair)
+        self.vj_g = alloc(nset_max * nao * nao)
+
+        self.buf1_g = alloc(nset_max * naux * nao * nao)
+        self.buf1_r_g = alloc(nset_max * nao * naux * nao)
+        self.vk_g = alloc(nset_max * nao * nao)
+```
+
+Runtime:
+
+```python
+def run(self, dms, with_j, with_k):
+    nset = dms.shape[0]
+    upload dms once
+
+    if with_j:
+        pack_dmtril_batched(dms_g -> dmtril_g)
+        matmul(dmtril_g, cderi_g.T -> tmp_j_g)
+        matmul(tmp_j_g, cderi_g -> vj_pack_g)
+        unpack_tril_batched(vj_pack_g -> vj_g)
+
+    if with_k:
+        batched_matmul(cderi_full_g, dms_g -> buf1_g, broadcast_A=True)
+        transpose_k_buf1_batched(buf1_g -> buf1_r_g)
+        batched_matmul(buf1_r_g, cderi_full_g -> vk_g, broadcast_B=True)
+
+    download requested vj/vk
+```
+
+This removes the `for k in range(nset)` loop entirely.
+
+# Required New Kernels
+
+## `batched_matmul_tiled`
+
+Generic and reusable.
+
+```c
+__kernel void batched_matmul_tiled(
+    __global const float *A,
+    __global const float *B,
+    __global float *C,
+    int M, int N, int K,
+    int strideA, int strideB, int strideC)
+{
+    int row = get_global_id(0);
+    int col = get_global_id(1);
+    int batch = get_global_id(2);
+
+    A += batch * strideA;
+    B += batch * strideB;
+    C += batch * strideC;
+
+    tiled GEMM body...
+}
+```
+
+Broadcast is handled by `strideA=0` or `strideB=0`.
+
+## `pack_dmtril_batched`
+
+Uses baked triangular indices.
+
+```c
+__kernel void pack_dmtril_batched(
+    __global const float *dms,
+    __global float *dmtril,
+    __global const int *tril_i,
+    __global const int *tril_j,
+    int nset, int nao, int nao_pair)
+{
+    int s = get_global_id(0);
+    int q = get_global_id(1);
+    if (s >= nset || q >= nao_pair) return;
+
+    int i = tril_i[q];
+    int j = tril_j[q];
+
+    float v = dms[s*nao*nao + i*nao + j] + dms[s*nao*nao + j*nao + i];
+    if (i == j) v *= 0.5f;
+
+    dmtril[s*nao_pair + q] = v;
+}
+```
+
+## `transpose_k_buf1_batched`
+
+```c
+__kernel void transpose_k_buf1_batched(
+    __global const float *buf1,
+    __global float *buf1_r,
+    int naux, int nao)
+{
+    int s = get_global_id(0);
+    int i = get_global_id(1);
+    int pk = get_global_id(2);
+
+    int p = pk / nao;
+    int k = pk - p * nao;
+
+    buf1_r[(s*nao + i)*naux*nao + pk] =
+        buf1[((s*naux + p)*nao + i)*nao + k];
+}
+```
+
+# Runtime Python Should Look Like This
+
+For DF:
+
+```python
+vj, vk = ocl.df_plan(dfobj, nao, nset_max).run(dms, with_j=True, with_k=True)
+```
+
+Internally:
+
+```python
+upload dms
+if with_j:
+    launch pack_dmtril_batched
+    launch GEMM
+    launch GEMM
+    launch unpack_tril_batched
+if with_k:
+    launch batched GEMM
+    launch batched transpose
+    launch batched GEMM
+download vj/vk
+```
+
+No Python `for k in range(nset)`.
+
+For XC:
+
+```python
+nelec, excsum, vmat = ocl.grid_plan(mol, grids, xc).run(dm)
+```
+
+Internally near-term:
+
+```python
+upload dm
+for slot in pipeline:
+    CPU AO eval into pinned host buffer
+    async upload AO
+    GPU rho
+    async download rho
+    CPU libxc
+    async upload wv
+    GPU aow/GEMM
+GPU reduce vmat
+download vmat
+```
+
+Long-term full GPU:
+
+```python
+upload dm
+launch eval_ao_grid
+launch rho
+launch xc
+launch aow
+launch reduce_vmat
+download scalar nelec/excsum/vmat
+```
+
+# Implementation Order I Recommend
+
+## Step 1: Introduce `PySCFOCL` and plan classes
+
+No numerical algorithm change.
+
+- `PySCFOCL`
+- `CLBufferPool`
+- `GridPlan`
+- `DFPlan`
+- Keep wrappers compatible.
+
+This gives us persistent memory and centralized kernel compilation.
+
+## Step 2: Convert DF to fully batched `nset`
+
+Highest value and cleanest.
+
+- Add `batched_matmul_tiled`.
+- Add `pack_dmtril_batched`.
+- Add `transpose_k_buf1_batched`.
+- Remove `for k in range(nset)` in K.
+
+## Step 3: Make DFPlan cache `cderi_full_g`
+
+Avoid rebuilding/unpacking `cderi` every SCF cycle.
+
+## Step 4: Convert XC into persistent `GridPlan`
+
+No AO/libxc port yet.
+
+- Move buffers out of [nr_rks_gpu()](cci:1://file:///home/prokophapala/git/pyscf/pyscf/OpenCL/xc_grid.py:90:0-227:30).
+- Add pinned/ring buffers.
+- Accumulate `vmat` on GPU.
+
+## Step 5: Optional: batch AO blocks
+
+If memory allows, evaluate multiple AO blocks on CPU, upload them into `[batch, BLK, nao]`, then launch batched kernels once per several blocks.
+
+## Step 6: Full GPU AO/XC
+
+Major project, separate validation.
+
+# Important Constraint
+
+For grids, “all grid points parallel on GPU” is only truly possible after moving AO evaluation and XC evaluation to GPU. Until then, the best possible design is a **persistent streaming pipeline** that hides CPU/GPU latency and avoids allocation/loop overhead.
+
+# My Recommendation
+
+Start with the refactor skeleton and DF batching first.
+
+Reason:
+
+- DF batching is mathematically straightforward.
+- It removes the obviously bad `for k in range(nset)` loop.
+- It benefits repeated SCF cycles immediately.
+- It requires only generic kernels we will reuse elsewhere.
+- It is easier to test against the existing DF J/K reference.
+
+Status: **conceptual design ready; I would implement Step 1 + Step 2 first, guarded by tests after each step.**
+

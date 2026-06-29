@@ -27,6 +27,7 @@ We develop rigorous scientific software where debuggability, physical consistenc
 
 - Custom examples/tests go in `expamples_prokop/` (not `examples/` which is upstream)
 - Notes and profiling results go in `doc/`
+- **GPU path cookbook:** `doc/opencl_gpu_paths_cookbook.md` · profiles `pyscf/OpenCL/gpu_profiles.py`
 - Profiling script: `expamples_prokop/profile_dft.py`
 
 ## DFT execution path (for profiling/debugging)

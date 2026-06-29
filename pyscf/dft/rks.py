@@ -547,12 +547,16 @@ class KohnShamDFT:
             t0 = logger.timer(self, 'setting up nlc grids', *t0)
         return self
 
-    def setup_gpu(self, mol=None, dm=None, xc_path='precomputed', gpu_xc='auto', **kwargs):
+    def setup_gpu(self, mol=None, dm=None, xc_path='precomputed', gpu_xc='auto', profile=None, **kwargs):
         '''Pre-SCF OpenCL setup: compile kernels, upload grid AOs / Hermite tables.
 
         xc_path: 'precomputed' (GTO AOs on grid, default) or 'onthefly' (Hermite AO).
         gpu_xc: 'auto' | 'pbe_f32' | 'pbe_f64' | 'cpu' (precomputed path only).
+        profile: named preset from pyscf.OpenCL.gpu_profiles (overrides xc_path/setup kwargs).
         '''
+        if profile is not None:
+            from pyscf.OpenCL.gpu_profiles import apply_gpu_profile
+            return apply_gpu_profile(self, profile, setup=True, dm=dm)
         if mol is None:
             mol = self.mol
         self.initialize_grids(mol, dm)
@@ -566,7 +570,8 @@ class KohnShamDFT:
             self._gpu_xc_path = 'precomputed'
         elif xc_path == 'onthefly':
             from pyscf.OpenCL.xc_grid import setup_xc_grid_gpu
-            self._xc_gpu_plan = setup_xc_grid_gpu(mol, self.grids, self.xc)
+            self._xc_gpu_plan = setup_xc_grid_gpu(
+                mol, self.grids, self.xc, gpu_xc=gpu_xc, **kwargs)
             self._gpu_xc_path = 'onthefly'
         else:
             raise ValueError(f'xc_path={xc_path!r}; use precomputed or onthefly')

@@ -138,7 +138,7 @@ def run_benzene(basis, grid_level, gpu_xc, n_timed):
     init_device(quiet=True)
     plan_pc = get_xc_grid_plan(mol, grids, 'PBE')
     t0 = time.perf_counter()
-    plan_pc.setup_precomputed_gto(gpu_only=True, gpu_xc='cpu')
+    plan_pc.setup_precomputed_gto(gpu_only=True, xc_eval='cpu')
     setup_pc = time.perf_counter() - t0
     log(f'  setup_precomputed_gto: {setup_pc*1e3:.1f} ms (one-time)')
     def run_precomp_libxc(profile):
@@ -169,7 +169,7 @@ def run_benzene(basis, grid_level, gpu_xc, n_timed):
     reset_opencl()
     init_device(quiet=True)
     plan_gemm = get_xc_grid_plan(mol, grids, 'PBE')
-    plan_gemm.setup_precomputed_gto(gpu_only=True, gpu_xc='cpu', fused='gemm')
+    plan_gemm.setup_precomputed_gto(gpu_only=True, xc_eval='cpu', fused='gemm')
 
     def run_precomp_gemm(profile):
         out = plan_gemm.nr_rks_precomputed_gto(dm, projection='gpu', profile=profile)
@@ -182,7 +182,7 @@ def run_benzene(basis, grid_level, gpu_xc, n_timed):
     reset_opencl()
     init_device(quiet=True)
     plan_blk_pc = get_xc_grid_plan(mol, grids, 'PBE')
-    plan_blk_pc.setup_precomputed_gto(gpu_only=True, gpu_xc='cpu', fused=False)
+    plan_blk_pc.setup_precomputed_gto(gpu_only=True, xc_eval='cpu', fused=False)
 
     def run_precomp_blocked(profile):
         out = plan_blk_pc.nr_rks_precomputed_gto(dm, projection='gpu', profile=profile)
@@ -190,7 +190,7 @@ def run_benzene(basis, grid_level, gpu_xc, n_timed):
 
     rows.append(bench_call('gpu_precomp_blocked', run_precomp_blocked, n_timed=n_timed, ref=ref))
 
-    log('\n[7/7] gpu_hermite_otf  (Hermite rho/vmat kernels + libxc on CPU)')
+    log('\n[7/9] gpu_hermite_otf  (Hermite rho/vmat kernels + libxc on CPU)')
     clear_xc_plan_cache()
     reset_opencl()
     init_device(quiet=True)
@@ -205,6 +205,40 @@ def run_benzene(basis, grid_level, gpu_xc, n_timed):
 
     rows.append(bench_call('gpu_hermite_otf', run_hermite_otf, n_timed=n_timed, ref=ref))
     rows[-1]['setup_ms'] = setup_otf * 1e3
+
+    log('\n[8/9] gpu_precomp_coalesced  (transposed chi + coalesced rho kernel)')
+    clear_xc_plan_cache()
+    reset_opencl()
+    init_device(quiet=True)
+    plan_coal = get_xc_grid_plan(mol, grids, 'PBE')
+    t0 = time.perf_counter()
+    plan_coal.setup_precomputed_gto(gpu_only=True, gpu_xc=gpu_xc, fused='coalesced')
+    setup_coal = time.perf_counter() - t0
+    log(f'  setup_precomputed_gto(coalesced): {setup_coal*1e3:.1f} ms (one-time)')
+
+    def run_precomp_coalesced(profile):
+        out = plan_coal.nr_rks_precomputed_gto(dm, projection='gpu', profile=profile)
+        return (*out, plan_coal.last_timing) if profile else out
+
+    rows.append(bench_call('gpu_precomp_coalesced', run_precomp_coalesced, n_timed=n_timed, ref=ref))
+    rows[-1]['setup_ms'] = setup_coal * 1e3
+
+    log('\n[9/9] gpu_precomp_radial  (radial R/dR precomp + radial rho kernel)')
+    clear_xc_plan_cache()
+    reset_opencl()
+    init_device(quiet=True)
+    plan_rad = get_xc_grid_plan(mol, grids, 'PBE')
+    t0 = time.perf_counter()
+    plan_rad.setup_precomputed_gto(gpu_only=True, gpu_xc=gpu_xc, fused='radial_precomp')
+    setup_rad = time.perf_counter() - t0
+    log(f'  setup_precomputed_gto(radial): {setup_rad*1e3:.1f} ms (one-time)  radial_cpu={plan_rad.precalc_timing.get("radial_cpu", 0)*1e3:.1f} ms')
+
+    def run_precomp_radial(profile):
+        out = plan_rad.nr_rks_precomputed_gto(dm, projection='gpu', profile=profile)
+        return (*out, plan_rad.last_timing) if profile else out
+
+    rows.append(bench_call('gpu_precomp_radial', run_precomp_radial, n_timed=n_timed, ref=ref))
+    rows[-1]['setup_ms'] = setup_rad * 1e3
 
     log(f'\n{"="*76}')
     log('SUMMARY  (min wall ms per path; setup one-time)')

@@ -312,6 +312,19 @@ __kernel void pbe_xc_f32(
     vsigma[igrid] = es + cs;
 }
 
+__kernel void sanitize_pbe_xc_f32(
+    __global float *exc,
+    __global float *vrho,
+    __global float *vsigma,
+    int ngrids)
+{
+    int igrid = get_global_id(0);
+    if (igrid >= ngrids) return;
+    if (!isfinite(exc[igrid])) exc[igrid] = 0.0f;
+    if (!isfinite(vrho[igrid])) vrho[igrid] = 0.0f;
+    if (!isfinite(vsigma[igrid])) vsigma[igrid] = 0.0f;
+}
+
 __kernel void compute_wv_gga_f32(
     __global const float *weight,
     __global const float *vrho,
@@ -328,7 +341,7 @@ __kernel void compute_wv_gga_f32(
     float dx = rho_grad[1 * ngrids + igrid];
     float dy = rho_grad[2 * ngrids + igrid];
     float dz = rho_grad[3 * ngrids + igrid];
-    wv[0 * ngrids + igrid] = w * vr;
+    wv[0 * ngrids + igrid] = w * vr * 0.5f;
     wv[1 * ngrids + igrid] = w * (float)2.0 * vs * dx;
     wv[2 * ngrids + igrid] = w * (float)2.0 * vs * dy;
     wv[3 * ngrids + igrid] = w * (float)2.0 * vs * dz;
@@ -643,7 +656,7 @@ __kernel void compute_wv_gga_f64(
     double dx = rho_grad[1 * ngrids + igrid];
     double dy = rho_grad[2 * ngrids + igrid];
     double dz = rho_grad[3 * ngrids + igrid];
-    wv[0 * ngrids + igrid] = w * vr;
+    wv[0 * ngrids + igrid] = w * vr * 0.5;
     wv[1 * ngrids + igrid] = w * (double)2.0 * vs * dx;
     wv[2 * ngrids + igrid] = w * (double)2.0 * vs * dy;
     wv[3 * ngrids + igrid] = w * (double)2.0 * vs * dz;

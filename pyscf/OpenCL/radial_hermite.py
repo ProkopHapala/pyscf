@@ -185,3 +185,41 @@ class MappedHermiteRadialBasis:
 
     def eval_sph(self, coords):
         return self.eval_cart(coords).dot(self.mol.cart2sph_coeff(normalized='sp').astype(np.float32))
+
+
+def build_radial_on_grid(plan, coords):
+    '''Precompute R(ir,g) and dR/dr(ir,g) on grid for rho_gga_radial_precomp_pair.
+
+    Layout: rad_val[ir*ngrids + g], C-contiguous float32 [nradial, ngrids].
+    Hermite interpolation matches hermite_eval_* in kernels.cl.
+    GPU path: OpenCLAOHermiteEvaluator.build_radial_on_grid_gpu() / build_radial_on_grid_tiled.
+    '''
+    coords = np.asarray(coords, dtype=np.float64)
+    ngrids = coords.shape[0]
+    nradial = plan.nradial
+    nrad = plan.nrad
+    r0 = float(plan.r0)
+    du = float(plan.du)
+    atom_coords = plan.atom_coords.astype(np.float64)
+    rv = plan.radial_values
+    du_vals = plan.radial_du_values
+    rad_val = np.empty((nradial, ngrids), dtype=np.float32)
+    rad_dr = np.empty_like(rad_val)
+    for ir in range(nradial):
+        ia = int(plan.radial_atom[ir])
+        r = np.linalg.norm(coords - atom_coords[ia], axis=1)
+        ui = np.log1p(r / r0) / du
+        ik = np.floor(ui).astype(np.int64)
+        ik = np.clip(ik, 0, nrad - 2)
+        t = np.clip(ui - ik, 0.0, 1.0)
+        t1m = t - 1.0  # matches hermite_map_point() in kernels.cl
+        y0 = rv[ir, ik].astype(np.float64)
+        y1 = rv[ir, ik + 1].astype(np.float64)
+        d0 = du_vals[ir, ik].astype(np.float64)
+        d1 = du_vals[ir, ik + 1].astype(np.float64)
+        dy = y1 - y0
+        R = y0 + t * t * (3.0 - 2.0 * t) * dy + t * t1m * t1m * du * d0 + t * t * t1m * du * d1
+        dR_du = (6.0 * t * (1.0 - t) * dy + (3.0 * t - 1.0) * t1m * du * d0 + t * (3.0 * t - 2.0) * du * d1) / du
+        rad_val[ir] = R.astype(np.float32)
+        rad_dr[ir] = (dR_du / (r + r0)).astype(np.float32)
+    return rad_val, rad_dr

@@ -80,8 +80,23 @@ def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
     else:
         max_memory = ks.max_memory - lib.current_memory()[0]
         if backend & 2:
-            from pyscf.OpenCL.xc_grid import nr_rks_gpu
-            n_gpu, exc_gpu, vxc_gpu = nr_rks_gpu(mol, ks.grids, ks.xc, dm, max_memory=max_memory)
+            plan = getattr(ks, '_xc_gpu_plan', None)
+            xc_path = getattr(ks, '_gpu_xc_path', 'onthefly')
+            if plan is None:
+                raise RuntimeError('Call mf.setup_gpu() before kernel() when backend uses GPU (backend & 2)')
+            profile = ks.__dict__.get('_gpu_profile', False)
+            if xc_path == 'precomputed':
+                if not getattr(plan, '_pcg_ready', False):
+                    raise RuntimeError('Call mf.setup_gpu() before kernel() when backend uses GPU (backend & 2)')
+                n_gpu, exc_gpu, vxc_gpu = plan.nr_rks_precomputed_gto(dm, profile=profile)
+            else:
+                if not getattr(plan, '_otf_ready', False):
+                    raise RuntimeError('Call mf.setup_gpu() before kernel() when backend uses GPU (backend & 2)')
+                n_gpu, exc_gpu, vxc_gpu = plan.nr_rks_hermite_onthefly(dm, profile=profile)
+            if profile and getattr(plan, 'last_timing', None):
+                acc = ks.__dict__.setdefault('_gpu_timing_acc', {})
+                for k, v in plan.last_timing.items():
+                    acc[k] = acc.get(k, 0.0) + v
         if backend & 1:
             n, exc, vxc = ni.nr_rks(mol, ks.grids, ks.xc, dm, max_memory=max_memory)
         if backend == 3:
@@ -530,6 +545,31 @@ class KohnShamDFT:
                 self.nlcgrids = prune_small_rho_grids_(self, self.mol, dm,
                                                        self.nlcgrids)
             t0 = logger.timer(self, 'setting up nlc grids', *t0)
+        return self
+
+    def setup_gpu(self, mol=None, dm=None, xc_path='precomputed', gpu_xc='auto', **kwargs):
+        '''Pre-SCF OpenCL setup: compile kernels, upload grid AOs / Hermite tables.
+
+        xc_path: 'precomputed' (GTO AOs on grid, default) or 'onthefly' (Hermite AO).
+        gpu_xc: 'auto' | 'pbe_f32' | 'pbe_f64' | 'cpu' (precomputed path only).
+        '''
+        if mol is None:
+            mol = self.mol
+        self.initialize_grids(mol, dm)
+        backend = getattr(self, 'backend', 1)
+        if not (backend & 2):
+            return self
+        if xc_path == 'precomputed':
+            from pyscf.OpenCL.xc_grid import setup_precomputed_gto
+            self._xc_gpu_plan = setup_precomputed_gto(
+                mol, self.grids, self.xc, gpu_only=True, gpu_xc=gpu_xc, **kwargs)
+            self._gpu_xc_path = 'precomputed'
+        elif xc_path == 'onthefly':
+            from pyscf.OpenCL.xc_grid import setup_xc_grid_gpu
+            self._xc_gpu_plan = setup_xc_grid_gpu(mol, self.grids, self.xc)
+            self._gpu_xc_path = 'onthefly'
+        else:
+            raise ValueError(f'xc_path={xc_path!r}; use precomputed or onthefly')
         return self
 
     def to_gpu(self):

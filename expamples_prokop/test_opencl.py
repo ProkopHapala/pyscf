@@ -37,7 +37,8 @@ def test_xc_grid():
 
     # GPU
     print("\nRunning GPU (OpenCL)...")
-    from pyscf.OpenCL.xc_grid import nr_rks_gpu
+    from pyscf.OpenCL.xc_grid import setup_xc_grid_gpu, nr_rks_gpu
+    setup_xc_grid_gpu(mol, grids, 'pbe')
     t0 = time.perf_counter()
     n_gpu, exc_gpu, vxc_gpu = nr_rks_gpu(mol, grids, 'pbe', dm, max_memory=2000)
     t_gpu = time.perf_counter() - t0

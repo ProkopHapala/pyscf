@@ -19,9 +19,7 @@ class OpenCLAOHermiteEvaluator:
         mf = cl.mem_flags
         if self.plan.lmax > 3:
             raise NotImplementedError('OpenCL atom-block Hermite AO kernel currently supports angular momentum l<=3')
-        self.rad_val = np.ascontiguousarray(self.plan.radial_values, dtype=np.float32)
-        self.rad_du = np.ascontiguousarray(self.plan.radial_du_values, dtype=np.float32)
-        self.rad_dy = np.ascontiguousarray(self.plan.radial_dy_values, dtype=np.float32)
+        self.rad_node = np.ascontiguousarray(self.plan.radial_nodes, dtype=np.float32)
         self.atom_coords = np.zeros((self.plan.atom_coords.shape[0], 4), dtype=np.float32)
         self.atom_coords[:, :3] = self.plan.atom_coords
         self.radial_l = np.ascontiguousarray(self.plan.radial_l, dtype=np.int32)
@@ -29,9 +27,7 @@ class OpenCLAOHermiteEvaluator:
         self.atom_radial_offset = np.ascontiguousarray(self.plan.atom_radial_offset, dtype=np.int32)
         self.atom_radial_list = np.ascontiguousarray(self.plan.atom_radial_list, dtype=np.int32)
         self.natoms = self.plan.natoms
-        self.buf_rad_val = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, self.rad_val.nbytes, self.rad_val)
-        self.buf_rad_du = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, self.rad_du.nbytes, self.rad_du)
-        self.buf_rad_dy = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, self.rad_dy.nbytes, self.rad_dy)
+        self.buf_rad_node = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, self.rad_node.nbytes, self.rad_node)
         self.buf_atom_coords = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, self.atom_coords.nbytes, self.atom_coords)
         self.buf_radial_l = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, self.radial_l.nbytes, self.radial_l)
         self.buf_radial_cart0 = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, self.radial_cart0.nbytes, self.radial_cart0)
@@ -75,7 +71,7 @@ class OpenCLAOHermiteEvaluator:
         cl.enqueue_copy(self.queue, self.buf_coords, coords4).wait()
         _knl(self.prg, 'eval_ao_mapped_hermite_cart_atom')(
             self.queue, (round_up(ngrids, TILE), round_up(self.natoms, TILE)), (TILE, TILE),
-            self.buf_coords, self.buf_atom_coords, self.buf_rad_val, self.buf_rad_du, self.buf_rad_dy,
+            self.buf_coords, self.buf_atom_coords, self.buf_rad_node,
             self.buf_radial_l, self.buf_radial_cart0,
             self.buf_atom_radial_offset, self.buf_atom_radial_list,
             self.buf_cart,
@@ -110,7 +106,7 @@ class OpenCLAOHermiteEvaluator:
         cl.enqueue_copy(self.queue, self.buf_coords, coords4).wait()
         _knl(self.prg, 'eval_ao_mapped_hermite_cart_deriv1_atom')(
             self.queue, (round_up(ngrids, TILE), round_up(self.natoms, TILE)), (TILE, TILE),
-            self.buf_coords, self.buf_atom_coords, self.buf_rad_val, self.buf_rad_du, self.buf_rad_dy,
+            self.buf_coords, self.buf_atom_coords, self.buf_rad_node,
             self.buf_radial_l, self.buf_radial_cart0,
             self.buf_atom_radial_offset, self.buf_atom_radial_list,
             self.buf_cart_deriv[0], self.buf_cart_deriv[1], self.buf_cart_deriv[2], self.buf_cart_deriv[3],
@@ -140,7 +136,7 @@ class OpenCLAOHermiteEvaluator:
         return out
 
     def __del__(self):
-        for name in ('buf_rad_val', 'buf_rad_du', 'buf_rad_dy', 'buf_atom_coords', 'buf_radial_l', 'buf_radial_cart0', 'buf_atom_radial_offset', 'buf_atom_radial_list', 'buf_c2s', 'buf_coords', 'buf_cart', 'buf_sph'):
+        for name in ('buf_rad_node', 'buf_atom_coords', 'buf_radial_l', 'buf_radial_cart0', 'buf_atom_radial_offset', 'buf_atom_radial_list', 'buf_c2s', 'buf_coords', 'buf_cart', 'buf_sph'):
             buf = getattr(self, name, None)
             if buf is not None:
                 try:

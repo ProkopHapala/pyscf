@@ -65,6 +65,7 @@ class MappedHermiteRadialBasis:
         self.shell_l = np.empty(nshell, dtype=np.int32)
         self.shell_atom = np.empty(nshell, dtype=np.int32)
         self.shell_cart0 = np.empty(nshell, dtype=np.int32)
+        self.shell_ctr_ir = np.full(nshell * nctr_max, -1, dtype=np.int32)
         cart0 = 0
         for ib in range(nshell):
             l = mol.bas_angular(ib)
@@ -103,6 +104,7 @@ class MappedHermiteRadialBasis:
             l = self.shell_l[ib]
             ncart_l = (l + 1) * (l + 2) // 2
             for ic in range(self.shell_nctr[ib]):
+                self.shell_ctr_ir[ib * nctr_max + ic] = ir
                 self.radial_values[ir] = self.values[ib, ic]
                 self.radial_du_values[ir] = self.du_values[ib, ic]
                 self.radial_dy_values[ir] = self.dy_values[ib, ic]
@@ -110,6 +112,9 @@ class MappedHermiteRadialBasis:
                 self.radial_atom[ir] = self.shell_atom[ib]
                 self.radial_cart0[ir] = self.shell_cart0[ib] + ic * ncart_l
                 ir += 1
+        self.radial_nodes = np.empty((self.nradial, self.nrad, 2), dtype=np.float32)
+        self.radial_nodes[:, :, 0] = self.radial_values
+        self.radial_nodes[:, :, 1] = self.radial_du_values
         atom_radial_offset = np.zeros(mol.natm + 1, dtype=np.int32)
         for ir in range(self.nradial):
             atom_radial_offset[self.radial_atom[ir] + 1] += 1

@@ -14,6 +14,11 @@
 
 #define MAX_L 8
 
+// libcint CINTcommon_fac_sp(l), l = 0..7
+__constant float CINT_FAC_SP[8] = {
+    1.0f, 1.0f, 3.0f, 15.0f, 105.0f, 945.0f, 10395.0f, 135135.0f
+};
+
 // ============================================================
 // Kernel: eval_gto_sph
 // Evaluate contracted spherical GTOs on grid points (value only)
@@ -69,16 +74,7 @@ __kernel void eval_gto_sph(
             }
         }
 
-        // Common normalization factor
-        float fac = 1.0f;
-        if (l == 0)      fac = 1.0f;
-        else if (l == 1) fac = 1.0f;
-        else if (l == 2) fac = 3.0f;  // CINTcommon_fac_sp(2) = 3
-        else if (l == 3) fac = 15.0f;
-        else if (l == 4) fac = 105.0f;
-        else if (l == 5) fac = 945.0f;
-        else if (l == 6) fac = 10395.0f;
-        else if (l == 7) fac = 135135.0f;
+        float fac = CINT_FAC_SP[l];
 
         // For now: write Cartesian-like values, convert to spherical
         // Spherical harmonics conversion for l=0: just ectr
@@ -251,15 +247,7 @@ __kernel void eval_gto_sph_deriv1(
             }
         }
 
-        float fac = 1.0f;
-        if (l == 0)      fac = 1.0f;
-        else if (l == 1) fac = 1.0f;
-        else if (l == 2) fac = 3.0f;
-        else if (l == 3) fac = 15.0f;
-        else if (l == 4) fac = 105.0f;
-        else if (l == 5) fac = 945.0f;
-        else if (l == 6) fac = 10395.0f;
-        else if (l == 7) fac = 135135.0f;
+        float fac = CINT_FAC_SP[l];
 
         // For l=0: val = ectr, grad = dectr
         // For l=1: val = ectr * (x,y,z), grad = dectr*(x,y,z) + ectr*(1,0,0) etc.
@@ -315,10 +303,10 @@ __kernel void eval_gto_sph_deriv1(
 #define TILE 32
 
 __kernel void matmul_tiled(
-    __global const float *A,   // [M, K] row-major
+    __global const float *A,   // [M, K] row-major (or rows [row0:row0+M] of larger matrix)
     __global const float *B,   // [K, N] row-major
     __global float       *C,   // [M, N] row-major
-    int M, int N, int K)
+    int M, int N, int K, int row0)
 {
     int tx = get_local_id(0);
     int ty = get_local_id(1);
@@ -333,9 +321,8 @@ __kernel void matmul_tiled(
     int numTiles = (K + TILE - 1) / TILE;
 
     for (int t = 0; t < numTiles; t++) {
-        // Load tiles into local memory (gather, no scatter)
         if (row < M && t * TILE + ty < K)
-            Asub[tx][ty] = A[row * K + t * TILE + ty];
+            Asub[tx][ty] = A[(row0 + row) * K + t * TILE + ty];
         else
             Asub[tx][ty] = 0.0f;
 
@@ -346,7 +333,6 @@ __kernel void matmul_tiled(
 
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        // Compute partial sum
         for (int i = 0; i < TILE; i++) {
             sum += Asub[tx][i] * Bsub[i][ty];
         }
@@ -354,7 +340,6 @@ __kernel void matmul_tiled(
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    // Write result (gather-style: each thread writes its own element)
     if (row < M && col < N) {
         C[row * N + col] = sum;
     }
@@ -366,33 +351,30 @@ __kernel void matmul_tiled(
 // A is transposed: A^T[M,K]
 // ============================================================
 __kernel void matmul_tiled_transpose_A(
-    __global const float *A,   // [K, M] row-major (will be transposed)
-    __global const float *B,   // [K, N] row-major
+    __global const float *A,   // [K, M] row-major rows [a_row0:a_row0+K] of [?, M]
+    __global const float *B,   // [K, N] row-major rows [b_row0:b_row0+K] of [?, N]
     __global float       *C,   // [M, N] row-major
-    int M, int N, int K)
+    int M, int N, int K, int a_row0, int b_row0)
 {
     int tx = get_local_id(0);
     int ty = get_local_id(1);
-    int row = get_group_id(0) * TILE + tx;  // row in C (= col in A)
-    int col = get_group_id(1) * TILE + ty;  // col in C
+    int row = get_group_id(0) * TILE + tx;
+    int col = get_group_id(1) * TILE + ty;
 
-    __local float Asub[TILE][TILE];  // A^T tile: [M_tile, K_tile]
-    __local float Bsub[TILE][TILE];  // B tile: [K_tile, N_tile]
+    __local float Asub[TILE][TILE];
+    __local float Bsub[TILE][TILE];
 
     float sum = 0.0f;
     int numTiles = (K + TILE - 1) / TILE;
 
     for (int t = 0; t < numTiles; t++) {
-        // Load A^T tile: A is [K, M], so A^T[row, k] = A[k, row] = A[k * M + row]
-        // We need Asub[tx][ty] = A^T[row, t*TILE+ty] = A[(t*TILE+ty) * M + row]
         if (row < M && t * TILE + ty < K)
-            Asub[tx][ty] = A[(t * TILE + ty) * M + row];
+            Asub[tx][ty] = A[(a_row0 + t * TILE + ty) * M + row];
         else
             Asub[tx][ty] = 0.0f;
 
-        // Load B tile: B[k, col] = B[k * N + col]
         if (t * TILE + tx < K && col < N)
-            Bsub[tx][ty] = B[(t * TILE + tx) * N + col];
+            Bsub[tx][ty] = B[(b_row0 + t * TILE + tx) * N + col];
         else
             Bsub[tx][ty] = 0.0f;
 
@@ -410,12 +392,11 @@ __kernel void matmul_tiled_transpose_A(
     }
 }
 
-// Accumulating version: C[row*N+col] += sum
 __kernel void matmul_tiled_transpose_A_accum(
     __global const float *A,
     __global const float *B,
     __global float       *C,
-    int M, int N, int K)
+    int M, int N, int K, int a_row0, int b_row0)
 {
     int tx = get_local_id(0);
     int ty = get_local_id(1);
@@ -430,11 +411,11 @@ __kernel void matmul_tiled_transpose_A_accum(
 
     for (int t = 0; t < numTiles; t++) {
         if (row < M && t * TILE + ty < K)
-            Asub[tx][ty] = A[(t * TILE + ty) * M + row];
+            Asub[tx][ty] = A[(a_row0 + t * TILE + ty) * M + row];
         else
             Asub[tx][ty] = 0.0f;
         if (t * TILE + tx < K && col < N)
-            Bsub[tx][ty] = B[(t * TILE + tx) * N + col];
+            Bsub[tx][ty] = B[(b_row0 + t * TILE + tx) * N + col];
         else
             Bsub[tx][ty] = 0.0f;
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -595,139 +576,7 @@ __kernel void contract_rho_grad(
     rho[3 * ngrids + igrid] = 2.0f * sum3;
 }
 
-// ============================================================
-// Kernel: pbe_xc
-// PBE XC functional evaluation (pointwise, GGA)
-// Input: rho[4, ngrids] = [rho, dx, dy, dz]
-// Output: exc[ngrids], vrho[ngrids], vsigma[ngrids]
-// vrho = dE/drho, vsigma = dE/d(|grad rho|^2)
-// ============================================================
-
-// PBE exchange parameters
-#define PBE_KAPPA 0.804f
-#define PBE_MU 0.2195149727645171f
-
-// PBE correlation parameters
-#define PBE_BETA 0.06672455060314922f
-#define PBE_GAMMA 0.031090690869654895f
-
-// Constants
-#define PI 3.14159265358979323846f
-#define RS_FACTOR 0.6203504908994001f  // (3/(4*pi))^(1/3)
-
-void lda_x(float rho, float *exc, float *vrho) {
-    if (rho < 1e-20f) { *exc = 0.0f; *vrho = 0.0f; return; }
-    float ax = -0.7385587663820224f;  // -3/4 * (3/pi)^(1/3)
-    float rho13 = pow(rho, 1.0f/3.0f);
-    *exc = ax * rho13;
-    *vrho = ax * (4.0f/3.0f) * rho13;
-}
-
-void pbe_x(float rho, float sigma, float *exc, float *vrho, float *vsigma) {
-    if (rho < 1e-20f) { *exc = 0.0f; *vrho = 0.0f; *vsigma = 0.0f; return; }
-    float ax = -0.7385587663820224f;
-    float rho13 = pow(rho, 1.0f/3.0f);
-    float rho43 = rho * rho13;
-    float ex_unif = ax * rho13;
-
-    // PBE enhancement factor
-    float kappa = PBE_KAPPA;
-    float mu = PBE_MU;
-    float kf = 1.9191582926775138f * rho13;  // (3*pi^2*rho)^(1/3)
-    float s2 = sigma / (rho * rho * (2.0f * kf * kf));  // s^2 = |grad|^2 / (rho^2 * 4*kf^2)
-    // Actually s = |grad| / (2 * kf * rho), s^2 = sigma / (4 * kf^2 * rho^2)
-    float s2_corrected = sigma / (4.0f * kf * kf * rho * rho);
-    float s = sqrt(s2_corrected);
-    float s2_val = s2_corrected;
-
-    // Fx(s) = 1 + kappa - kappa / (1 + mu * s2 / kappa)
-    float denom = 1.0f + mu * s2_val / kappa;
-    float Fx = 1.0f + kappa - kappa / denom;
-
-    *exc = ex_unif * Fx;
-    *vrho = ex_unif * (4.0f/3.0f) * Fx;  // approximate (ignoring derivative of Fx w.r.t. rho)
-    // dFx/ds2 = kappa * mu / kappa / (denom^2) = mu / (denom^2)
-    float dFx_ds2 = mu / (denom * denom);
-    // vsigma = ex_unif * dFx/dsigma = ex_unif * dFx_ds2 / (4 * kf^2 * rho^2)
-    *vsigma = ex_unif * dFx_ds2 / (4.0f * kf * kf * rho * rho);
-}
-
-void pbe_c(float rho, float sigma, float *exc, float *vrho, float *vsigma) {
-    if (rho < 1e-20f) { *exc = 0.0f; *vrho = 0.0f; *vsigma = 0.0f; return; }
-
-    float rs = RS_FACTOR / pow(rho, 1.0f/3.0f);
-    float zeta = 0.0f;  // unpolarized
-
-    // PBE correlation (unpolarized)
-    // ec_unif = PBE correlation energy density (uniform electron gas)
-    // Using the PBE parametrization of Perdew-Wang
-    float A = 0.031090690869654895f;
-    float alpha1 = 0.21370f;
-    float beta1 = 7.5957f;
-    float beta2 = 3.5876f;
-    float beta3 = 1.6382f;
-    float beta4 = 0.49294f;
-
-    float t = sqrt(sigma) / (2.0f * 1.9191582926775138f * pow(rho, 4.0f/3.0f));  // t = |grad| / (2*kf*rho)
-    // Actually t = s / (2 * sqrt(rs * zeta_factor))... let's use simplified PBE
-
-    // Simplified: use the GGA-1 form
-    // For unpolarized: phi = 1
-    float phi = 1.0f;
-    float t2 = t * t;
-
-    // ec_unif from Perdew-Wang
-    float Q = sqrt(4.0f * A * rs + beta1 * rs * rs);
-    float ec_unif = -2.0f * A * (1.0f + alpha1 * rs) * log(1.0f + 1.0f / (2.0f * A * (beta1 * rs + beta2 * rs * rs + beta3 * rs * rs * rs + beta4 * rs * rs * rs * rs)));
-
-    // Actually, let's use a simpler approach: just use LDA correlation for now
-    // and add PBE correction approximately
-    // This is a simplification - for production, full PBE correlation needed
-
-    // Simple PBE correlation (simplified)
-    float ec = ec_unif;
-    float H = PBE_BETA * t2 / PBE_GAMMA * 1.0f / (1.0f + 4.0f * PBE_BETA * t2 / PBE_GAMMA);
-    ec += H;
-
-    *exc = ec;
-    *vrho = ec;  // approximate
-    *vsigma = 0.0f;  // approximate - will be small
-}
-
-__kernel void pbe_xc(
-    __global const float *rho_in,   // [4, ngrids] = [rho, dx, dy, dz]
-    __global float       *exc,      // [ngrids]
-    __global float       *vrho,     // [ngrids]
-    __global float       *vsigma,   // [ngrids]
-    int ngrids)
-{
-    int igrid = get_global_id(0);
-    if (igrid >= ngrids) return;
-
-    float rho = rho_in[0 * ngrids + igrid];
-    float dx  = rho_in[1 * ngrids + igrid];
-    float dy  = rho_in[2 * ngrids + igrid];
-    float dz  = rho_in[3 * ngrids + igrid];
-
-    float sigma = dx*dx + dy*dy + dz*dz;  // |grad rho|^2
-
-    if (rho < 1e-20f) {
-        exc[igrid] = 0.0f;
-        vrho[igrid] = 0.0f;
-        vsigma[igrid] = 0.0f;
-        return;
-    }
-
-    float exc_x, vrho_x, vsigma_x;
-    float exc_c, vrho_c, vsigma_c;
-
-    pbe_x(rho, sigma, &exc_x, &vrho_x, &vsigma_x);
-    pbe_c(rho, sigma, &exc_c, &vrho_c, &vsigma_c);
-
-    exc[igrid] = exc_x + exc_c;
-    vrho[igrid] = vrho_x + vrho_c;
-    vsigma[igrid] = vsigma_x + vsigma_c;
-}
+// PBE XC (libxc maple2c) — see pbe.cl, appended at build time in __init__.py
 
 // ============================================================
 // Kernel: scale_ao_gga
@@ -803,6 +652,166 @@ __kernel void vxc_mat_gga(
         barrier(CLK_LOCAL_MEM_FENCE);
 
         // Partial sum: sum_g aow[g, row] * ao[0, g, col]
+        for (int i = 0; i < TILE; i++) {
+            sum += aow_sub[tx][i] * ao0_sub[i][ty];
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (row < nao && col < nao) {
+        vmat[row * nao + col] = sum;
+    }
+}
+
+// ============================================================
+// Precomputed GTO AO on grid — one launch per stage (no Python block loop)
+// AO buffers: ao0..ao3 each [ngrids, nao] row-major (same layout as setup_precomputed_gto)
+// rho: [4, ngrids] as rho[c*ngrids + g] — matches contract_rho_gga_from_aodm (no extra 2x)
+// ============================================================
+__kernel void contract_rho_gga_precomp(
+    __global const float *ao0,
+    __global const float *ao1,
+    __global const float *ao2,
+    __global const float *ao3,
+    __global const float *dm,
+    __global float       *rho,
+    int nao, int ngrids)
+{
+    int g = get_global_id(0);
+    if (g >= ngrids) return;
+
+    int base = g * nao;
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    for (int i = 0; i < nao; i++) {
+        float v0 = ao0[base + i];
+        float v1 = ao1[base + i];
+        float v2 = ao2[base + i];
+        float v3 = ao3[base + i];
+        float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+        for (int j = 0; j < nao; j++) {
+            float dm_ij = dm[i * nao + j];
+            d0 += dm_ij * ao0[base + j];
+            d1 += dm_ij * ao1[base + j];
+            d2 += dm_ij * ao2[base + j];
+            d3 += dm_ij * ao3[base + j];
+        }
+        s0 += d0 * v0;
+        s1 += d0 * v1 + d1 * v0;
+        s2 += d0 * v2 + d2 * v0;
+        s3 += d0 * v3 + d3 * v0;
+    }
+    rho[g] = s0;
+    rho[ngrids + g] = s1;
+    rho[2 * ngrids + g] = s2;
+    rho[3 * ngrids + g] = s3;
+}
+
+__kernel void contract_rho_lda_precomp(
+    __global const float *ao0,
+    __global const float *dm,
+    __global float       *rho,
+    int nao, int ngrids)
+{
+    int g = get_global_id(0);
+    if (g >= ngrids) return;
+
+    int base = g * nao;
+    float s0 = 0.0f;
+    for (int i = 0; i < nao; i++) {
+        float d0 = 0.0f;
+        for (int j = 0; j < nao; j++) {
+            d0 += dm[i * nao + j] * ao0[base + j];
+        }
+        s0 += d0 * ao0[base + i];
+    }
+    rho[g] = s0;
+}
+
+__kernel void vxc_mat_gga_precomp(
+    __global const float *ao0,
+    __global const float *ao1,
+    __global const float *ao2,
+    __global const float *ao3,
+    __global const float *wv,
+    __global float       *vmat,
+    int nao, int ngrids)
+{
+    int tx = get_local_id(0);
+    int ty = get_local_id(1);
+    int row = get_group_id(0) * TILE + tx;
+    int col = get_group_id(1) * TILE + ty;
+
+    __local float aow_sub[TILE][TILE];
+    __local float ao0_sub[TILE][TILE];
+
+    float sum = 0.0f;
+    int numGridTiles = (ngrids + TILE - 1) / TILE;
+
+    for (int t = 0; t < numGridTiles; t++) {
+        int g_idx = t * TILE + ty;
+        if (g_idx < ngrids && row < nao) {
+            int base = g_idx * nao + row;
+            float val = ao0[base] * wv[g_idx] + ao1[base] * wv[ngrids + g_idx]
+                      + ao2[base] * wv[2 * ngrids + g_idx] + ao3[base] * wv[3 * ngrids + g_idx];
+            aow_sub[tx][ty] = val;
+        } else {
+            aow_sub[tx][ty] = 0.0f;
+        }
+
+        if (g_idx < ngrids && col < nao) {
+            ao0_sub[tx][ty] = ao0[g_idx * nao + col];
+        } else {
+            ao0_sub[tx][ty] = 0.0f;
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (int i = 0; i < TILE; i++) {
+            sum += aow_sub[tx][i] * ao0_sub[i][ty];
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (row < nao && col < nao) {
+        vmat[row * nao + col] = sum;
+    }
+}
+
+__kernel void vxc_mat_lda_precomp(
+    __global const float *ao0,
+    __global const float *wv,
+    __global float       *vmat,
+    int nao, int ngrids)
+{
+    int tx = get_local_id(0);
+    int ty = get_local_id(1);
+    int row = get_group_id(0) * TILE + tx;
+    int col = get_group_id(1) * TILE + ty;
+
+    __local float aow_sub[TILE][TILE];
+    __local float ao0_sub[TILE][TILE];
+
+    float sum = 0.0f;
+    int numGridTiles = (ngrids + TILE - 1) / TILE;
+
+    for (int t = 0; t < numGridTiles; t++) {
+        int g_idx = t * TILE + ty;
+        if (g_idx < ngrids && row < nao) {
+            aow_sub[tx][ty] = ao0[g_idx * nao + row] * wv[g_idx];
+        } else {
+            aow_sub[tx][ty] = 0.0f;
+        }
+
+        if (g_idx < ngrids && col < nao) {
+            ao0_sub[tx][ty] = ao0[g_idx * nao + col];
+        } else {
+            ao0_sub[tx][ty] = 0.0f;
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+
         for (int i = 0; i < TILE; i++) {
             sum += aow_sub[tx][i] * ao0_sub[i][ty];
         }
@@ -916,17 +925,18 @@ __kernel void contract_rho_lda_from_aodm(
     __global const float *ao0,
     __global const float *aodm0,
     __global float       *rho,
-    int nao, int ngrids)
+    int nao, int nblk, int grid0, int ao_row0)
 {
     int g = get_global_id(0);
-    if (g >= ngrids) return;
+    if (g >= nblk) return;
 
     float s0 = 0.0f;
-    int base = g * nao;
+    int base_ao = (ao_row0 + g) * nao;
+    int base_dm = g * nao;
     for (int i = 0; i < nao; i++) {
-        s0 += aodm0[base + i] * ao0[base + i];
+        s0 += aodm0[base_dm + i] * ao0[base_ao + i];
     }
-    rho[g] = s0;
+    rho[grid0 + g] = s0;
 }
 
 __kernel void contract_rho_gga_from_aodm(
@@ -939,45 +949,47 @@ __kernel void contract_rho_gga_from_aodm(
     __global const float *aodm2,
     __global const float *aodm3,
     __global float       *rho,
-    int nao, int ngrids)
+    int nao, int nblk, int grid0, int ngrids_total, int ao_row0)
 {
     int g = get_global_id(0);
-    if (g >= ngrids) return;
+    if (g >= nblk) return;
 
     float s0 = 0.0f;
     float s1 = 0.0f;
     float s2 = 0.0f;
     float s3 = 0.0f;
-    int base = g * nao;
+    int base_ao = (ao_row0 + g) * nao;
+    int base_dm = g * nao;
     for (int i = 0; i < nao; i++) {
-        float v0 = ao0[base + i];
-        float v1 = ao1[base + i];
-        float v2 = ao2[base + i];
-        float v3 = ao3[base + i];
-        float d0 = aodm0[base + i];
+        float v0 = ao0[base_ao + i];
+        float v1 = ao1[base_ao + i];
+        float v2 = ao2[base_ao + i];
+        float v3 = ao3[base_ao + i];
+        float d0 = aodm0[base_dm + i];
         s0 += d0 * v0;
-        s1 += d0 * v1 + aodm1[base + i] * v0;
-        s2 += d0 * v2 + aodm2[base + i] * v0;
-        s3 += d0 * v3 + aodm3[base + i] * v0;
+        s1 += d0 * v1 + aodm1[base_dm + i] * v0;
+        s2 += d0 * v2 + aodm2[base_dm + i] * v0;
+        s3 += d0 * v3 + aodm3[base_dm + i] * v0;
     }
-    rho[g] = s0;
-    rho[ngrids + g] = s1;
-    rho[2 * ngrids + g] = s2;
-    rho[3 * ngrids + g] = s3;
+    int og = grid0 + g;
+    rho[og] = s0;
+    rho[ngrids_total + og] = s1;
+    rho[2*ngrids_total + og] = s2;
+    rho[3*ngrids_total + og] = s3;
 }
 
 __kernel void scale_aow_lda(
     __global const float *ao0,
     __global const float *wv,
     __global float       *aow,
-    int nao, int ngrids)
+    int nao, int nblk, int grid0, int ao_row0)
 {
     int g = get_global_id(0);
     int i = get_global_id(1);
-    if (g >= ngrids || i >= nao) return;
+    if (g >= nblk || i >= nao) return;
 
     int idx = g * nao + i;
-    aow[idx] = ao0[idx] * wv[g];
+    aow[idx] = ao0[(ao_row0 + g) * nao + i] * wv[grid0 + g];
 }
 
 __kernel void scale_aow_gga_split(
@@ -987,14 +999,16 @@ __kernel void scale_aow_gga_split(
     __global const float *ao3,
     __global const float *wv,
     __global float       *aow,
-    int nao, int ngrids)
+    int nao, int nblk, int grid0, int ngrids_total, int ao_row0)
 {
     int g = get_global_id(0);
     int i = get_global_id(1);
-    if (g >= ngrids || i >= nao) return;
+    if (g >= nblk || i >= nao) return;
 
     int idx = g * nao + i;
-    aow[idx] = ao0[idx] * wv[g] + ao1[idx] * wv[ngrids + g] + ao2[idx] * wv[2 * ngrids + g] + ao3[idx] * wv[3 * ngrids + g];
+    int og = grid0 + g;
+    int aidx = (ao_row0 + g) * nao + i;
+    aow[idx] = ao0[aidx] * wv[og] + ao1[aidx] * wv[ngrids_total + og] + ao2[aidx] * wv[2*ngrids_total + og] + ao3[aidx] * wv[3*ngrids_total + og];
 }
 
 // ============================================================
@@ -1050,12 +1064,48 @@ __kernel void compute_nelec_exc(
     nelec_exc[1 * ngrids + igrid] = den * exc[igrid];
 }
 
+// float2 knot: (y, dy/du). Interval [ik, ik+1] uses rad_node[ik], rad_node[ik+1].
+inline void hermite_map_point(float4 d, float r0, float du, int nrad, float *t, float *t1m, int *ik)
+{
+    float r = sqrt(d.x*d.x + d.y*d.y + d.z*d.z);
+    float uf = log1p(r / r0) / du;
+    int i = max(0, min((int)floor(uf), nrad - 2));
+    *ik = i;
+    *t = clamp(uf - (float)i, 0.0f, 1.0f);
+    *t1m = *t - 1.0f;
+}
+
+inline float hermite_eval_node(float t, float t1m, float du, float2 n0, float2 n1)
+{
+    float y0 = n0.x, d0 = n0.y, y1 = n1.x, d1 = n1.y;
+    float dy = y1 - y0;
+    return y0 + t*t*(3.0f-2.0f*t)*dy + t*t1m*t1m*du*d0 + t*t*t1m*du*d1;
+}
+
+inline float hermite_eval_deriv_node(float t, float t1m, float du, float2 n0, float2 n1)
+{
+    float dy = n1.x - n0.x;
+    float d0 = n0.y, d1 = n1.y;
+    return (6.0f*t*(1.0f-t)*dy + (3.0f*t-1.0f)*t1m*du*d0 + t*(3.0f*t-2.0f)*du*d1) / du;
+}
+
+inline float hermite_eval_ir(float t, float t1m, float du, int ik, int ir, int nrad, __global const float2 *rad_node)
+{
+    int base = ir * nrad + ik;
+    return hermite_eval_node(t, t1m, du, rad_node[base], rad_node[base + 1]);
+}
+
+inline float hermite_eval_deriv_ir(float t, float t1m, float du, int ik, int ir, int nrad, __global const float2 *rad_node)
+{
+    int base = ir * nrad + ik;
+    return hermite_eval_deriv_node(t, t1m, du, rad_node[base], rad_node[base + 1]);
+}
+
 __kernel void eval_ao_mapped_hermite_cart(
     __global const float *coords,
     __global const float *atom_coords,
-    __global const float *rad_val,
-    __global const float *rad_du,
-    __global const float *rad_dy,
+    __global const float2 *rad_node,
+    __global const int   *shell_ctr_ir,
     __global const int   *cart_shell,
     __global const int   *cart_ctr,
     __global const int   *cart_ixyz,
@@ -1081,13 +1131,9 @@ __kernel void eval_ao_mapped_hermite_cart(
     int i = (int)floor(uf);
     i = max(0, min(i, nrad - 2));
     float t = clamp(uf - (float)i, 0.0f, 1.0f);
-    int base = (sh * nctr_max + ctr) * nrad + i;
-    float y0 = rad_val[base];
-    float dy = rad_dy[base];
-    float d0 = rad_du[base];
-    float d1 = rad_du[base + 1];
     float t1m = t - 1.0f;
-    float radial = y0 + t*t*(3.0f-2.0f*t)*dy + t*t1m*t1m*du*d0 + t*t*t1m*du*d1;
+    int ir = shell_ctr_ir[sh * nctr_max + ctr];
+    float radial = hermite_eval_ir(t, t1m, du, i, ir, nrad, rad_node);
     int p0 = iao * 3;
     int ix = cart_ixyz[p0];
     int iy = cart_ixyz[p0 + 1];
@@ -1102,9 +1148,8 @@ __kernel void eval_ao_mapped_hermite_cart(
 __kernel void eval_ao_mapped_hermite_cart_deriv1(
     __global const float *coords,
     __global const float *atom_coords,
-    __global const float *rad_val,
-    __global const float *rad_du,
-    __global const float *rad_dy,
+    __global const float2 *rad_node,
+    __global const int   *shell_ctr_ir,
     __global const int   *cart_shell,
     __global const int   *cart_ctr,
     __global const int   *cart_ixyz,
@@ -1133,18 +1178,10 @@ __kernel void eval_ao_mapped_hermite_cart_deriv1(
     int i = (int)floor(uf);
     i = max(0, min(i, nrad - 2));
     float t = clamp(uf - (float)i, 0.0f, 1.0f);
-    int base = (sh * nctr_max + ctr) * nrad + i;
-    float y0 = rad_val[base];
-    float dy = rad_dy[base];
-    float d0 = rad_du[base];
-    float d1 = rad_du[base + 1];
-
-    // Fully factored Hermite to minimize float32 cancellation:
-    // H(t) = y0 + t^2(3-2t)*dy + t(t-1)^2*h*d0 + t^2(t-1)*h*d1
-    float t1m = t - 1.0f;  // (t-1)
-    float radial = y0 + t*t*(3.0f-2.0f*t)*dy + t*t1m*t1m*du*d0 + t*t*t1m*du*d1;
-    // H'(t) = 6t(1-t)*dy + (3t-1)(t-1)*h*d0 + t(3t-2)*h*d1
-    float drad_du = (6.0f*t*(1.0f-t)*dy + (3.0f*t-1.0f)*t1m*du*d0 + t*(3.0f*t-2.0f)*du*d1) / du;
+    float t1m = t - 1.0f;
+    int ir = shell_ctr_ir[sh * nctr_max + ctr];
+    float radial = hermite_eval_ir(t, t1m, du, i, ir, nrad, rad_node);
+    float drad_du = hermite_eval_deriv_ir(t, t1m, du, i, ir, nrad, rad_node);
     float drad_dr = drad_du / (r + r0);
     float invr = r > 1.0e-20f ? 1.0f / r : 0.0f;
 
@@ -1175,19 +1212,6 @@ __kernel void eval_ao_mapped_hermite_cart_deriv1(
 // Each channel is one already-contracted radial function with angular momentum l.
 // Thread layout: (grid_point, atom); kernel loop only dispatches eval_radial_cart*().
 // Angular Cartesian components are explicitly unrolled for s/p/d/f inside helpers.
-
-inline float hermite_eval(float t, float t1m, float du, float y0, float dy, float d0, float d1)
-// Factored cubic Hermite on uniform grid with spacing du:
-//   H(t) = y0 + t^2(3-2t)*dy + t(t-1)^2*h*d0 + t^2(t-1)*h*d1
-// dy=y1-y0 precomputed in float64 to avoid cancellation.
-{
-    return y0 + t*t*(3.0f-2.0f*t)*dy + t*t1m*t1m*du*d0 + t*t*t1m*du*d1;
-}
-
-inline float hermite_eval_deriv(float t, float t1m, float du, float dy, float d0, float d1)
-{
-    return (6.0f*t*(1.0f-t)*dy + (3.0f*t-1.0f)*t1m*du*d0 + t*(3.0f*t-2.0f)*du*d1) / du;
-}
 
 inline void eval_radial_cart(float4 d, int l, int out, float radial, int ncart, float *ao)
 {
@@ -1257,9 +1281,7 @@ inline void eval_radial_cart_deriv1(float4 d, int l, int out, float radial, floa
 __kernel void eval_ao_mapped_hermite_cart_atom(
     __global const float4 *coords,
     __global const float4 *atom_coords,
-    __global const float *rad_val,
-    __global const float *rad_du,
-    __global const float *rad_dy,
+    __global const float2 *rad_node,
     __global const int   *radial_l,
     __global const int   *radial_cart0,
     __global const int   *atom_radial_offset,
@@ -1284,8 +1306,7 @@ __kernel void eval_ao_mapped_hermite_cart_atom(
     int nr = atom_radial_offset[iat + 1] - off;
     for (int ii = 0; ii < nr; ii++) {
         int ir = atom_radial_list[off + ii];
-        int base = ir * nrad + i;
-        float radial = hermite_eval(t, t1m, du, rad_val[base], rad_dy[base], rad_du[base], rad_du[base + 1]);
+        float radial = hermite_eval_ir(t, t1m, du, i, ir, nrad, rad_node);
         eval_radial_cart(d, radial_l[ir], g * ncart + radial_cart0[ir], radial, ncart, ao);
     }
 }
@@ -1293,9 +1314,7 @@ __kernel void eval_ao_mapped_hermite_cart_atom(
 __kernel void eval_ao_mapped_hermite_cart_deriv1_atom(
     __global const float4 *coords,
     __global const float4 *atom_coords,
-    __global const float *rad_val,
-    __global const float *rad_du,
-    __global const float *rad_dy,
+    __global const float2 *rad_node,
     __global const int   *radial_l,
     __global const int   *radial_cart0,
     __global const int   *atom_radial_offset,
@@ -1324,9 +1343,8 @@ __kernel void eval_ao_mapped_hermite_cart_deriv1_atom(
     int nr = atom_radial_offset[iat + 1] - off;
     for (int ii = 0; ii < nr; ii++) {
         int ir = atom_radial_list[off + ii];
-        int base = ir * nrad + i;
-        float radial = hermite_eval(t, t1m, du, rad_val[base], rad_dy[base], rad_du[base], rad_du[base + 1]);
-        float drad_du = hermite_eval_deriv(t, t1m, du, rad_dy[base], rad_du[base], rad_du[base + 1]);
+        float radial = hermite_eval_ir(t, t1m, du, i, ir, nrad, rad_node);
+        float drad_du = hermite_eval_deriv_ir(t, t1m, du, i, ir, nrad, rad_node);
         eval_radial_cart_deriv1(d, radial_l[ir], g * ncart + radial_cart0[ir], radial, drad_du / (r + r0), invr, ncart, ao0, ao1, ao2, ao3);
     }
 }
@@ -1344,16 +1362,23 @@ __kernel void eval_ao_mapped_hermite_cart_deriv1_atom(
 // - iatom radials kept in private Ri[MAX_SHELL]
 // - DM blocks cached in local dm_blk[NATILE][NATILE][MAX_AO_ATOM][MAX_AO_ATOM]
 // - Angular unfolding in registers only (fi[6], fj[6])
-// - rho: reduce over NATILE iatom threads per grid point, atomic_add to global
-// - vmat: separate kernel layout, one (ia,ja) pair at a time, tree reduction
+// - rho: one workgroup per grid tile; loop all iTile x jTile inside;
+//   reduce over NATILE in __local psum → final rho[g] (no partials, no atomics)
 // ============================================================
 
 #ifndef NPTILE
 #define NPTILE 16
 #endif
+#ifndef LOG_NPTILE
+#define LOG_NPTILE 4
+#endif
 #ifndef NATILE
 #define NATILE 4
 #endif
+#ifndef LOG_NATILE
+#define LOG_NATILE 2
+#endif
+#define PT_ATOM_SIZE (NPTILE * NATILE)
 #ifndef WGS_TILED
 #define WGS_TILED (NPTILE * NATILE)
 #endif
@@ -1361,53 +1386,108 @@ __kernel void eval_ao_mapped_hermite_cart_deriv1_atom(
 #define MAX_SHELL 6
 #endif
 #ifndef MAX_AO_ATOM
-#define MAX_AO_ATOM 15
+#define MAX_AO_ATOM 16
 #endif
-#define DM_TILE_SIZE (NATILE * NATILE * MAX_AO_ATOM * MAX_AO_ATOM)
+#ifndef LOG_MAX_AO_ATOM
+#define LOG_MAX_AO_ATOM 4
+#endif
+#ifndef MAX_ITILE
+#define MAX_ITILE 32
+#endif
+#define AO_BLK (MAX_AO_ATOM * MAX_AO_ATOM)
+#define LOG_AO_BLK (LOG_MAX_AO_ATOM + LOG_MAX_AO_ATOM)
+#define AO_TILE (NATILE * MAX_AO_ATOM)
+#define LOG_AO_TILE (LOG_NATILE + LOG_MAX_AO_ATOM)
+#define DM_TILE_SIZE (NATILE * NATILE * AO_BLK)
 #define WFJ_SIZE (NPTILE * NATILE * MAX_SHELL)
 
-// Evaluate all radial channels for one atom at one point.
-// Writes Ri[0..ns-1], zeros the rest.
-inline void eval_atom_radials(int ia, float4 d, float r0, float du, int nrad,
-    __global const float *rad_val, __global const float *rad_du, __global const float *rad_dy,
-    __global const int *atom_radial_offset, __global const int *atom_radial_list,
-    float *Ri) {
-    int off = atom_radial_offset[ia];
-    int ns = atom_radial_offset[ia + 1] - off;
-    float r = sqrt(d.x*d.x + d.y*d.y + d.z*d.z);
-    float uf = log1p(r / r0) / du;
-    int i = max(0, min((int)floor(uf), nrad - 2));
-    float t = clamp(uf - (float)i, 0.0f, 1.0f);
-    float t1m = t - 1.0f;
-    for (int s = 0; s < ns; s++) {
-        int ir = atom_radial_list[off + s];
-        int base = ir * nrad + i;
-        Ri[s] = hermite_eval(t, t1m, du, rad_val[base], rad_dy[base], rad_du[base], rad_du[base + 1]);
-    }
+inline void decode_q_vmat(int q, int *iao_l, int *jao_l, int *il, int *jl, int *a, int *b)
+{
+    int jao = q & (AO_TILE - 1);
+    int iao = q >> LOG_AO_TILE;
+    *jao_l = jao;
+    *iao_l = iao;
+    *il = iao >> LOG_MAX_AO_ATOM;
+    *jl = jao >> LOG_MAX_AO_ATOM;
+    *a = iao & (MAX_AO_ATOM - 1);
+    *b = jao & (MAX_AO_ATOM - 1);
+}
+
+// Evaluate all radial channels for one atom at one point (ir_list in private or local).
+inline void eval_radials_slice(int ns, const int *ir_list, float t, float t1m, float du, int ik, int nrad, __global const float2 *rad_node, float *Ri)
+{
+    for (int s = 0; s < ns; s++)
+        Ri[s] = hermite_eval_ir(t, t1m, du, ik, ir_list[s], nrad, rad_node);
     for (int s = ns; s < MAX_SHELL; s++) Ri[s] = 0.0f;
 }
 
-// Same but also compute radial derivatives dR/dr
-inline void eval_atom_radials_deriv(int ia, float4 d, float r0, float du, int nrad,
-    __global const float *rad_val, __global const float *rad_du, __global const float *rad_dy,
-    __global const int *atom_radial_offset, __global const int *atom_radial_list,
-    float *Ri, float *dRi) {
-    int off = atom_radial_offset[ia];
-    int ns = atom_radial_offset[ia + 1] - off;
-    float r = sqrt(d.x*d.x + d.y*d.y + d.z*d.z);
-    float uf = log1p(r / r0) / du;
-    int i = max(0, min((int)floor(uf), nrad - 2));
-    float t = clamp(uf - (float)i, 0.0f, 1.0f);
-    float t1m = t - 1.0f;
-    float invr = r > 1.0e-20f ? 1.0f / r : 0.0f;
+inline void eval_radials_slice_deriv(int ns, const int *ir_list, float t, float t1m, float du, int ik, int nrad, float r, float r0, __global const float2 *rad_node, float *Ri, float *dRi)
+{
     for (int s = 0; s < ns; s++) {
-        int ir = atom_radial_list[off + s];
-        int base = ir * nrad + i;
-        Ri[s] = hermite_eval(t, t1m, du, rad_val[base], rad_dy[base], rad_du[base], rad_du[base + 1]);
-        float drad_du = hermite_eval_deriv(t, t1m, du, rad_dy[base], rad_du[base], rad_du[base + 1]);
-        dRi[s] = drad_du / (r + r0);
+        Ri[s] = hermite_eval_ir(t, t1m, du, ik, ir_list[s], nrad, rad_node);
+        dRi[s] = hermite_eval_deriv_ir(t, t1m, du, ik, ir_list[s], nrad, rad_node) / (r + r0);
     }
     for (int s = ns; s < MAX_SHELL; s++) { Ri[s] = 0.0f; dRi[s] = 0.0f; }
+}
+
+inline void load_atom_tile_meta(int tile0, int natoms, int lid, int lstride, __global const int *atom_radial_offset, __global const int *atom_radial_list, __local int l_ns[NATILE], __local int l_ir[NATILE][MAX_SHELL])
+{
+    for (int k = lid; k < NATILE * MAX_SHELL; k += lstride) {
+        int jj = k / MAX_SHELL;
+        int s = k % MAX_SHELL;
+        int ja = tile0 + jj;
+        if (ja < natoms) {
+            int off = atom_radial_offset[ja];
+            int ns = atom_radial_offset[ja + 1] - off;
+            if (s == 0) l_ns[jj] = ns;
+            if (s < ns) l_ir[jj][s] = atom_radial_list[off + s];
+        } else if (s == 0) {
+            l_ns[jj] = 0;
+        }
+    }
+}
+
+inline void load_atom_tile_meta_l(int tile0, int natoms, int lid, int lstride, __global const int *atom_radial_offset, __global const int *atom_radial_list, __global const int *radial_l, __local int l_ns[NATILE], __local int l_ir[NATILE][MAX_SHELL], __local int l_l[NATILE][MAX_SHELL])
+{
+    for (int k = lid; k < NATILE * MAX_SHELL; k += lstride) {
+        int jj = k / MAX_SHELL;
+        int s = k % MAX_SHELL;
+        int ja = tile0 + jj;
+        if (ja < natoms) {
+            int off = atom_radial_offset[ja];
+            int ns = atom_radial_offset[ja + 1] - off;
+            if (s == 0) l_ns[jj] = ns;
+            if (s < ns) {
+                int ir = atom_radial_list[off + s];
+                l_ir[jj][s] = ir;
+                l_l[jj][s] = radial_l[ir];
+            }
+        } else if (s == 0) {
+            l_ns[jj] = 0;
+        }
+    }
+}
+
+inline int load_atom_ir(int ia, int natoms, __global const int *atom_radial_offset, __global const int *atom_radial_list, int *ir_out)
+{
+    if (ia >= natoms) return 0;
+    int off = atom_radial_offset[ia];
+    int ns = atom_radial_offset[ia + 1] - off;
+    for (int s = 0; s < ns; s++) ir_out[s] = atom_radial_list[off + s];
+    return ns;
+}
+
+inline int load_atom_ir_l(int ia, int natoms, __global const int *atom_radial_offset, __global const int *atom_radial_list, __global const int *radial_l, int *ir_out, int *l_out)
+{
+    if (ia >= natoms) return 0;
+    int off = atom_radial_offset[ia];
+    int ns = atom_radial_offset[ia + 1] - off;
+    for (int s = 0; s < ns; s++) {
+        int ir = atom_radial_list[off + s];
+        ir_out[s] = ir;
+        l_out[s] = radial_l[ir];
+    }
+    return ns;
 }
 
 // Unfold one shell: radial * angular Cartesian components
@@ -1425,9 +1505,9 @@ inline int unfold_shell_deriv(int l, float R, float dRdr, float4 d, float invr,
     float gx=dRdr*x*invr, gy=dRdr*y*invr, gz=dRdr*z*invr;
     if (l == 0) { f0[0]=R; f1[0]=gx; f2[0]=gy; f3[0]=gz; return 1; }
     if (l == 1) {
-        f0[0]=R*x; f1[0]=gx*x+R; f2[0]=gy*x;     f3[0]=gz*x;
-        f0[1]=R*y; f1[1]=gx*y;     f2[1]=gy*y+R; f3[1]=gz*y;
-        f0[2]=R*z; f1[2]=gx*z;     f2[2]=gy*z;     f3[2]=gz*z+R;
+        f0[0]=R*x; f1[0]=gx*x+R; f2[0]=gy*x;   f3[0]=gz*x;
+        f0[1]=R*y; f1[1]=gx*y;   f2[1]=gy*y+R; f3[1]=gz*y;
+        f0[2]=R*z; f1[2]=gx*z;   f2[2]=gy*z;   f3[2]=gz*z+R;
         return 3;
     }
     float x2=x*x, y2=y*y, z2=z*z, xy=x*y, xz=x*z, yz=y*z;
@@ -1440,23 +1520,51 @@ inline int unfold_shell_deriv(int l, float R, float dRdr, float4 d, float invr,
     return 6;
 }
 
+// float4 per cart component: (phi, dphi/dx, dphi/dy, dphi/dz)
+inline int unfold_shell_deriv_f4(int l, float R, float dRdr, float4 d, float invr, float4 *f)
+{
+    float x=d.x, y=d.y, z=d.z;
+    float gx=dRdr*x*invr, gy=dRdr*y*invr, gz=dRdr*z*invr;
+    if (l == 0) { f[0]=(float4)(R, gx, gy, gz); return 1; }
+    if (l == 1) {
+        f[0]=(float4)(R*x, gx*x+R, gy*x, gz*x);
+        f[1]=(float4)(R*y, gx*y,   gy*y+R, gz*y);
+        f[2]=(float4)(R*z, gx*z,   gy*z,   gz*z+R);
+        return 3;
+    }
+    float x2=x*x, y2=y*y, z2=z*z, xy=x*y, xz=x*z, yz=y*z;
+    f[0]=(float4)(R*x2, gx*x2+2.f*R*x, gy*x2,            gz*x2);
+    f[1]=(float4)(R*xy, gx*xy+R*y,     gy*xy+R*x,        gz*xy);
+    f[2]=(float4)(R*xz, gx*xz+R*z,     gy*xz,            gz*xz+R*x);
+    f[3]=(float4)(R*y2, gx*y2,         gy*y2+2.f*R*y,    gz*y2);
+    f[4]=(float4)(R*yz, gx*yz,         gy*yz+R*z,        gz*yz+R*y);
+    f[5]=(float4)(R*z2, gx*z2,         gy*z2,            gz*z2+2.f*R*z);
+    return 6;
+}
+
+inline void accum_rho_gga_f4(float4 fi, float4 t, float *rho_val, float *gx_val, float *gy_val, float *gz_val)
+{
+    *rho_val += fi.x * t.x;
+    *gx_val  += fi.x * t.y + fi.y * t.x;
+    *gy_val  += fi.x * t.z + fi.z * t.x;
+    *gz_val  += fi.x * t.w + fi.w * t.x;
+}
+
 // Contract one (ia,ja) atom pair using shellwise unfolding.
 // Uses private Ri, local Rj, local dm_blk. No full phi arrays.
-inline float contract_pair_rho(float4 di, float4 dj, int ia, int ja,
+inline float contract_pair_rho(float4 di, float4 dj,
     int il, int jl, float *Ri, __local float *Rj,
     __local float dm_blk[NATILE][NATILE][MAX_AO_ATOM][MAX_AO_ATOM],
-    __global const int *atom_radial_offset, __global const int *atom_radial_list,
+    int ns_i, const int *ir_i, int ns_j, const int *ir_j,
     __global const int *radial_l) {
     float acc = 0.0f;
-    int off_i = atom_radial_offset[ia], ns_i = atom_radial_offset[ia+1] - off_i;
-    int off_j = atom_radial_offset[ja], ns_j = atom_radial_offset[ja+1] - off_j;
     int iao_off = 0;
     for (int si = 0; si < ns_i; si++) {
-        int li = radial_l[atom_radial_list[off_i + si]];
+        int li = radial_l[ir_i[si]];
         float fi[6]; int ni = unfold_shell(li, Ri[si], di, fi);
         int jao_off = 0;
         for (int sj = 0; sj < ns_j; sj++) {
-            int lj = radial_l[atom_radial_list[off_j + sj]];
+            int lj = radial_l[ir_j[sj]];
             float fj[6]; int nj = unfold_shell(lj, Rj[sj], dj, fj);
             for (int ai = 0; ai < ni; ai++) {
                 float tmp = 0.0f;
@@ -1470,28 +1578,50 @@ inline float contract_pair_rho(float4 di, float4 dj, int ia, int ja,
     return acc;
 }
 
+// v2: angular momentum l[] preloaded; no radial_l global reads in contract
+inline float contract_pair_rho_v2(int il, int jl, float *Ri, __local float *Rj,
+    __local float dm_blk[NATILE][NATILE][MAX_AO_ATOM][MAX_AO_ATOM],
+    int ns_i, const int *l_i, int ns_j, const int *l_j,
+    float4 di, float4 dj) {
+    float acc = 0.0f;
+    int iao_off = 0;
+    for (int si = 0; si < ns_i; si++) {
+        float fi[6]; int ni = unfold_shell(l_i[si], Ri[si], di, fi);
+        int jao_off = 0;
+        for (int sj = 0; sj < ns_j; sj++) {
+            float fj[6]; int nj = unfold_shell(l_j[sj], Rj[sj], dj, fj);
+            for (int ai = 0; ai < ni; ai++) {
+                float tmp = 0.0f;
+                for (int aj = 0; aj < nj; aj++) tmp += dm_blk[il][jl][iao_off+ai][jao_off+aj] * fj[aj];
+                acc += fi[ai] * tmp;
+            }
+            jao_off += nj;
+        }
+        iao_off += ni;
+    }
+    return acc;
+}
+
 // Contract one (ia,ja) pair for GGA: returns rho, gx, gy, gz contributions
-inline void contract_pair_rho_gga(float4 di, float4 dj, int ia, int ja,
+inline void contract_pair_rho_gga(float4 di, float4 dj,
     int il, int jl, float *Ri, float *dRi, __local float *Rj, __local float *dRj,
     __local float dm_blk[NATILE][NATILE][MAX_AO_ATOM][MAX_AO_ATOM],
-    __global const int *atom_radial_offset, __global const int *atom_radial_list,
+    int ns_i, const int *ir_i, int ns_j, const int *ir_j,
     __global const int *radial_l,
     float *rho_val, float *gx_val, float *gy_val, float *gz_val) {
     *rho_val = 0.0f; *gx_val = 0.0f; *gy_val = 0.0f; *gz_val = 0.0f;
-    int off_i = atom_radial_offset[ia], ns_i = atom_radial_offset[ia+1] - off_i;
-    int off_j = atom_radial_offset[ja], ns_j = atom_radial_offset[ja+1] - off_j;
     float ri_mag = sqrt(di.x*di.x + di.y*di.y + di.z*di.z);
     float rj_mag = sqrt(dj.x*dj.x + dj.y*dj.y + dj.z*dj.z);
     float invr_i = ri_mag > 1e-20f ? 1.0f/ri_mag : 0.0f;
     float invr_j = rj_mag > 1e-20f ? 1.0f/rj_mag : 0.0f;
     int iao_off = 0;
     for (int si = 0; si < ns_i; si++) {
-        int li = radial_l[atom_radial_list[off_i + si]];
+        int li = radial_l[ir_i[si]];
         float fi0[6], fi1[6], fi2[6], fi3[6];
         int ni = unfold_shell_deriv(li, Ri[si], dRi[si], di, invr_i, fi0, fi1, fi2, fi3);
         int jao_off = 0;
         for (int sj = 0; sj < ns_j; sj++) {
-            int lj = radial_l[atom_radial_list[off_j + sj]];
+            int lj = radial_l[ir_j[sj]];
             float fj0[6], fj1[6], fj2[6], fj3[6];
             int nj = unfold_shell_deriv(lj, Rj[sj], dRj[sj], dj, invr_j, fj0, fj1, fj2, fj3);
             for (int ai = 0; ai < ni; ai++) {
@@ -1503,7 +1633,7 @@ inline void contract_pair_rho_gga(float4 di, float4 dj, int ia, int ja,
                     t2 += dm * fj2[aj];
                     t3 += dm * fj3[aj];
                 }
-                *rho_val += fi0[ai] * t0;
+                *rho_val +=                fi0[ai] * t0;
                 *gx_val  += fi0[ai] * t1 + fi1[ai] * t0;
                 *gy_val  += fi0[ai] * t2 + fi2[ai] * t0;
                 *gz_val  += fi0[ai] * t3 + fi3[ai] * t0;
@@ -1514,18 +1644,44 @@ inline void contract_pair_rho_gga(float4 di, float4 dj, int ia, int ja,
     }
 }
 
+// v2: l[] preloaded, invr precomputed, float4 (phi,dphi) inner dm·fj
+inline void contract_pair_rho_gga_v2(int il, int jl, float *Ri, float *dRi, __local float *Rj, __local float *dRj,
+    __local float dm_blk[NATILE][NATILE][MAX_AO_ATOM][MAX_AO_ATOM],
+    int ns_i, const int *l_i, int ns_j, const int *l_j,
+    float4 di, float4 dj, float invr_i, float invr_j,
+    float *rho_val, float *gx_val, float *gy_val, float *gz_val) {
+    *rho_val = 0.0f; *gx_val = 0.0f; *gy_val = 0.0f; *gz_val = 0.0f;
+    int iao_off = 0;
+    for (int si = 0; si < ns_i; si++) {
+        float4 fi[6];
+        int ni = unfold_shell_deriv_f4(l_i[si], Ri[si], dRi[si], di, invr_i, fi);
+        int jao_off = 0;
+        for (int sj = 0; sj < ns_j; sj++) {
+            float4 fj[6];
+            int nj = unfold_shell_deriv_f4(l_j[sj], Rj[sj], dRj[sj], dj, invr_j, fj);
+            for (int ai = 0; ai < ni; ai++) {
+                float4 t = (float4)(0.0f);
+                for (int aj = 0; aj < nj; aj++) {
+                    float dm = dm_blk[il][jl][iao_off+ai][jao_off+aj];
+                    t += dm * fj[aj];
+                }
+                accum_rho_gga_f4(fi[ai], t, rho_val, gx_val, gy_val, gz_val);
+            }
+            jao_off += nj;
+        }
+        iao_off += ni;
+    }
+}
+
 // ---- rho_lda_tiled ----
-// 2D workgroup: (NPTILE grid points, NATILE i-atoms)
-// Each thread = (ip grid point, il i-atom). Iterates over j-atom tiles.
-// jatom radials cached in local wfRj, DM blocks in local dm_blk.
-// Final: reduce over il, atomic_add to rho[g].
+// One workgroup per grid-point tile (NPTILE points).
+// Threads (ip, il): loop all iTile x jTile atom-pair tiles inside the kernel.
+// Final __local reduction over il → rho[g].
 
 __kernel void rho_lda_tiled(
     __global const float4 *coords,
     __global const float4 *atom_coords,
-    __global const float *rad_val,
-    __global const float *rad_du,
-    __global const float *rad_dy,
+    __global const float2 *rad_node,
     __global const int *radial_l,
     __global const int *radial_cart0,
     __global const int *atom_radial_offset,
@@ -1541,75 +1697,83 @@ __kernel void rho_lda_tiled(
     int il = get_local_id(1);
     int lid = il * NPTILE + ip;
     int gTile = get_group_id(0);
-    int iTile = get_group_id(1);
     int g = gTile * NPTILE + ip;
-    int ia = iTile * NATILE + il;
 
-    __local float wfRj[NPTILE][NATILE][MAX_SHELL];
-    __local float dm_blk[NATILE][NATILE][MAX_AO_ATOM][MAX_AO_ATOM];
-    __local float psum[WGS_TILED];
-
-    float4 di = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
-    float Ri[MAX_SHELL];
-    for (int s = 0; s < MAX_SHELL; s++) Ri[s] = 0.0f;
-    if (g < ngrids && ia < natoms) {
-        di = coords[g] - atom_coords[ia];
-        eval_atom_radials(ia, di, r0, du, nrad, rad_val, rad_du, rad_dy,
-            atom_radial_offset, atom_radial_list, Ri);
-    }
+    __local float wfRj[NPTILE][NATILE][MAX_SHELL];           // j-atom radial values at each grid point in tile (cooperative fill)
+    __local float dm_blk[NATILE][NATILE][MAX_AO_ATOM][MAX_AO_ATOM]; // DM sub-block for current (iTile,jTile) pair
+    __local float psum[WGS_TILED];                           // per-thread rho partials before NATILE reduction
+    __local int l_j_ns[NATILE];                              // shell count per j-atom in current jTile
+    __local int l_j_ir[NATILE][MAX_SHELL];                   // radial channel index ir per (j-atom, shell)
+    __local int l_j_l[NATILE][MAX_SHELL];                     // angular momentum l per (j-atom, shell)
 
     float rho_priv = 0.0f;
+    int n_iTiles = (natoms + NATILE - 1) / NATILE;
+    int i_ir_tile[MAX_ITILE][MAX_SHELL];
+    int i_l_tile[MAX_ITILE][MAX_SHELL];
+    int i_ns_tile[MAX_ITILE];
+    float Ri_tile[MAX_ITILE][MAX_SHELL];
+    float4 di_tile[MAX_ITILE];
+
+    for (int it = 0; it < n_iTiles; it++) {
+        int ia = (it << LOG_NATILE) + il;
+        i_ns_tile[it] = load_atom_ir_l(ia, natoms, atom_radial_offset, atom_radial_list, radial_l, i_ir_tile[it], i_l_tile[it]);
+        di_tile[it] = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+        float t_i = 0.0f, t1m_i = 0.0f; int ik_i = 0;
+        for (int s = 0; s < MAX_SHELL; s++) Ri_tile[it][s] = 0.0f;
+        if (g < ngrids && ia < natoms) {
+            di_tile[it] = coords[g] - atom_coords[ia];
+            hermite_map_point(di_tile[it], r0, du, nrad, &t_i, &t1m_i, &ik_i);
+            eval_radials_slice(i_ns_tile[it], i_ir_tile[it], t_i, t1m_i, du, ik_i, nrad, rad_node, Ri_tile[it]);
+        }
+    }
 
     for (int jTile = 0; jTile < natoms; jTile += NATILE) {
-        // Cooperative load: wfRj and dm_blk (disjoint arrays, one barrier)
-        for (int k = lid; k < WFJ_SIZE; k += WGS_TILED) {
-            int s = k % MAX_SHELL;
-            int jj = (k / MAX_SHELL) % NATILE;
-            int pp = k / (MAX_SHELL * NATILE);
+        load_atom_tile_meta_l(jTile, natoms, lid, WGS_TILED, atom_radial_offset, atom_radial_list, radial_l, l_j_ns, l_j_ir, l_j_l);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int k = lid; k < PT_ATOM_SIZE; k += WGS_TILED) {
+            int jj = k & (NATILE - 1);
+            int pp = k >> LOG_NATILE;
             int gj = gTile * NPTILE + pp;
             int ja = jTile + jj;
-            float v = 0.0f;
+            for (int s = 0; s < MAX_SHELL; s++) wfRj[pp][jj][s] = 0.0f;
             if (gj < ngrids && ja < natoms) {
-                float4 dj = coords[gj] - atom_coords[ja];
-                int off = atom_radial_offset[ja];
-                int ns = atom_radial_offset[ja+1] - off;
-                if (s < ns) {
-                    int ir = atom_radial_list[off + s];
-                    float r = sqrt(dj.x*dj.x + dj.y*dj.y + dj.z*dj.z);
-                    float uf = log1p(r / r0) / du;
-                    int i = max(0, min((int)floor(uf), nrad - 2));
-                    float t = clamp(uf - (float)i, 0.0f, 1.0f);
-                    float t1m = t - 1.0f;
-                    int base = ir * nrad + i;
-                    v = hermite_eval(t, t1m, du, rad_val[base], rad_dy[base], rad_du[base], rad_du[base+1]);
-                }
+                float t, t1m; int ik;
+                hermite_map_point(coords[gj] - atom_coords[ja], r0, du, nrad, &t, &t1m, &ik);
+                for (int s = 0; s < l_j_ns[jj]; s++)
+                    wfRj[pp][jj][s] = hermite_eval_ir(t, t1m, du, ik, l_j_ir[jj][s], nrad, rad_node);
             }
-            wfRj[pp][jj][s] = v;
-        }
-        for (int k = lid; k < DM_TILE_SIZE; k += WGS_TILED) {
-            int ab = k % (MAX_AO_ATOM * MAX_AO_ATOM);
-            int pq = k / (MAX_AO_ATOM * MAX_AO_ATOM);
-            int a = ab / MAX_AO_ATOM, b = ab % MAX_AO_ATOM;
-            int ii2 = pq / NATILE, jj2 = pq % NATILE;
-            int ia2 = iTile * NATILE + ii2, ja2 = jTile + jj2;
-            float v = 0.0f;
-            if (ia2 < natoms && ja2 < natoms && a < atom_nao[ia2] && b < atom_nao[ja2]) {
-                v = dm_cart[(atom_ao0[ia2] + a) * ncart + (atom_ao0[ja2] + b)];
-            }
-            dm_blk[ii2][jj2][a][b] = v;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        if (g < ngrids && ia < natoms) {
-            for (int jl = 0; jl < NATILE; jl++) {
-                int ja = jTile + jl;
-                if (ja >= natoms) continue;
-                float4 dj = coords[g] - atom_coords[ja];
-                rho_priv += contract_pair_rho(di, dj, ia, ja, il, jl, Ri, wfRj[ip][jl],
-                    dm_blk, atom_radial_offset, atom_radial_list, radial_l);
+        for (int it = 0; it < n_iTiles; it++) {
+            int ia = (it << LOG_NATILE) + il;
+
+            for (int k = lid; k < DM_TILE_SIZE; k += WGS_TILED) {
+                int ab = k & (AO_BLK - 1);
+                int pq = k >> LOG_AO_BLK;
+                int a = ab >> LOG_MAX_AO_ATOM;
+                int b = ab & (MAX_AO_ATOM - 1);
+                int ii2 = pq >> LOG_NATILE;
+                int jj2 = pq & (NATILE - 1);
+                int ia2 = (it << LOG_NATILE) + ii2, ja2 = jTile + jj2;
+                float v = 0.0f;
+                if (ia2 < natoms && ja2 < natoms && a < atom_nao[ia2] && b < atom_nao[ja2]) {
+                    v = dm_cart[(atom_ao0[ia2] + a) * ncart + (atom_ao0[ja2] + b)];
+                }
+                dm_blk[ii2][jj2][a][b] = v;
             }
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            if (g < ngrids && ia < natoms) {
+                for (int jl = 0; jl < NATILE; jl++) {
+                    int ja = jTile + jl;
+                    if (ja >= natoms) continue;
+                    float4 dj = coords[g] - atom_coords[ja];
+                    rho_priv += contract_pair_rho_v2(il, jl, Ri_tile[it], wfRj[ip][jl], dm_blk, i_ns_tile[it], i_l_tile[it], l_j_ns[jl], &l_j_l[jl][0], di_tile[it], dj);
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
         }
-        barrier(CLK_LOCAL_MEM_FENCE);
     }
 
     psum[lid] = rho_priv;
@@ -1617,18 +1781,17 @@ __kernel void rho_lda_tiled(
     if (il == 0 && g < ngrids) {
         float s = 0.0f;
         for (int k = 0; k < NATILE; k++) s += psum[k * NPTILE + ip];
-        rho[iTile * ngrids + g] = s;
+        rho[g] = s;
     }
 }
 
 // ---- rho_gga_tiled ----
+// Same structure as rho_lda_tiled; also accumulates grad rho components.
 
 __kernel void rho_gga_tiled(
     __global const float4 *coords,
     __global const float4 *atom_coords,
-    __global const float *rad_val,
-    __global const float *rad_du,
-    __global const float *rad_dy,
+    __global const float2 *rad_node,
     __global const int *radial_l,
     __global const int *radial_cart0,
     __global const int *atom_radial_offset,
@@ -1644,85 +1807,101 @@ __kernel void rho_gga_tiled(
     int il = get_local_id(1);
     int lid = il * NPTILE + ip;
     int gTile = get_group_id(0);
-    int iTile = get_group_id(1);
     int g = gTile * NPTILE + ip;
-    int ia = iTile * NATILE + il;
 
-    __local float wfRj[NPTILE][NATILE][MAX_SHELL];
-    __local float dwfRj[NPTILE][NATILE][MAX_SHELL];
-    __local float dm_blk[NATILE][NATILE][MAX_AO_ATOM][MAX_AO_ATOM];
-    __local float psum_rho[WGS_TILED];
-    __local float psum_gx[WGS_TILED];
-    __local float psum_gy[WGS_TILED];
-    __local float psum_gz[WGS_TILED];
-
-    float4 di = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
-    float Ri[MAX_SHELL], dRi[MAX_SHELL];
-    for (int s = 0; s < MAX_SHELL; s++) { Ri[s] = 0.0f; dRi[s] = 0.0f; }
-    if (g < ngrids && ia < natoms) {
-        di = coords[g] - atom_coords[ia];
-        eval_atom_radials_deriv(ia, di, r0, du, nrad, rad_val, rad_du, rad_dy,
-            atom_radial_offset, atom_radial_list, Ri, dRi);
-    }
+    __local float wfRj[NPTILE][NATILE][MAX_SHELL];           // j-atom radial R(r) at each grid point in tile
+    __local float dwfRj[NPTILE][NATILE][MAX_SHELL];          // j-atom dR/dr at each grid point in tile
+    __local float dm_blk[NATILE][NATILE][MAX_AO_ATOM][MAX_AO_ATOM]; // DM sub-block for current (iTile,jTile)
+    __local float psum_rho[WGS_TILED];                       // rho partial per thread before NATILE reduction
+    __local float psum_gx[WGS_TILED];                        // grad_x partial per thread
+    __local float psum_gy[WGS_TILED];                        // grad_y partial per thread
+    __local float psum_gz[WGS_TILED];                        // grad_z partial per thread
+    __local int l_j_ns[NATILE];                              // shell count per j-atom in current jTile
+    __local int l_j_ir[NATILE][MAX_SHELL];                   // radial channel ir per (j-atom, shell)
+    __local int l_j_l[NATILE][MAX_SHELL];                     // angular momentum l per (j-atom, shell)
 
     float rho_priv = 0.0f, gx_priv = 0.0f, gy_priv = 0.0f, gz_priv = 0.0f;
+    int n_iTiles = (natoms + NATILE - 1) / NATILE;
+    int i_ir_tile[MAX_ITILE][MAX_SHELL];
+    int i_l_tile[MAX_ITILE][MAX_SHELL];
+    int i_ns_tile[MAX_ITILE];
+    float Ri_tile[MAX_ITILE][MAX_SHELL];
+    float dRi_tile[MAX_ITILE][MAX_SHELL];
+    float4 di_tile[MAX_ITILE];
+    float invr_i_tile[MAX_ITILE];
+
+    for (int it = 0; it < n_iTiles; it++) {
+        int ia = (it << LOG_NATILE) + il;
+        i_ns_tile[it] = load_atom_ir_l(ia, natoms, atom_radial_offset, atom_radial_list, radial_l, i_ir_tile[it], i_l_tile[it]);
+        di_tile[it] = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+        invr_i_tile[it] = 0.0f;
+        float t_i = 0.0f, t1m_i = 0.0f; int ik_i = 0;
+        float r_i = 0.0f;
+        for (int s = 0; s < MAX_SHELL; s++) { Ri_tile[it][s] = 0.0f; dRi_tile[it][s] = 0.0f; }
+        if (g < ngrids && ia < natoms) {
+            di_tile[it] = coords[g] - atom_coords[ia];
+            r_i = sqrt(di_tile[it].x*di_tile[it].x + di_tile[it].y*di_tile[it].y + di_tile[it].z*di_tile[it].z);
+            invr_i_tile[it] = r_i > 1e-20f ? 1.0f/r_i : 0.0f;
+            hermite_map_point(di_tile[it], r0, du, nrad, &t_i, &t1m_i, &ik_i);
+            eval_radials_slice_deriv(i_ns_tile[it], i_ir_tile[it], t_i, t1m_i, du, ik_i, nrad, r_i, r0, rad_node, Ri_tile[it], dRi_tile[it]);
+        }
+    }
 
     for (int jTile = 0; jTile < natoms; jTile += NATILE) {
-        // Cooperative load: wfRj, dwfRj, dm_blk
-        for (int k = lid; k < WFJ_SIZE; k += WGS_TILED) {
-            int s = k % MAX_SHELL;
-            int jj = (k / MAX_SHELL) % NATILE;
-            int pp = k / (MAX_SHELL * NATILE);
+        load_atom_tile_meta_l(jTile, natoms, lid, WGS_TILED, atom_radial_offset, atom_radial_list, radial_l, l_j_ns, l_j_ir, l_j_l);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int k = lid; k < PT_ATOM_SIZE; k += WGS_TILED) {
+            int jj = k & (NATILE - 1);
+            int pp = k >> LOG_NATILE;
             int gj = gTile * NPTILE + pp;
             int ja = jTile + jj;
-            float v = 0.0f, dv = 0.0f;
+            for (int s = 0; s < MAX_SHELL; s++) { wfRj[pp][jj][s] = 0.0f; dwfRj[pp][jj][s] = 0.0f; }
             if (gj < ngrids && ja < natoms) {
                 float4 dj = coords[gj] - atom_coords[ja];
-                int off = atom_radial_offset[ja];
-                int ns = atom_radial_offset[ja+1] - off;
-                if (s < ns) {
-                    int ir = atom_radial_list[off + s];
-                    float r = sqrt(dj.x*dj.x + dj.y*dj.y + dj.z*dj.z);
-                    float uf = log1p(r / r0) / du;
-                    int i = max(0, min((int)floor(uf), nrad - 2));
-                    float t = clamp(uf - (float)i, 0.0f, 1.0f);
-                    float t1m = t - 1.0f;
-                    int base = ir * nrad + i;
-                    v = hermite_eval(t, t1m, du, rad_val[base], rad_dy[base], rad_du[base], rad_du[base+1]);
-                    float drad_du = hermite_eval_deriv(t, t1m, du, rad_dy[base], rad_du[base], rad_du[base+1]);
-                    dv = drad_du / (r + r0);
+                float rj = sqrt(dj.x*dj.x + dj.y*dj.y + dj.z*dj.z);
+                float t, t1m; int ik;
+                hermite_map_point(dj, r0, du, nrad, &t, &t1m, &ik);
+                for (int s = 0; s < l_j_ns[jj]; s++) {
+                    wfRj[pp][jj][s] = hermite_eval_ir(t, t1m, du, ik, l_j_ir[jj][s], nrad, rad_node);
+                    dwfRj[pp][jj][s] = hermite_eval_deriv_ir(t, t1m, du, ik, l_j_ir[jj][s], nrad, rad_node) / (rj + r0);
                 }
             }
-            wfRj[pp][jj][s] = v;
-            dwfRj[pp][jj][s] = dv;
-        }
-        for (int k = lid; k < DM_TILE_SIZE; k += WGS_TILED) {
-            int ab = k % (MAX_AO_ATOM * MAX_AO_ATOM);
-            int pq = k / (MAX_AO_ATOM * MAX_AO_ATOM);
-            int a = ab / MAX_AO_ATOM, b = ab % MAX_AO_ATOM;
-            int ii2 = pq / NATILE, jj2 = pq % NATILE;
-            int ia2 = iTile * NATILE + ii2, ja2 = jTile + jj2;
-            float v = 0.0f;
-            if (ia2 < natoms && ja2 < natoms && a < atom_nao[ia2] && b < atom_nao[ja2]) {
-                v = dm_cart[(atom_ao0[ia2] + a) * ncart + (atom_ao0[ja2] + b)];
-            }
-            dm_blk[ii2][jj2][a][b] = v;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        if (g < ngrids && ia < natoms) {
-            for (int jl = 0; jl < NATILE; jl++) {
-                int ja = jTile + jl;
-                if (ja >= natoms) continue;
-                float4 dj = coords[g] - atom_coords[ja];
-                float rv, gv1, gv2, gv3;
-                contract_pair_rho_gga(di, dj, ia, ja, il, jl, Ri, dRi, wfRj[ip][jl], dwfRj[ip][jl],
-                    dm_blk, atom_radial_offset, atom_radial_list, radial_l,
-                    &rv, &gv1, &gv2, &gv3);
-                rho_priv += rv; gx_priv += gv1; gy_priv += gv2; gz_priv += gv3;
+        for (int it = 0; it < n_iTiles; it++) {
+            int ia = (it << LOG_NATILE) + il;
+
+            for (int k = lid; k < DM_TILE_SIZE; k += WGS_TILED) {
+                int ab = k & (AO_BLK - 1);
+                int pq = k >> LOG_AO_BLK;
+                int a = ab >> LOG_MAX_AO_ATOM;
+                int b = ab & (MAX_AO_ATOM - 1);
+                int ii2 = pq >> LOG_NATILE;
+                int jj2 = pq & (NATILE - 1);
+                int ia2 = (it << LOG_NATILE) + ii2, ja2 = jTile + jj2;
+                float v = 0.0f;
+                if (ia2 < natoms && ja2 < natoms && a < atom_nao[ia2] && b < atom_nao[ja2]) {
+                    v = dm_cart[(atom_ao0[ia2] + a) * ncart + (atom_ao0[ja2] + b)];
+                }
+                dm_blk[ii2][jj2][a][b] = v;
             }
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            if (g < ngrids && ia < natoms) {
+                for (int jl = 0; jl < NATILE; jl++) {
+                    int ja = jTile + jl;
+                    if (ja >= natoms) continue;
+                    float4 dj = coords[g] - atom_coords[ja];
+                    float rj = sqrt(dj.x*dj.x + dj.y*dj.y + dj.z*dj.z);
+                    float invr_j = rj > 1e-20f ? 1.0f/rj : 0.0f;
+                    float rv, gv1, gv2, gv3;
+                    contract_pair_rho_gga_v2(il, jl, Ri_tile[it], dRi_tile[it], wfRj[ip][jl], dwfRj[ip][jl], dm_blk, i_ns_tile[it], i_l_tile[it], l_j_ns[jl], &l_j_l[jl][0], di_tile[it], dj, invr_i_tile[it], invr_j, &rv, &gv1, &gv2, &gv3);
+                    rho_priv += rv; gx_priv += gv1; gy_priv += gv2; gz_priv += gv3;
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
         }
-        barrier(CLK_LOCAL_MEM_FENCE);
     }
 
     psum_rho[lid] = rho_priv; psum_gx[lid] = gx_priv;
@@ -1734,11 +1913,10 @@ __kernel void rho_gga_tiled(
             sr += psum_rho[k*NPTILE+ip]; sx += psum_gx[k*NPTILE+ip];
             sy += psum_gy[k*NPTILE+ip]; sz += psum_gz[k*NPTILE+ip];
         }
-        int base = iTile * 4 * ngrids;
-        rho[base + g] = sr;
-        rho[base + ngrids + g] = sx;
-        rho[base + 2*ngrids + g] = sy;
-        rho[base + 3*ngrids + g] = sz;
+        rho[g] = sr;
+        rho[ngrids + g] = sx;
+        rho[2*ngrids + g] = sy;
+        rho[3*ngrids + g] = sz;
     }
 }
 
@@ -1753,53 +1931,38 @@ __kernel void rho_gga_tiled(
 #ifndef WGS_VMAT
 #define WGS_VMAT 256
 #endif
-#define AO_TILE (NATILE * MAX_AO_ATOM)
 #define VBLK_SIZE (AO_TILE * AO_TILE)
 #define QPT ((VBLK_SIZE + WGS_VMAT - 1) / WGS_VMAT)
 #define PT_ATOM_SIZE (NPTILE * NATILE)
 
 // Fill local AO values for one atom at one grid point (LDA: just phi)
-inline void fill_atom_ao_lda(int ia, float4 d, int base, __local float *ao,
-    float r0, float du, int nrad,
-    __global const float *rad_val, __global const float *rad_du, __global const float *rad_dy,
-    __global const int *radial_l,
-    __global const int *atom_radial_offset, __global const int *atom_radial_list)
+inline void fill_atom_ao_lda(int ns, const int *ir_list, float4 d, int base, __local float *ao, float r0, float du, int nrad, __global const float2 *rad_node, __global const int *radial_l)
 {
+    float t, t1m; int ik;
+    hermite_map_point(d, r0, du, nrad, &t, &t1m, &ik);
     float R[MAX_SHELL];
-    eval_atom_radials(ia, d, r0, du, nrad, rad_val, rad_du, rad_dy, atom_radial_offset, atom_radial_list, R);
-    int off = atom_radial_offset[ia];
-    int ns = atom_radial_offset[ia + 1] - off;
+    eval_radials_slice(ns, ir_list, t, t1m, du, ik, nrad, rad_node, R);
     int ao0 = 0;
     for (int s = 0; s < ns; s++) {
-        int ir = atom_radial_list[off + s];
-        int l = radial_l[ir];
         float f[6];
-        int n = unfold_shell(l, R[s], d, f);
+        int n = unfold_shell(radial_l[ir_list[s]], R[s], d, f);
         for (int a = 0; a < n; a++) ao[base + ao0 + a] = f[a];
         ao0 += n;
     }
 }
 
-// Fill local AO values for one atom at one grid point (GGA: w0*phi + w*dphi)
-inline void fill_atom_aow_gga(int ia, float4 d, float w0, float wx, float wy, float wz,
-    int base, __local float *ao,
-    float r0, float du, int nrad,
-    __global const float *rad_val, __global const float *rad_du, __global const float *rad_dy,
-    __global const int *radial_l,
-    __global const int *atom_radial_offset, __global const int *atom_radial_list)
+inline void fill_atom_aow_gga(int ns, const int *ir_list, float4 d, float w0, float wx, float wy, float wz, int base, __local float *ao, float r0, float du, int nrad, __global const float2 *rad_node, __global const int *radial_l)
 {
+    float t, t1m; int ik;
+    hermite_map_point(d, r0, du, nrad, &t, &t1m, &ik);
+    float r = sqrt(d.x*d.x + d.y*d.y + d.z*d.z);
     float R[MAX_SHELL], dR[MAX_SHELL];
-    eval_atom_radials_deriv(ia, d, r0, du, nrad, rad_val, rad_du, rad_dy, atom_radial_offset, atom_radial_list, R, dR);
-    float rr = sqrt(d.x*d.x + d.y*d.y + d.z*d.z);
-    float invr = (rr > 1e-20f) ? 1.0f / rr : 0.0f;
-    int off = atom_radial_offset[ia];
-    int ns = atom_radial_offset[ia + 1] - off;
+    eval_radials_slice_deriv(ns, ir_list, t, t1m, du, ik, nrad, r, r0, rad_node, R, dR);
+    float invr = (r > 1e-20f) ? 1.0f / r : 0.0f;
     int ao0 = 0;
     for (int s = 0; s < ns; s++) {
-        int ir = atom_radial_list[off + s];
-        int l = radial_l[ir];
         float f0[6], f1[6], f2[6], f3[6];
-        int n = unfold_shell_deriv(l, R[s], dR[s], d, invr, f0, f1, f2, f3);
+        int n = unfold_shell_deriv(radial_l[ir_list[s]], R[s], dR[s], d, invr, f0, f1, f2, f3);
         for (int a = 0; a < n; a++) ao[base + ao0 + a] = w0*f0[a] + wx*f1[a] + wy*f2[a] + wz*f3[a];
         ao0 += n;
     }
@@ -1808,9 +1971,7 @@ inline void fill_atom_aow_gga(int ia, float4 d, float w0, float wx, float wy, fl
 __kernel void vmat_lda_tiled(
     __global const float4 *coords,
     __global const float4 *atom_coords,
-    __global const float *rad_val,
-    __global const float *rad_du,
-    __global const float *rad_dy,
+    __global const float2 *rad_node,
     __global const int *radial_l,
     __global const int *radial_cart0,
     __global const int *atom_radial_offset,
@@ -1825,9 +1986,18 @@ __kernel void vmat_lda_tiled(
     int lid = get_local_id(1);
     int iTile = get_group_id(0);
     int jTile = get_group_id(1);
+    if (jTile < iTile) return;
 
-    __local float aoI[NPTILE][AO_TILE];
-    __local float aoJ[NPTILE][AO_TILE];
+    __local float aoI[NPTILE][AO_TILE];                      // unfolded i-atom Cartesian AO values per grid point
+    __local float aoJ[NPTILE][AO_TILE];                      // unfolded j-atom Cartesian AO values per grid point
+    __local int l_i_ns[NATILE];                              // shell count per i-atom in this workgroup's iTile
+    __local int l_j_ns[NATILE];                              // shell count per j-atom in this workgroup's jTile
+    __local int l_i_ir[NATILE][MAX_SHELL];                   // radial channel ir per (i-atom, shell)
+    __local int l_j_ir[NATILE][MAX_SHELL];                   // radial channel ir per (j-atom, shell)
+
+    load_atom_tile_meta(iTile << LOG_NATILE, natoms, lid, WGS_VMAT, atom_radial_offset, atom_radial_list, l_i_ns, l_i_ir);
+    load_atom_tile_meta(jTile << LOG_NATILE, natoms, lid, WGS_VMAT, atom_radial_offset, atom_radial_list, l_j_ns, l_j_ir);
+    barrier(CLK_LOCAL_MEM_FENCE);
 
     float acc[QPT];
     for (int t = 0; t < QPT; t++) acc[t] = 0.0f;
@@ -1836,29 +2006,29 @@ __kernel void vmat_lda_tiled(
 
         // Fill aoI: unfolded AO values for iTile atoms
         for (int k = lid; k < PT_ATOM_SIZE; k += WGS_VMAT) {
-            int il = k % NATILE;
-            int ip = k / NATILE;
-            int ia = iTile * NATILE + il;
+            int il = k & (NATILE - 1);
+            int ip = k >> LOG_NATILE;
+            int ia = (iTile << LOG_NATILE) + il;
             int g = gTile + ip;
-            int base = il * MAX_AO_ATOM;
+            int base = il << LOG_MAX_AO_ATOM;
             for (int a = 0; a < MAX_AO_ATOM; a++) aoI[ip][base + a] = 0.0f;
             if (g < ngrids && ia < natoms) {
                 float4 d = coords[g] - atom_coords[ia];
-                fill_atom_ao_lda(ia, d, base, aoI[ip], r0, du, nrad, rad_val, rad_du, rad_dy, radial_l, atom_radial_offset, atom_radial_list);
+                fill_atom_ao_lda(l_i_ns[il], &l_i_ir[il][0], d, base, aoI[ip], r0, du, nrad, rad_node, radial_l);
             }
         }
 
         // Fill aoJ: unfolded AO values for jTile atoms
         for (int k = lid; k < PT_ATOM_SIZE; k += WGS_VMAT) {
-            int jl = k % NATILE;
-            int ip = k / NATILE;
-            int ja = jTile * NATILE + jl;
+            int jl = k & (NATILE - 1);
+            int ip = k >> LOG_NATILE;
+            int ja = (jTile << LOG_NATILE) + jl;
             int g = gTile + ip;
-            int base = jl * MAX_AO_ATOM;
+            int base = jl << LOG_MAX_AO_ATOM;
             for (int b = 0; b < MAX_AO_ATOM; b++) aoJ[ip][base + b] = 0.0f;
             if (g < ngrids && ja < natoms) {
                 float4 d = coords[g] - atom_coords[ja];
-                fill_atom_ao_lda(ja, d, base, aoJ[ip], r0, du, nrad, rad_val, rad_du, rad_dy, radial_l, atom_radial_offset, atom_radial_list);
+                fill_atom_ao_lda(l_j_ns[jl], &l_j_ir[jl][0], d, base, aoJ[ip], r0, du, nrad, rad_node, radial_l);
             }
         }
 
@@ -1868,14 +2038,10 @@ __kernel void vmat_lda_tiled(
         for (int t = 0; t < QPT; t++) {
             int q = lid + t * WGS_VMAT;
             if (q >= VBLK_SIZE) continue;
-            int iao_l = q / AO_TILE;
-            int jao_l = q - iao_l * AO_TILE;
-            int il = iao_l / MAX_AO_ATOM;
-            int jl = jao_l / MAX_AO_ATOM;
-            int a = iao_l - il * MAX_AO_ATOM;
-            int b = jao_l - jl * MAX_AO_ATOM;
-            int ia = iTile * NATILE + il;
-            int ja = jTile * NATILE + jl;
+            int iao_l, jao_l, il, jl, a, b;
+            decode_q_vmat(q, &iao_l, &jao_l, &il, &jl, &a, &b);
+            int ia = (iTile << LOG_NATILE) + il;
+            int ja = (jTile << LOG_NATILE) + jl;
             if (ia >= natoms || ja >= natoms || a >= atom_nao[ia] || b >= atom_nao[ja]) continue;
 
             float s = 0.0f;
@@ -1894,18 +2060,15 @@ __kernel void vmat_lda_tiled(
     for (int t = 0; t < QPT; t++) {
         int q = lid + t * WGS_VMAT;
         if (q >= VBLK_SIZE) continue;
-        int iao_l = q / AO_TILE;
-        int jao_l = q - iao_l * AO_TILE;
-        int il = iao_l / MAX_AO_ATOM;
-        int jl = jao_l / MAX_AO_ATOM;
-        int a = iao_l - il * MAX_AO_ATOM;
-        int b = jao_l - jl * MAX_AO_ATOM;
-        int ia = iTile * NATILE + il;
-        int ja = jTile * NATILE + jl;
+        int iao_l, jao_l, il, jl, a, b;
+        decode_q_vmat(q, &iao_l, &jao_l, &il, &jl, &a, &b);
+        int ia = (iTile << LOG_NATILE) + il;
+        int ja = (jTile << LOG_NATILE) + jl;
         if (ia < natoms && ja < natoms && a < atom_nao[ia] && b < atom_nao[ja]) {
             int iao = atom_ao0[ia] + a;
             int jao = atom_ao0[ja] + b;
             vmat[iao * ncart + jao] = acc[t];
+            if (iTile != jTile) vmat[jao * ncart + iao] = acc[t];
         }
     }
 }
@@ -1913,14 +2076,12 @@ __kernel void vmat_lda_tiled(
 // ---- vmat_gga_tiled ----
 // aow = w0*phi + w1*dphi_x + w2*dphi_y + w3*dphi_z
 // vmat[i,j] = sum_g aow_i(g) * phi_j(g)
-// The (ja,ia) workgroup handles the symmetric term.
+// The host adds vmat + vmat.T for the symmetric GGA operator.
 
 __kernel void vmat_gga_tiled(
     __global const float4 *coords,
     __global const float4 *atom_coords,
-    __global const float *rad_val,
-    __global const float *rad_du,
-    __global const float *rad_dy,
+    __global const float2 *rad_node,
     __global const int *radial_l,
     __global const int *radial_cart0,
     __global const int *atom_radial_offset,
@@ -1936,8 +2097,16 @@ __kernel void vmat_gga_tiled(
     int iTile = get_group_id(0);
     int jTile = get_group_id(1);
 
-    __local float aoI[NPTILE][AO_TILE];
-    __local float aoJ[NPTILE][AO_TILE];
+    __local float aoI[NPTILE][AO_TILE];                      // unfolded i-atom Cartesian AO values per grid point
+    __local float aoJ[NPTILE][AO_TILE];                      // unfolded j-atom Cartesian AO values per grid point
+    __local int l_i_ns[NATILE];                              // shell count per i-atom in this workgroup's iTile
+    __local int l_j_ns[NATILE];                              // shell count per j-atom in this workgroup's jTile
+    __local int l_i_ir[NATILE][MAX_SHELL];                   // radial channel ir per (i-atom, shell)
+    __local int l_j_ir[NATILE][MAX_SHELL];                   // radial channel ir per (j-atom, shell)
+
+    load_atom_tile_meta(iTile << LOG_NATILE, natoms, lid, WGS_VMAT, atom_radial_offset, atom_radial_list, l_i_ns, l_i_ir);
+    load_atom_tile_meta(jTile << LOG_NATILE, natoms, lid, WGS_VMAT, atom_radial_offset, atom_radial_list, l_j_ns, l_j_ir);
+    barrier(CLK_LOCAL_MEM_FENCE);
 
     float acc[QPT];
     for (int t = 0; t < QPT; t++) acc[t] = 0.0f;
@@ -1946,30 +2115,30 @@ __kernel void vmat_gga_tiled(
 
         // Fill aoI: weighted AO with derivatives (aow) for iTile atoms
         for (int k = lid; k < PT_ATOM_SIZE; k += WGS_VMAT) {
-            int il = k % NATILE;
-            int ip = k / NATILE;
-            int ia = iTile * NATILE + il;
+            int il = k & (NATILE - 1);
+            int ip = k >> LOG_NATILE;
+            int ia = (iTile << LOG_NATILE) + il;
             int g = gTile + ip;
-            int base = il * MAX_AO_ATOM;
+            int base = il << LOG_MAX_AO_ATOM;
             for (int a = 0; a < MAX_AO_ATOM; a++) aoI[ip][base + a] = 0.0f;
             if (g < ngrids && ia < natoms) {
                 float4 d = coords[g] - atom_coords[ia];
                 float w0 = wv[g], wx = wv[ngrids + g], wy = wv[2*ngrids + g], wz = wv[3*ngrids + g];
-                fill_atom_aow_gga(ia, d, w0, wx, wy, wz, base, aoI[ip], r0, du, nrad, rad_val, rad_du, rad_dy, radial_l, atom_radial_offset, atom_radial_list);
+                fill_atom_aow_gga(l_i_ns[il], &l_i_ir[il][0], d, w0, wx, wy, wz, base, aoI[ip], r0, du, nrad, rad_node, radial_l);
             }
         }
 
         // Fill aoJ: plain AO values (no derivatives) for jTile atoms
         for (int k = lid; k < PT_ATOM_SIZE; k += WGS_VMAT) {
-            int jl = k % NATILE;
-            int ip = k / NATILE;
-            int ja = jTile * NATILE + jl;
+            int jl = k & (NATILE - 1);
+            int ip = k >> LOG_NATILE;
+            int ja = (jTile << LOG_NATILE) + jl;
             int g = gTile + ip;
-            int base = jl * MAX_AO_ATOM;
+            int base = jl << LOG_MAX_AO_ATOM;
             for (int b = 0; b < MAX_AO_ATOM; b++) aoJ[ip][base + b] = 0.0f;
             if (g < ngrids && ja < natoms) {
                 float4 d = coords[g] - atom_coords[ja];
-                fill_atom_ao_lda(ja, d, base, aoJ[ip], r0, du, nrad, rad_val, rad_du, rad_dy, radial_l, atom_radial_offset, atom_radial_list);
+                fill_atom_ao_lda(l_j_ns[jl], &l_j_ir[jl][0], d, base, aoJ[ip], r0, du, nrad, rad_node, radial_l);
             }
         }
 
@@ -1978,14 +2147,10 @@ __kernel void vmat_gga_tiled(
         for (int t = 0; t < QPT; t++) {
             int q = lid + t * WGS_VMAT;
             if (q >= VBLK_SIZE) continue;
-            int iao_l = q / AO_TILE;
-            int jao_l = q - iao_l * AO_TILE;
-            int il = iao_l / MAX_AO_ATOM;
-            int jl = jao_l / MAX_AO_ATOM;
-            int a = iao_l - il * MAX_AO_ATOM;
-            int b = jao_l - jl * MAX_AO_ATOM;
-            int ia = iTile * NATILE + il;
-            int ja = jTile * NATILE + jl;
+            int iao_l, jao_l, il, jl, a, b;
+            decode_q_vmat(q, &iao_l, &jao_l, &il, &jl, &a, &b);
+            int ia = (iTile << LOG_NATILE) + il;
+            int ja = (jTile << LOG_NATILE) + jl;
             if (ia >= natoms || ja >= natoms || a >= atom_nao[ia] || b >= atom_nao[ja]) continue;
 
             float s = 0.0f;
@@ -2003,18 +2168,1124 @@ __kernel void vmat_gga_tiled(
     for (int t = 0; t < QPT; t++) {
         int q = lid + t * WGS_VMAT;
         if (q >= VBLK_SIZE) continue;
-        int iao_l = q / AO_TILE;
-        int jao_l = q - iao_l * AO_TILE;
-        int il = iao_l / MAX_AO_ATOM;
-        int jl = jao_l / MAX_AO_ATOM;
-        int a = iao_l - il * MAX_AO_ATOM;
-        int b = jao_l - jl * MAX_AO_ATOM;
-        int ia = iTile * NATILE + il;
-        int ja = jTile * NATILE + jl;
+        int iao_l, jao_l, il, jl, a, b;
+        decode_q_vmat(q, &iao_l, &jao_l, &il, &jl, &a, &b);
+        int ia = (iTile << LOG_NATILE) + il;
+        int ja = (jTile << LOG_NATILE) + jl;
         if (ia < natoms && ja < natoms && a < atom_nao[ia] && b < atom_nao[ja]) {
             int iao = atom_ao0[ia] + a;
             int jao = atom_ao0[ja] + b;
             vmat[iao * ncart + jao] = acc[t];
+        }
+    }
+}
+
+// ============================================================
+// Single atom-pair kernels (NATILE=1 specialization, fixed AO layout)
+// Host selects these when TileConfig.NATILE == 1.
+// ============================================================
+
+#define PAIR_AO_TILE MAX_AO_ATOM
+#define PAIR_BLK_SIZE (PAIR_AO_TILE * PAIR_AO_TILE)
+#define PAIR_QPT ((PAIR_BLK_SIZE + WGS_VMAT - 1) / WGS_VMAT)
+
+inline void load_single_atom_meta(int ia, int natoms, __global const int *atom_radial_offset, __global const int *atom_radial_list, __local int *ns, __local int *ir_out)
+{
+    if (ia >= natoms) { *ns = 0; return; }
+    int off = atom_radial_offset[ia];
+    *ns = atom_radial_offset[ia + 1] - off;
+    for (int s = 0; s < *ns; s++) ir_out[s] = atom_radial_list[off + s];
+}
+
+inline void load_single_atom_meta_l(int ia, int natoms, __global const int *atom_radial_offset, __global const int *atom_radial_list, __global const int *radial_l, __local int *ns, __local int *ir_out, __local int *l_out)
+{
+    if (ia >= natoms) { *ns = 0; return; }
+    int off = atom_radial_offset[ia];
+    *ns = atom_radial_offset[ia + 1] - off;
+    for (int s = 0; s < *ns; s++) {
+        int ir = atom_radial_list[off + s];
+        ir_out[s] = ir;
+        l_out[s] = radial_l[ir];
+    }
+}
+
+inline float contract_rho_pair_lda(float *Ri, float *Rj, __local float dm_blk[MAX_AO_ATOM][MAX_AO_ATOM], int ns_i, const int *l_i, int ns_j, const int *l_j, float4 di, float4 dj)
+{
+    float acc = 0.0f;
+    int iao_off = 0;
+    for (int si = 0; si < ns_i; si++) {
+        float fi[6]; int ni = unfold_shell(l_i[si], Ri[si], di, fi);
+        int jao_off = 0;
+        for (int sj = 0; sj < ns_j; sj++) {
+            float fj[6]; int nj = unfold_shell(l_j[sj], Rj[sj], dj, fj);
+            for (int ai = 0; ai < ni; ai++) {
+                float tmp = 0.0f;
+                for (int aj = 0; aj < nj; aj++) tmp += dm_blk[iao_off + ai][jao_off + aj] * fj[aj];
+                acc += fi[ai] * tmp;
+            }
+            jao_off += nj;
+        }
+        iao_off += ni;
+    }
+    return acc;
+}
+
+inline void contract_rho_pair_gga(float *Ri, float *dRi, float *Rj, float *dRj, __local float dm_blk[MAX_AO_ATOM][MAX_AO_ATOM], int ns_i, const int *l_i, int ns_j, const int *l_j, float4 di, float4 dj, float invr_i, float invr_j, float *rho_val, float *gx_val, float *gy_val, float *gz_val)
+{
+    *rho_val = 0.0f; *gx_val = 0.0f; *gy_val = 0.0f; *gz_val = 0.0f;
+    int iao_off = 0;
+    for (int si = 0; si < ns_i; si++) {
+        float4 fi[6];
+        int ni = unfold_shell_deriv_f4(l_i[si], Ri[si], dRi[si], di, invr_i, fi);
+        int jao_off = 0;
+        for (int sj = 0; sj < ns_j; sj++) {
+            float4 fj[6];
+            int nj = unfold_shell_deriv_f4(l_j[sj], Rj[sj], dRj[sj], dj, invr_j, fj);
+            for (int ai = 0; ai < ni; ai++) {
+                float4 t = (float4)(0.0f);
+                for (int aj = 0; aj < nj; aj++) t += dm_blk[iao_off + ai][jao_off + aj] * fj[aj];
+                accum_rho_gga_f4(fi[ai], t, rho_val, gx_val, gy_val, gz_val);
+            }
+            jao_off += nj;
+        }
+        iao_off += ni;
+    }
+}
+
+// One workgroup per grid-point tile; loops all atom pairs (ia, ja).
+__kernel void rho_lda_pair(
+    __global const float4 *coords,
+    __global const float4 *atom_coords,
+    __global const float2 *rad_node,
+    __global const int *radial_l,
+    __global const int *radial_cart0,
+    __global const int *atom_radial_offset,
+    __global const int *atom_radial_list,
+    __global const float *dm_cart,
+    __global const int *atom_ao0,
+    __global const int *atom_nao,
+    __global float *rho,
+    float r0, float du,
+    int nrad, int ncart, int ngrids, int natoms)
+{
+    int ip = get_local_id(0);
+    int lid = ip;
+    int gTile = get_group_id(0);
+    int g = gTile * NPTILE + ip;
+
+    __local float wfRj[NPTILE][MAX_SHELL];
+    __local float dm_blk[MAX_AO_ATOM][MAX_AO_ATOM];
+    __local int l_j_ns;
+    __local int l_j_ir[MAX_SHELL];
+    __local int l_j_l[MAX_SHELL];
+
+    float rho_priv = 0.0f;
+    int i_ir[MAX_SHELL];
+    int i_l[MAX_SHELL];
+    float Ri[MAX_SHELL];
+
+    for (int ja = 0; ja < natoms; ja++) {
+        if (lid == 0) load_single_atom_meta_l(ja, natoms, atom_radial_offset, atom_radial_list, radial_l, &l_j_ns, l_j_ir, l_j_l);
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (int k = lid; k < NPTILE * MAX_SHELL; k += NPTILE) {
+            int pp = k / MAX_SHELL;
+            int gj = gTile * NPTILE + pp;
+            for (int s = 0; s < MAX_SHELL; s++) wfRj[pp][s] = 0.0f;
+            if (gj < ngrids && ja < natoms) {
+                float t, t1m; int ik;
+                hermite_map_point(coords[gj] - atom_coords[ja], r0, du, nrad, &t, &t1m, &ik);
+                for (int s = 0; s < l_j_ns; s++)
+                    wfRj[pp][s] = hermite_eval_ir(t, t1m, du, ik, l_j_ir[s], nrad, rad_node);
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (int ia = 0; ia < natoms; ia++) {
+            int ns_i = 0;
+            float4 di = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+            float t_i = 0.0f, t1m_i = 0.0f; int ik_i = 0;
+            for (int s = 0; s < MAX_SHELL; s++) Ri[s] = 0.0f;
+            if (g < ngrids && ia < natoms) {
+                ns_i = load_atom_ir_l(ia, natoms, atom_radial_offset, atom_radial_list, radial_l, i_ir, i_l);
+                di = coords[g] - atom_coords[ia];
+                hermite_map_point(di, r0, du, nrad, &t_i, &t1m_i, &ik_i);
+                eval_radials_slice(ns_i, i_ir, t_i, t1m_i, du, ik_i, nrad, rad_node, Ri);
+            }
+
+            for (int k = lid; k < PAIR_BLK_SIZE; k += NPTILE) {
+                int a = k >> LOG_MAX_AO_ATOM;
+                int b = k & (MAX_AO_ATOM - 1);
+                float v = 0.0f;
+                if (ia < natoms && ja < natoms && a < atom_nao[ia] && b < atom_nao[ja])
+                    v = dm_cart[(atom_ao0[ia] + a) * ncart + (atom_ao0[ja] + b)];
+                dm_blk[a][b] = v;
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            if (g < ngrids && ia < natoms) {
+                float4 dj = coords[g] - atom_coords[ja];
+                rho_priv += contract_rho_pair_lda(Ri, wfRj[ip], dm_blk, ns_i, i_l, l_j_ns, l_j_l, di, dj);
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+    }
+
+    if (g < ngrids) rho[g] = rho_priv;
+}
+
+__kernel void rho_gga_pair(
+    __global const float4 *coords,
+    __global const float4 *atom_coords,
+    __global const float2 *rad_node,
+    __global const int *radial_l,
+    __global const int *radial_cart0,
+    __global const int *atom_radial_offset,
+    __global const int *atom_radial_list,
+    __global const float *dm_cart,
+    __global const int *atom_ao0,
+    __global const int *atom_nao,
+    __global float *rho,
+    float r0, float du,
+    int nrad, int ncart, int ngrids, int natoms)
+{
+    int ip = get_local_id(0);
+    int lid = ip;
+    int gTile = get_group_id(0);
+    int g = gTile * NPTILE + ip;
+
+    __local float wfRj[NPTILE][MAX_SHELL];
+    __local float dwfRj[NPTILE][MAX_SHELL];
+    __local float dm_blk[MAX_AO_ATOM][MAX_AO_ATOM];
+    __local int l_j_ns;
+    __local int l_j_ir[MAX_SHELL];
+    __local int l_j_l[MAX_SHELL];
+
+    float rho_priv = 0.0f, gx_priv = 0.0f, gy_priv = 0.0f, gz_priv = 0.0f;
+    int i_ir[MAX_SHELL];
+    int i_l[MAX_SHELL];
+    float Ri[MAX_SHELL];
+    float dRi[MAX_SHELL];
+
+    for (int ja = 0; ja < natoms; ja++) {
+        if (lid == 0) load_single_atom_meta_l(ja, natoms, atom_radial_offset, atom_radial_list, radial_l, &l_j_ns, l_j_ir, l_j_l);
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (int k = lid; k < NPTILE * MAX_SHELL; k += NPTILE) {
+            int pp = k / MAX_SHELL;
+            int gj = gTile * NPTILE + pp;
+            for (int s = 0; s < MAX_SHELL; s++) { wfRj[pp][s] = 0.0f; dwfRj[pp][s] = 0.0f; }
+            if (gj < ngrids && ja < natoms) {
+                float4 dj = coords[gj] - atom_coords[ja];
+                float rj = sqrt(dj.x*dj.x + dj.y*dj.y + dj.z*dj.z);
+                float t, t1m; int ik;
+                hermite_map_point(dj, r0, du, nrad, &t, &t1m, &ik);
+                for (int s = 0; s < l_j_ns; s++) {
+                    wfRj[pp][s] = hermite_eval_ir(t, t1m, du, ik, l_j_ir[s], nrad, rad_node);
+                    dwfRj[pp][s] = hermite_eval_deriv_ir(t, t1m, du, ik, l_j_ir[s], nrad, rad_node) / (rj + r0);
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (int ia = 0; ia < natoms; ia++) {
+            int ns_i = 0;
+            float4 di = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+            float invr_i = 0.0f;
+            float t_i = 0.0f, t1m_i = 0.0f; int ik_i = 0;
+            float r_i = 0.0f;
+            for (int s = 0; s < MAX_SHELL; s++) { Ri[s] = 0.0f; dRi[s] = 0.0f; }
+            if (g < ngrids && ia < natoms) {
+                ns_i = load_atom_ir_l(ia, natoms, atom_radial_offset, atom_radial_list, radial_l, i_ir, i_l);
+                di = coords[g] - atom_coords[ia];
+                r_i = sqrt(di.x*di.x + di.y*di.y + di.z*di.z);
+                invr_i = r_i > 1e-20f ? 1.0f/r_i : 0.0f;
+                hermite_map_point(di, r0, du, nrad, &t_i, &t1m_i, &ik_i);
+                eval_radials_slice_deriv(ns_i, i_ir, t_i, t1m_i, du, ik_i, nrad, r_i, r0, rad_node, Ri, dRi);
+            }
+
+            for (int k = lid; k < PAIR_BLK_SIZE; k += NPTILE) {
+                int a = k >> LOG_MAX_AO_ATOM;
+                int b = k & (MAX_AO_ATOM - 1);
+                float v = 0.0f;
+                if (ia < natoms && ja < natoms && a < atom_nao[ia] && b < atom_nao[ja])
+                    v = dm_cart[(atom_ao0[ia] + a) * ncart + (atom_ao0[ja] + b)];
+                dm_blk[a][b] = v;
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            if (g < ngrids && ia < natoms) {
+                float4 dj = coords[g] - atom_coords[ja];
+                float rj = sqrt(dj.x*dj.x + dj.y*dj.y + dj.z*dj.z);
+                float invr_j = rj > 1e-20f ? 1.0f/rj : 0.0f;
+                float rv, gv1, gv2, gv3;
+                contract_rho_pair_gga(Ri, dRi, wfRj[ip], dwfRj[ip], dm_blk, ns_i, i_l, l_j_ns, l_j_l, di, dj, invr_i, invr_j, &rv, &gv1, &gv2, &gv3);
+                rho_priv += rv; gx_priv += gv1; gy_priv += gv2; gz_priv += gv3;
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+    }
+
+    if (g < ngrids) {
+        rho[g] = rho_priv;
+        rho[ngrids + g] = gx_priv;
+        rho[2*ngrids + g] = gy_priv;
+        rho[3*ngrids + g] = gz_priv;
+    }
+}
+
+// One workgroup per atom pair (ia, ja); LDA writes symmetric off-diagonal blocks.
+__kernel void vmat_lda_pair(
+    __global const float4 *coords,
+    __global const float4 *atom_coords,
+    __global const float2 *rad_node,
+    __global const int *radial_l,
+    __global const int *radial_cart0,
+    __global const int *atom_radial_offset,
+    __global const int *atom_radial_list,
+    __global const int *atom_ao0,
+    __global const int *atom_nao,
+    __global const float *wv,
+    __global float *vmat,
+    float r0, float du,
+    int nrad, int ncart, int ngrids, int natoms)
+{
+    int lid = get_local_id(1);
+    int ia = get_group_id(0);
+    int ja = get_group_id(1);
+    if (ja < ia) return;
+
+    __local float aoI[NPTILE][MAX_AO_ATOM];
+    __local float aoJ[NPTILE][MAX_AO_ATOM];
+    __local int l_i_ns;
+    __local int l_j_ns;
+    __local int l_i_ir[MAX_SHELL];
+    __local int l_j_ir[MAX_SHELL];
+
+    if (lid == 0) {
+        load_single_atom_meta(ia, natoms, atom_radial_offset, atom_radial_list, &l_i_ns, l_i_ir);
+        load_single_atom_meta(ja, natoms, atom_radial_offset, atom_radial_list, &l_j_ns, l_j_ir);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    float acc[PAIR_QPT];
+    for (int t = 0; t < PAIR_QPT; t++) acc[t] = 0.0f;
+
+    for (int gTile = 0; gTile < ngrids; gTile += NPTILE) {
+        for (int k = lid; k < NPTILE; k += WGS_VMAT) {
+            int ip = k;
+            int g = gTile + ip;
+            for (int a = 0; a < MAX_AO_ATOM; a++) aoI[ip][a] = 0.0f;
+            if (g < ngrids && ia < natoms)
+                fill_atom_ao_lda(l_i_ns, l_i_ir, coords[g] - atom_coords[ia], 0, aoI[ip], r0, du, nrad, rad_node, radial_l);
+        }
+        for (int k = lid; k < NPTILE; k += WGS_VMAT) {
+            int ip = k;
+            int g = gTile + ip;
+            for (int b = 0; b < MAX_AO_ATOM; b++) aoJ[ip][b] = 0.0f;
+            if (g < ngrids && ja < natoms)
+                fill_atom_ao_lda(l_j_ns, l_j_ir, coords[g] - atom_coords[ja], 0, aoJ[ip], r0, du, nrad, rad_node, radial_l);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (int t = 0; t < PAIR_QPT; t++) {
+            int q = lid + t * WGS_VMAT;
+            if (q >= PAIR_BLK_SIZE) continue;
+            int a = q >> LOG_MAX_AO_ATOM;
+            int b = q & (MAX_AO_ATOM - 1);
+            if (ia >= natoms || ja >= natoms || a >= atom_nao[ia] || b >= atom_nao[ja]) continue;
+            float s = 0.0f;
+            for (int ip = 0; ip < NPTILE; ip++) {
+                int g = gTile + ip;
+                if (g >= ngrids) continue;
+                s += wv[g] * aoI[ip][a] * aoJ[ip][b];
+            }
+            acc[t] += s;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    for (int t = 0; t < PAIR_QPT; t++) {
+        int q = lid + t * WGS_VMAT;
+        if (q >= PAIR_BLK_SIZE) continue;
+        int a = q >> LOG_MAX_AO_ATOM;
+        int b = q & (MAX_AO_ATOM - 1);
+        if (ia < natoms && ja < natoms && a < atom_nao[ia] && b < atom_nao[ja]) {
+            int iao = atom_ao0[ia] + a;
+            int jao = atom_ao0[ja] + b;
+            vmat[iao * ncart + jao] = acc[t];
+            if (ia != ja) vmat[jao * ncart + iao] = acc[t];
+        }
+    }
+}
+
+__kernel void vmat_gga_pair(
+    __global const float4 *coords,
+    __global const float4 *atom_coords,
+    __global const float2 *rad_node,
+    __global const int *radial_l,
+    __global const int *radial_cart0,
+    __global const int *atom_radial_offset,
+    __global const int *atom_radial_list,
+    __global const int *atom_ao0,
+    __global const int *atom_nao,
+    __global const float *wv,
+    __global float *vmat,
+    float r0, float du,
+    int nrad, int ncart, int ngrids, int natoms)
+{
+    int lid = get_local_id(1);
+    int ia = get_group_id(0);
+    int ja = get_group_id(1);
+
+    __local float aoI[NPTILE][MAX_AO_ATOM];
+    __local float aoJ[NPTILE][MAX_AO_ATOM];
+    __local int l_i_ns;
+    __local int l_j_ns;
+    __local int l_i_ir[MAX_SHELL];
+    __local int l_j_ir[MAX_SHELL];
+
+    if (lid == 0) {
+        load_single_atom_meta(ia, natoms, atom_radial_offset, atom_radial_list, &l_i_ns, l_i_ir);
+        load_single_atom_meta(ja, natoms, atom_radial_offset, atom_radial_list, &l_j_ns, l_j_ir);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    float acc[PAIR_QPT];
+    for (int t = 0; t < PAIR_QPT; t++) acc[t] = 0.0f;
+
+    for (int gTile = 0; gTile < ngrids; gTile += NPTILE) {
+        for (int k = lid; k < NPTILE; k += WGS_VMAT) {
+            int ip = k;
+            int g = gTile + ip;
+            for (int a = 0; a < MAX_AO_ATOM; a++) aoI[ip][a] = 0.0f;
+            if (g < ngrids && ia < natoms) {
+                float w0 = wv[g], wx = wv[ngrids + g], wy = wv[2*ngrids + g], wz = wv[3*ngrids + g];
+                fill_atom_aow_gga(l_i_ns, l_i_ir, coords[g] - atom_coords[ia], w0, wx, wy, wz, 0, aoI[ip], r0, du, nrad, rad_node, radial_l);
+            }
+        }
+        for (int k = lid; k < NPTILE; k += WGS_VMAT) {
+            int ip = k;
+            int g = gTile + ip;
+            for (int b = 0; b < MAX_AO_ATOM; b++) aoJ[ip][b] = 0.0f;
+            if (g < ngrids && ja < natoms)
+                fill_atom_ao_lda(l_j_ns, l_j_ir, coords[g] - atom_coords[ja], 0, aoJ[ip], r0, du, nrad, rad_node, radial_l);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (int t = 0; t < PAIR_QPT; t++) {
+            int q = lid + t * WGS_VMAT;
+            if (q >= PAIR_BLK_SIZE) continue;
+            int a = q >> LOG_MAX_AO_ATOM;
+            int b = q & (MAX_AO_ATOM - 1);
+            if (ia >= natoms || ja >= natoms || a >= atom_nao[ia] || b >= atom_nao[ja]) continue;
+            float s = 0.0f;
+            for (int ip = 0; ip < NPTILE; ip++) {
+                int g = gTile + ip;
+                if (g >= ngrids) continue;
+                s += aoI[ip][a] * aoJ[ip][b];
+            }
+            acc[t] += s;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    for (int t = 0; t < PAIR_QPT; t++) {
+        int q = lid + t * WGS_VMAT;
+        if (q >= PAIR_BLK_SIZE) continue;
+        int a = q >> LOG_MAX_AO_ATOM;
+        int b = q & (MAX_AO_ATOM - 1);
+        if (ia < natoms && ja < natoms && a < atom_nao[ia] && b < atom_nao[ja]) {
+            int iao = atom_ao0[ia] + a;
+            int jao = atom_ao0[ja] + b;
+            vmat[iao * ncart + jao] = acc[t];
+        }
+    }
+}
+
+// ============================================================
+// Precomputed GTO — OTF-mirror pair gather (1 launch rho + 1 launch vmat)
+// rho: one WG per grid tile, NPTILE threads, atom-pair loop with aoJ[NPTILE][MAX_AO_ATOM]
+//      in __local (same pattern as rho_lda_pair / rho_gga_pair Hermite kernels).
+// vmat: pair gather (vmat_*_precomp_pair), same as Hermite vmat_gga_pair.
+// fused GEMM kernels below kept for fused=gemm fallback only.
+// ============================================================
+#define KTILE 32
+
+__kernel void rho_lda_precomp_pair(
+    __global const float *ao0,
+    __global const float *dm,
+    __global const int *atom_ao0,
+    __global const int *atom_nao,
+    __global float *rho,
+    int nao, int ngrids, int natoms)
+{
+    int ip = get_local_id(0);
+    int gTile = get_group_id(0);
+    int g = gTile * NPTILE + ip;
+
+    __local float aoJ[NPTILE][MAX_AO_ATOM];
+    __local float dm_blk[MAX_AO_ATOM][MAX_AO_ATOM];
+
+    float rho_priv = 0.0f;
+
+    for (int ja = 0; ja < natoms; ja++) {
+        for (int k = ip; k < NPTILE * MAX_AO_ATOM; k += NPTILE) {
+            int pp = k / MAX_AO_ATOM;
+            int b = k & (MAX_AO_ATOM - 1);
+            int gj = gTile * NPTILE + pp;
+            aoJ[pp][b] = 0.0f;
+            if (gj < ngrids && ja < natoms && b < atom_nao[ja]) {
+                int gbase = gj * nao;
+                aoJ[pp][b] = ao0[gbase + atom_ao0[ja] + b];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (int ia = 0; ia < natoms; ia++) {
+            for (int kk = ip; kk < PAIR_BLK_SIZE; kk += NPTILE) {
+                int a = kk >> LOG_MAX_AO_ATOM;
+                int b = kk & (MAX_AO_ATOM - 1);
+                float v = 0.0f;
+                if (ia < natoms && ja < natoms && a < atom_nao[ia] && b < atom_nao[ja])
+                    v = dm[(atom_ao0[ia] + a) * nao + (atom_ao0[ja] + b)];
+                dm_blk[a][b] = v;
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            if (g < ngrids && ia < natoms && ja < natoms) {
+                int gbase = g * nao;
+                int i0 = atom_ao0[ia];
+                for (int a = 0; a < atom_nao[ia]; a++) {
+                    float ai = ao0[gbase + i0 + a];
+                    for (int b = 0; b < atom_nao[ja]; b++)
+                        rho_priv += ai * dm_blk[a][b] * aoJ[ip][b];
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+    }
+
+    if (g < ngrids) rho[g] = rho_priv;
+}
+
+__kernel void rho_gga_precomp_pair(
+    __global const float *ao0,
+    __global const float *ao1,
+    __global const float *ao2,
+    __global const float *ao3,
+    __global const float *dm,
+    __global const int *atom_ao0,
+    __global const int *atom_nao,
+    __global float *rho,
+    int nao, int ngrids, int natoms)
+{
+    int ip = get_local_id(0);
+    int gTile = get_group_id(0);
+    int g = gTile * NPTILE + ip;
+
+    __local float aoJ0[NPTILE][MAX_AO_ATOM];
+    __local float aoJ1[NPTILE][MAX_AO_ATOM];
+    __local float aoJ2[NPTILE][MAX_AO_ATOM];
+    __local float aoJ3[NPTILE][MAX_AO_ATOM];
+    __local float dm_blk[MAX_AO_ATOM][MAX_AO_ATOM];
+
+    float rho_priv = 0.0f, gx_priv = 0.0f, gy_priv = 0.0f, gz_priv = 0.0f;
+
+    for (int ja = 0; ja < natoms; ja++) {
+        for (int k = ip; k < NPTILE * MAX_AO_ATOM; k += NPTILE) {
+            int pp = k / MAX_AO_ATOM;
+            int b = k & (MAX_AO_ATOM - 1);
+            int gj = gTile * NPTILE + pp;
+            aoJ0[pp][b] = 0.0f; aoJ1[pp][b] = 0.0f;
+            aoJ2[pp][b] = 0.0f; aoJ3[pp][b] = 0.0f;
+            if (gj < ngrids && ja < natoms && b < atom_nao[ja]) {
+                int idx = gj * nao + atom_ao0[ja] + b;
+                aoJ0[pp][b] = ao0[idx];
+                aoJ1[pp][b] = ao1[idx];
+                aoJ2[pp][b] = ao2[idx];
+                aoJ3[pp][b] = ao3[idx];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (int ia = 0; ia < natoms; ia++) {
+            for (int kk = ip; kk < PAIR_BLK_SIZE; kk += NPTILE) {
+                int a = kk >> LOG_MAX_AO_ATOM;
+                int b = kk & (MAX_AO_ATOM - 1);
+                float v = 0.0f;
+                if (ia < natoms && ja < natoms && a < atom_nao[ia] && b < atom_nao[ja])
+                    v = dm[(atom_ao0[ia] + a) * nao + (atom_ao0[ja] + b)];
+                dm_blk[a][b] = v;
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            if (g < ngrids && ia < natoms && ja < natoms) {
+                int gbase = g * nao;
+                int i0 = atom_ao0[ia];
+                for (int a = 0; a < atom_nao[ia]; a++) {
+                    int idx = gbase + i0 + a;
+                    float v0 = ao0[idx];
+                    float v1 = ao1[idx];
+                    float v2 = ao2[idx];
+                    float v3 = ao3[idx];
+                    for (int b = 0; b < atom_nao[ja]; b++) {
+                        float d = dm_blk[a][b];
+                        float j0v = aoJ0[ip][b];
+                        float j1v = aoJ1[ip][b];
+                        float j2v = aoJ2[ip][b];
+                        float j3v = aoJ3[ip][b];
+                        rho_priv += v0 * d * j0v;
+                        gx_priv += v0 * d * j1v + v1 * d * j0v;
+                        gy_priv += v0 * d * j2v + v2 * d * j0v;
+                        gz_priv += v0 * d * j3v + v3 * d * j0v;
+                    }
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+    }
+
+    if (g < ngrids) {
+        rho[g] = rho_priv;
+        rho[ngrids + g] = gx_priv;
+        rho[2 * ngrids + g] = gy_priv;
+        rho[3 * ngrids + g] = gz_priv;
+    }
+}
+
+__kernel void rho_lda_precomp_tiled(
+    __global const float *ao0,
+    __global const float *dm,
+    __global const int *atom_ao0,
+    __global const int *atom_nao,
+    __global float *rho,
+    int nao, int ngrids, int natoms)
+{
+    int ip = get_local_id(0);
+    int il = get_local_id(1);
+    int lid = il * NPTILE + ip;
+    int gTile = get_group_id(0);
+    int g = gTile * NPTILE + ip;
+
+    __local float aoJ[NPTILE][NATILE][MAX_AO_ATOM];
+    __local float dm_blk[NATILE][NATILE][MAX_AO_ATOM][MAX_AO_ATOM];
+    __local float psum[WGS_TILED];
+
+    float rho_priv = 0.0f;
+    int n_iTiles = (natoms + NATILE - 1) / NATILE;
+    float aoI_tile[MAX_ITILE][MAX_AO_ATOM];
+    int n_i_ao[MAX_ITILE];
+
+    for (int it = 0; it < n_iTiles; it++) {
+        int ia = (it << LOG_NATILE) + il;
+        n_i_ao[it] = 0;
+        for (int a = 0; a < MAX_AO_ATOM; a++) aoI_tile[it][a] = 0.0f;
+        if (g < ngrids && ia < natoms) {
+            n_i_ao[it] = atom_nao[ia];
+            int gbase = g * nao;
+            int i0 = atom_ao0[ia];
+            for (int a = 0; a < n_i_ao[it]; a++)
+                aoI_tile[it][a] = ao0[gbase + i0 + a];
+        }
+    }
+
+    for (int jTile = 0; jTile < natoms; jTile += NATILE) {
+        for (int k = lid; k < PT_ATOM_SIZE; k += WGS_TILED) {
+            int jj = k & (NATILE - 1);
+            int pp = k >> LOG_NATILE;
+            int gj = gTile * NPTILE + pp;
+            int ja = jTile + jj;
+            for (int a = 0; a < MAX_AO_ATOM; a++) aoJ[pp][jj][a] = 0.0f;
+            if (gj < ngrids && ja < natoms) {
+                int gbase = gj * nao;
+                int j0 = atom_ao0[ja];
+                for (int b = 0; b < atom_nao[ja]; b++)
+                    aoJ[pp][jj][b] = ao0[gbase + j0 + b];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (int it = 0; it < n_iTiles; it++) {
+            int ia = (it << LOG_NATILE) + il;
+            for (int k = lid; k < DM_TILE_SIZE; k += WGS_TILED) {
+                int ab = k & (AO_BLK - 1);
+                int pq = k >> LOG_AO_BLK;
+                int a = ab >> LOG_MAX_AO_ATOM;
+                int b = ab & (MAX_AO_ATOM - 1);
+                int ii2 = pq >> LOG_NATILE;
+                int jj2 = pq & (NATILE - 1);
+                int ia2 = (it << LOG_NATILE) + ii2, ja2 = jTile + jj2;
+                float v = 0.0f;
+                if (ia2 < natoms && ja2 < natoms && a < atom_nao[ia2] && b < atom_nao[ja2]) {
+                    v = dm[(atom_ao0[ia2] + a) * nao + (atom_ao0[ja2] + b)];
+                }
+                dm_blk[ii2][jj2][a][b] = v;
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            if (g < ngrids && ia < natoms) {
+                for (int jl = 0; jl < NATILE; jl++) {
+                    int ja = jTile + jl;
+                    if (ja >= natoms) continue;
+                    int nja = atom_nao[ja];
+                    for (int a = 0; a < n_i_ao[it]; a++) {
+                        float ai = aoI_tile[it][a];
+                        for (int b = 0; b < nja; b++)
+                            rho_priv += ai * dm_blk[il][jl][a][b] * aoJ[ip][jl][b];
+                    }
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+    }
+
+    psum[lid] = rho_priv;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (il == 0 && g < ngrids) {
+        float s = 0.0f;
+        for (int k = 0; k < NATILE; k++) s += psum[k * NPTILE + ip];
+        rho[g] = s;
+    }
+}
+
+__kernel void rho_gga_precomp_tiled(
+    __global const float *ao0,
+    __global const float *ao1,
+    __global const float *ao2,
+    __global const float *ao3,
+    __global const float *dm,
+    __global const int *atom_ao0,
+    __global const int *atom_nao,
+    __global float *rho,
+    int nao, int ngrids, int natoms)
+{
+    int ip = get_local_id(0);
+    int il = get_local_id(1);
+    int lid = il * NPTILE + ip;
+    int gTile = get_group_id(0);
+    int g = gTile * NPTILE + ip;
+
+    __local float aoJ0[NPTILE][NATILE][MAX_AO_ATOM];
+    __local float aoJ1[NPTILE][NATILE][MAX_AO_ATOM];
+    __local float aoJ2[NPTILE][NATILE][MAX_AO_ATOM];
+    __local float aoJ3[NPTILE][NATILE][MAX_AO_ATOM];
+    __local float dm_blk[NATILE][NATILE][MAX_AO_ATOM][MAX_AO_ATOM];
+    __local float psum_rho[WGS_TILED];
+    __local float psum_gx[WGS_TILED];
+    __local float psum_gy[WGS_TILED];
+    __local float psum_gz[WGS_TILED];
+
+    float rho_priv = 0.0f, gx_priv = 0.0f, gy_priv = 0.0f, gz_priv = 0.0f;
+    int n_iTiles = (natoms + NATILE - 1) / NATILE;
+    float aoI0[MAX_ITILE][MAX_AO_ATOM];
+    float aoI1[MAX_ITILE][MAX_AO_ATOM];
+    float aoI2[MAX_ITILE][MAX_AO_ATOM];
+    float aoI3[MAX_ITILE][MAX_AO_ATOM];
+    int n_i_ao[MAX_ITILE];
+
+    for (int it = 0; it < n_iTiles; it++) {
+        int ia = (it << LOG_NATILE) + il;
+        n_i_ao[it] = 0;
+        for (int a = 0; a < MAX_AO_ATOM; a++) {
+            aoI0[it][a] = 0.0f; aoI1[it][a] = 0.0f;
+            aoI2[it][a] = 0.0f; aoI3[it][a] = 0.0f;
+        }
+        if (g < ngrids && ia < natoms) {
+            n_i_ao[it] = atom_nao[ia];
+            int gbase = g * nao;
+            int i0 = atom_ao0[ia];
+            for (int a = 0; a < n_i_ao[it]; a++) {
+                int idx = gbase + i0 + a;
+                aoI0[it][a] = ao0[idx];
+                aoI1[it][a] = ao1[idx];
+                aoI2[it][a] = ao2[idx];
+                aoI3[it][a] = ao3[idx];
+            }
+        }
+    }
+
+    for (int jTile = 0; jTile < natoms; jTile += NATILE) {
+        for (int k = lid; k < PT_ATOM_SIZE; k += WGS_TILED) {
+            int jj = k & (NATILE - 1);
+            int pp = k >> LOG_NATILE;
+            int gj = gTile * NPTILE + pp;
+            int ja = jTile + jj;
+            for (int a = 0; a < MAX_AO_ATOM; a++) {
+                aoJ0[pp][jj][a] = 0.0f; aoJ1[pp][jj][a] = 0.0f;
+                aoJ2[pp][jj][a] = 0.0f; aoJ3[pp][jj][a] = 0.0f;
+            }
+            if (gj < ngrids && ja < natoms) {
+                int gbase = gj * nao;
+                int j0 = atom_ao0[ja];
+                for (int b = 0; b < atom_nao[ja]; b++) {
+                    int idx = gbase + j0 + b;
+                    aoJ0[pp][jj][b] = ao0[idx];
+                    aoJ1[pp][jj][b] = ao1[idx];
+                    aoJ2[pp][jj][b] = ao2[idx];
+                    aoJ3[pp][jj][b] = ao3[idx];
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (int it = 0; it < n_iTiles; it++) {
+            int ia = (it << LOG_NATILE) + il;
+            for (int k = lid; k < DM_TILE_SIZE; k += WGS_TILED) {
+                int ab = k & (AO_BLK - 1);
+                int pq = k >> LOG_AO_BLK;
+                int a = ab >> LOG_MAX_AO_ATOM;
+                int b = ab & (MAX_AO_ATOM - 1);
+                int ii2 = pq >> LOG_NATILE;
+                int jj2 = pq & (NATILE - 1);
+                int ia2 = (it << LOG_NATILE) + ii2, ja2 = jTile + jj2;
+                float v = 0.0f;
+                if (ia2 < natoms && ja2 < natoms && a < atom_nao[ia2] && b < atom_nao[ja2]) {
+                    v = dm[(atom_ao0[ia2] + a) * nao + (atom_ao0[ja2] + b)];
+                }
+                dm_blk[ii2][jj2][a][b] = v;
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            if (g < ngrids && ia < natoms) {
+                for (int jl = 0; jl < NATILE; jl++) {
+                    int ja = jTile + jl;
+                    if (ja >= natoms) continue;
+                    int nja = atom_nao[ja];
+                    for (int a = 0; a < n_i_ao[it]; a++) {
+                        float v0 = aoI0[it][a];
+                        float v1 = aoI1[it][a];
+                        float v2 = aoI2[it][a];
+                        float v3 = aoI3[it][a];
+                        for (int b = 0; b < nja; b++) {
+                            float d = dm_blk[il][jl][a][b];
+                            float j0v = aoJ0[ip][jl][b];
+                            float j1v = aoJ1[ip][jl][b];
+                            float j2v = aoJ2[ip][jl][b];
+                            float j3v = aoJ3[ip][jl][b];
+                            rho_priv += v0 * d * j0v;
+                            gx_priv += v0 * d * j1v + v1 * d * j0v;
+                            gy_priv += v0 * d * j2v + v2 * d * j0v;
+                            gz_priv += v0 * d * j3v + v3 * d * j0v;
+                        }
+                    }
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+    }
+
+    psum_rho[lid] = rho_priv; psum_gx[lid] = gx_priv;
+    psum_gy[lid] = gy_priv;   psum_gz[lid] = gz_priv;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (il == 0 && g < ngrids) {
+        float sr = 0.0f, sx = 0.0f, sy = 0.0f, sz = 0.0f;
+        for (int k = 0; k < NATILE; k++) {
+            sr += psum_rho[k * NPTILE + ip]; sx += psum_gx[k * NPTILE + ip];
+            sy += psum_gy[k * NPTILE + ip]; sz += psum_gz[k * NPTILE + ip];
+        }
+        rho[g] = sr;
+        rho[ngrids + g] = sx;
+        rho[2 * ngrids + g] = sy;
+        rho[3 * ngrids + g] = sz;
+    }
+}
+
+__kernel void rho_lda_precomp_fused(
+    __global const float *ao0,
+    __global const float *dm,
+    __global float *rho,
+    int nao, int ngrids)
+{
+    int tx = get_local_id(0);
+    int ty = get_local_id(1);
+    int gTile = get_group_id(0);
+    int nTiles = (nao + TILE - 1) / TILE;
+    int nRowPanels = NPTILE / TILE;
+
+    __local float ao_jt[TILE][TILE];
+    __local float dm_tile[TILE][TILE];
+
+    for (int rowPanel = 0; rowPanel < nRowPanels; rowPanel++) {
+        int ip = rowPanel * TILE + tx;
+        int g = gTile * NPTILE + ip;
+        float ao_buf[128];
+        float aodm_buf[128];
+        if (g < ngrids) {
+            for (int mu = 0; mu < nao; mu++)
+                ao_buf[mu] = ao0[g * nao + mu];
+        }
+        for (int mu = 0; mu < nao; mu++)
+            aodm_buf[mu] = 0.0f;
+
+        for (int kt = 0; kt < nTiles; kt++) {
+            for (int jt = 0; jt < nTiles; jt++) {
+                if (g < ngrids && ty < TILE) {
+                    int mu = jt * TILE + ty;
+                    ao_jt[tx][ty] = (mu < nao) ? ao_buf[mu] : 0.0f;
+                } else {
+                    ao_jt[tx][ty] = 0.0f;
+                }
+                barrier(CLK_LOCAL_MEM_FENCE);
+                int ii = kt * TILE + ty;
+                int jj = jt * TILE + tx;
+                dm_tile[ty][tx] = (ii < nao && jj < nao) ? dm[ii * nao + jj] : 0.0f;
+                barrier(CLK_LOCAL_MEM_FENCE);
+                if (g < ngrids && ii < nao) {
+                    float s = 0.0f;
+                    for (int t = 0; t < TILE; t++)
+                        s += ao_jt[tx][t] * dm_tile[ty][t];
+                    aodm_buf[ii] += s;
+                }
+                barrier(CLK_LOCAL_MEM_FENCE);
+            }
+        }
+        if (g < ngrids && ty == 0) {
+            float rho_v = 0.0f;
+            for (int mu = 0; mu < nao; mu++)
+                rho_v += ao_buf[mu] * aodm_buf[mu];
+            rho[g] = rho_v;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+}
+
+__kernel void rho_gga_precomp_fused(
+    __global const float *ao0,
+    __global const float *ao1,
+    __global const float *ao2,
+    __global const float *ao3,
+    __global const float *dm,
+    __global float *rho,
+    int nao, int ngrids)
+{
+    int tx = get_local_id(0);
+    int ty = get_local_id(1);
+    int gTile = get_group_id(0);
+    int nTiles = (nao + TILE - 1) / TILE;
+    int nRowPanels = NPTILE / TILE;
+
+    __local float ao0_jt[TILE][TILE];
+    __local float ao1_jt[TILE][TILE];
+    __local float ao2_jt[TILE][TILE];
+    __local float ao3_jt[TILE][TILE];
+    __local float dm_tile[TILE][TILE];
+    __local float aodm0_loc[TILE][TILE];
+    __local float aodm1_loc[TILE][TILE];
+    __local float aodm2_loc[TILE][TILE];
+    __local float aodm3_loc[TILE][TILE];
+
+    for (int rowPanel = 0; rowPanel < nRowPanels; rowPanel++) {
+        int ip = rowPanel * TILE + tx;
+        int g = gTile * NPTILE + ip;
+        float ao0_buf[128], ao1_buf[128], ao2_buf[128], ao3_buf[128];
+        if (g < ngrids) {
+            for (int mu = 0; mu < nao; mu++) {
+                int idx = g * nao + mu;
+                ao0_buf[mu] = ao0[idx];
+                ao1_buf[mu] = ao1[idx];
+                ao2_buf[mu] = ao2[idx];
+                ao3_buf[mu] = ao3[idx];
+            }
+        }
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+
+        for (int kt = 0; kt < nTiles; kt++) {
+            if (ty < TILE) {
+                aodm0_loc[tx][ty] = 0.0f; aodm1_loc[tx][ty] = 0.0f;
+                aodm2_loc[tx][ty] = 0.0f; aodm3_loc[tx][ty] = 0.0f;
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            for (int jt = 0; jt < nTiles; jt++) {
+                if (g < ngrids && ty < TILE) {
+                    int mu = jt * TILE + ty;
+                    if (mu < nao) {
+                        int idx = g * nao + mu;
+                        ao0_jt[tx][ty] = ao0[idx];
+                        ao1_jt[tx][ty] = ao1[idx];
+                        ao2_jt[tx][ty] = ao2[idx];
+                        ao3_jt[tx][ty] = ao3[idx];
+                    } else {
+                        ao0_jt[tx][ty] = 0.0f; ao1_jt[tx][ty] = 0.0f;
+                        ao2_jt[tx][ty] = 0.0f; ao3_jt[tx][ty] = 0.0f;
+                    }
+                } else {
+                    ao0_jt[tx][ty] = 0.0f; ao1_jt[tx][ty] = 0.0f;
+                    ao2_jt[tx][ty] = 0.0f; ao3_jt[tx][ty] = 0.0f;
+                }
+                barrier(CLK_LOCAL_MEM_FENCE);
+                int ii = kt * TILE + ty;
+                int jj = jt * TILE + tx;
+                dm_tile[ty][tx] = (ii < nao && jj < nao) ? dm[ii * nao + jj] : 0.0f;
+                barrier(CLK_LOCAL_MEM_FENCE);
+                if (g < ngrids && ii < nao) {
+                    float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+                    for (int t = 0; t < TILE; t++) {
+                        float d = dm_tile[ty][t];
+                        v0 += ao0_jt[tx][t] * d;
+                        v1 += ao1_jt[tx][t] * d;
+                        v2 += ao2_jt[tx][t] * d;
+                        v3 += ao3_jt[tx][t] * d;
+                    }
+                    aodm0_loc[tx][ty] += v0; aodm1_loc[tx][ty] += v1;
+                    aodm2_loc[tx][ty] += v2; aodm3_loc[tx][ty] += v3;
+                }
+                barrier(CLK_LOCAL_MEM_FENCE);
+            }
+            if (g < ngrids && ty == 0) {
+                for (int t = 0; t < TILE; t++) {
+                    int mu = kt * TILE + t;
+                    if (mu >= nao) continue;
+                    float f0 = ao0_buf[mu];
+                    float f1 = ao1_buf[mu];
+                    float f2 = ao2_buf[mu];
+                    float f3 = ao3_buf[mu];
+                    s0 += f0 * aodm0_loc[tx][t];
+                    s1 += f0 * aodm1_loc[tx][t] + f1 * aodm0_loc[tx][t];
+                    s2 += f0 * aodm2_loc[tx][t] + f2 * aodm0_loc[tx][t];
+                    s3 += f0 * aodm3_loc[tx][t] + f3 * aodm0_loc[tx][t];
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        if (g < ngrids && ty == 0) {
+            rho[g] = s0;
+            rho[ngrids + g] = s1;
+            rho[2 * ngrids + g] = s2;
+            rho[3 * ngrids + g] = s3;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+}
+
+__kernel void vmat_lda_precomp_pair(
+    __global const float *ao0,
+    __global const float *wv,
+    __global const int *atom_ao0,
+    __global const int *atom_nao,
+    __global float *vmat,
+    int nao, int ngrids, int natoms)
+{
+    int lid = get_local_id(1);
+    int ia = get_group_id(0);
+    int ja = get_group_id(1);
+    __local float aoI[NPTILE][MAX_AO_ATOM];
+    __local float aoJ[NPTILE][MAX_AO_ATOM];
+    float acc[PAIR_QPT];
+    for (int t = 0; t < PAIR_QPT; t++) acc[t] = 0.0f;
+
+    for (int gTile = 0; gTile < ngrids; gTile += NPTILE) {
+        for (int k = lid; k < NPTILE; k += WGS_VMAT) {
+            int ip = k;
+            int g = gTile + ip;
+            for (int a = 0; a < MAX_AO_ATOM; a++) { aoI[ip][a] = 0.0f; aoJ[ip][a] = 0.0f; }
+            if (g < ngrids && ia < natoms && ja < natoms) {
+                int gbase = g * nao;
+                int i0 = atom_ao0[ia];
+                int j0 = atom_ao0[ja];
+                for (int a = 0; a < atom_nao[ia]; a++)
+                    aoI[ip][a] = wv[g] * ao0[gbase + i0 + a];
+                for (int b = 0; b < atom_nao[ja]; b++)
+                    aoJ[ip][b] = ao0[gbase + j0 + b];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int t = 0; t < PAIR_QPT; t++) {
+            int q = lid + t * WGS_VMAT;
+            if (q >= PAIR_BLK_SIZE) continue;
+            int a = q >> LOG_MAX_AO_ATOM;
+            int b = q & (MAX_AO_ATOM - 1);
+            if (ia >= natoms || ja >= natoms || a >= atom_nao[ia] || b >= atom_nao[ja]) continue;
+            float s = 0.0f;
+            for (int ip = 0; ip < NPTILE; ip++) {
+                int g = gTile + ip;
+                if (g >= ngrids) continue;
+                s += aoI[ip][a] * aoJ[ip][b];
+            }
+            acc[t] += s;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    for (int t = 0; t < PAIR_QPT; t++) {
+        int q = lid + t * WGS_VMAT;
+        if (q >= PAIR_BLK_SIZE) continue;
+        int a = q >> LOG_MAX_AO_ATOM;
+        int b = q & (MAX_AO_ATOM - 1);
+        if (ia < natoms && ja < natoms && a < atom_nao[ia] && b < atom_nao[ja]) {
+            int iao = atom_ao0[ia] + a;
+            int jao = atom_ao0[ja] + b;
+            vmat[iao * nao + jao] = acc[t];
+        }
+    }
+}
+
+__kernel void vmat_gga_precomp_pair(
+    __global const float *ao0,
+    __global const float *ao1,
+    __global const float *ao2,
+    __global const float *ao3,
+    __global const float *wv,
+    __global const int *atom_ao0,
+    __global const int *atom_nao,
+    __global float *vmat,
+    int nao, int ngrids, int natoms)
+{
+    int lid = get_local_id(1);
+    int ia = get_group_id(0);
+    int ja = get_group_id(1);
+    __local float aoI[NPTILE][MAX_AO_ATOM];
+    __local float aoJ[NPTILE][MAX_AO_ATOM];
+    float acc[PAIR_QPT];
+    for (int t = 0; t < PAIR_QPT; t++) acc[t] = 0.0f;
+
+    for (int gTile = 0; gTile < ngrids; gTile += NPTILE) {
+        for (int k = lid; k < NPTILE; k += WGS_VMAT) {
+            int ip = k;
+            int g = gTile + ip;
+            for (int a = 0; a < MAX_AO_ATOM; a++) { aoI[ip][a] = 0.0f; aoJ[ip][a] = 0.0f; }
+            if (g < ngrids && ia < natoms && ja < natoms) {
+                int gbase = g * nao;
+                float w0 = wv[g];
+                float wx = wv[ngrids + g];
+                float wy = wv[2 * ngrids + g];
+                float wz = wv[3 * ngrids + g];
+                int i0 = atom_ao0[ia];
+                int j0 = atom_ao0[ja];
+                for (int a = 0; a < atom_nao[ia]; a++) {
+                    int idx = gbase + i0 + a;
+                    aoI[ip][a] = w0 * ao0[idx] + wx * ao1[idx] + wy * ao2[idx] + wz * ao3[idx];
+                }
+                for (int b = 0; b < atom_nao[ja]; b++)
+                    aoJ[ip][b] = ao0[gbase + j0 + b];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int t = 0; t < PAIR_QPT; t++) {
+            int q = lid + t * WGS_VMAT;
+            if (q >= PAIR_BLK_SIZE) continue;
+            int a = q >> LOG_MAX_AO_ATOM;
+            int b = q & (MAX_AO_ATOM - 1);
+            if (ia >= natoms || ja >= natoms || a >= atom_nao[ia] || b >= atom_nao[ja]) continue;
+            float s = 0.0f;
+            for (int ip = 0; ip < NPTILE; ip++) {
+                int g = gTile + ip;
+                if (g >= ngrids) continue;
+                s += aoI[ip][a] * aoJ[ip][b];
+            }
+            acc[t] += s;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    for (int t = 0; t < PAIR_QPT; t++) {
+        int q = lid + t * WGS_VMAT;
+        if (q >= PAIR_BLK_SIZE) continue;
+        int a = q >> LOG_MAX_AO_ATOM;
+        int b = q & (MAX_AO_ATOM - 1);
+        if (ia < natoms && ja < natoms && a < atom_nao[ia] && b < atom_nao[ja]) {
+            int iao = atom_ao0[ia] + a;
+            int jao = atom_ao0[ja] + b;
+            vmat[iao * nao + jao] = acc[t];
         }
     }
 }

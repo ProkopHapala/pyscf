@@ -29,6 +29,7 @@ We develop rigorous scientific software where debuggability, physical consistenc
 - Notes and profiling results go in `doc/`
 - **GPU path cookbook:** `doc/opencl_gpu_paths_cookbook.md` · profiles `pyscf/OpenCL/gpu_profiles.py`
 - Profiling script: `expamples_prokop/profile_dft.py`
+- **Dimer scan benchmarks:** `doc/dimer_scan_benchmarks.md` · driver `expamples_prokop/profile_dimer_scan.py` (`--n0` = first atom of fragment 2)
 
 ## DFT execution path (for profiling/debugging)
 

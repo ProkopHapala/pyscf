@@ -58,6 +58,10 @@ When a loop is hot, try in order:
 - In-place operations — can break aliasing, shared views, or expression fusion.
 - Moving irregular inner loops to compiled code even when "vectorization" is possible.
 
+### Repo case: smallDFT grid XC
+
+`ThreadPoolExecutor` over grid tiles in `pyscf/smallDFT/parallel.py` capped at ~2× vs serial — GIL + per-tile Python overhead. Production path: **C/OpenMP in `libsmalldft`** only. Python role: `eval_ao`, libxc, ctypes dispatch, `GridWorkspace` AO cache. See skill:`cpu-perf` § Repo-specific smallDFT.
+
 ## Views vs Copies
 
 | Operation | Usually |

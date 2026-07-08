@@ -103,8 +103,13 @@ PBE RKS uses **J only** (K not needed for closed-shell).
 |--------------|--------|
 | `OPENCL_NPTILE`, `OPENCL_NATILE`, `OPENCL_WGS_VMAT` | grid/atom tile sizes in kernels |
 | `pyscf/OpenCL/tile_config.py` | defaults and sweeps |
+| `vmat_grid_splits` (`setup_kw`) | **split-K only** — grid shards for `vmat_gga_radial_precomp_pair_splitk` + `reduce_split_vmat` |
 
 Not a separate “path” — applies on top of any variant above.
+
+**Tile tuning (split-K):** prefer `expamples_prokop/sweep_splitk_tiles.py --neighbor` (1-neighborhood coordinate descent on power-of-2 lattice). Legacy brute-force: `sweep_opencl_tiles.py`. See `doc/GPU_optimixation_experience.md` § sweep methodology.
+
+**Profile-specific WGS:** `production_otf_radial_vmat_splitk` recompiles with `WGS_VMAT=128` via `_ensure_splitk_tile_config()` — do not set global `OPENCL_WGS_VMAT=128` (regresses OTF tiled vmat).
 
 ---
 
@@ -142,7 +147,8 @@ Not a separate “path” — applies on top of any variant above.
 | `debug_compare` | OTF | — | — | gpu | both | 1e-8 | 1e-5 | ~3e-6 | debug, max_cycle=5 |
 | `debug_xc_libxc` | precomp | coalesced | auto | **cpu** | CPU | 1e-8 | 1e-5 | ~3e-6 | converges |
 | **`production_otf`** | OTF | — | — | gpu | CPU | 1e-8 | 1e-5 | ~3e-5 | default OTF (ρ+vmat Hermite) |
-| **`production_otf_radial_vmat`** | OTF | — | — | gpu | CPU | 1e-8 | 1e-5 | ~3e-5 | **fastest per-cycle** — OTF ρ + radial vmat |
+| **`production_otf_radial_vmat`** | OTF | — | — | gpu | CPU | 1e-8 | 1e-5 | ~3e-5 | OTF ρ + radial vmat (~21 ms benzene) |
+| **`production_otf_radial_vmat_splitk`** | OTF | — | — | gpu | CPU | 1e-8 | 1e-5 | ~3e-5 | **fastest per-cycle** — split-K radial vmat (~12 ms benzene) |
 | `production_otf_quintic` | OTF | — | — | gpu | CPU | 1e-8 | 1e-5 | ~3e-5 | quintic spline; half setup table |
 | `production_coalesced` | precomp | coalesced | auto | gpu | CPU | 1e-8 | 1e-5 | ~3e-6 | small/fixed geom |
 | `production_radial` | precomp | radial | hermite_gpu | gpu | CPU | 1e-8 | 1e-5 | ~3e-6 | low χ memory |
@@ -150,7 +156,7 @@ Not a separate “path” — applies on top of any variant above.
 | **`fast_full_gpu`** | OTF | — | — | gpu | **GPU** | **1e-6** | **1e-4** | ~8e-6/veff | ~7e-5 Ha (~0.04 kcal/mol) |
 | `legacy_tiled_rowmajor` | precomp | tiled | auto | gpu | CPU | 1e-8 | 1e-5 | ~3e-6 | use coalesced instead |
 
-**Default:** `production_otf` (general). **Fastest XC per cycle (benzene):** `production_otf_radial_vmat` — see `doc/GPU_benchmark.md`.
+**Default:** `production_otf` (general). **Fastest XC per cycle (benzene, RTX 3090):** `production_otf_radial_vmat_splitk` — see `doc/GPU_benchmark.md` and `doc/GPU_optimixation_experience.md`.
 
 ### Hybrid OTF ρ + radial vmat
 
@@ -163,6 +169,19 @@ mf.setup_gpu(xc_path='onthefly', xc_eval='gpu', vmat_mode='radial_precomp')
 - ρ: `rho_gga_tiled` (OTF Hermite, same as `production_otf`)
 - vmat: `vmat_gga_radial_precomp_pair` (`R,dR` gathered at setup via `build_radial_on_grid_gpu`)
 - Requires GGA; radial metadata buffers must stay alive in `plan.otf` (see topical audit)
+
+### Split-K OTF ρ + radial vmat (production small-molecule default)
+
+```python
+apply_gpu_profile(mf, 'production_otf_radial_vmat_splitk')
+# equivalent manual:
+mf.setup_gpu(xc_path='onthefly', xc_eval='gpu', vmat_mode='radial_precomp', vmat_grid_splits=64)
+```
+
+- ρ: `rho_gga_tiled` (unchanged)
+- vmat: `vmat_gga_radial_precomp_pair_splitk` → partial vmat per grid shard → `reduce_split_vmat`
+- `apply_gpu_profile` triggers `WGS_VMAT=128` recompile for this profile only (`_ensure_splitk_tile_config`)
+- Tune: `sweep_splitk_tiles.py --neighbor --seed 64,2,128,64`
 
 ### Accuracy notes (benzene cc-pVDZ, grid level 3, PBE, DF)
 
@@ -189,6 +208,7 @@ flowchart TD
     C --> I{Optimize veff XC speed?}
     G --> I
     H --> I
+    I -->|yes, max veff XC speed| M[production_otf_radial_vmat_splitk]
     I -->|yes, same accuracy| L[production_otf_radial_vmat]
     I -->|yes, relaxed SCF tol OK| J[fast_full_gpu]
     I -->|no| K[keep CPU DF J + default tol]
@@ -210,8 +230,11 @@ mf.kernel()
 # Precomp coalesced
 mf.setup_gpu(xc_path='precomputed', fused='coalesced', ao_proj='auto', xc_eval='gpu')
 
-# Hybrid OTF rho + radial vmat (fastest per-cycle XC on benzene)
+# Hybrid OTF rho + radial vmat
 mf.setup_gpu(xc_path='onthefly', xc_eval='gpu', vmat_mode='radial_precomp')
+
+# Split-K radial vmat (fastest per-cycle XC on benzene)
+mf.setup_gpu(xc_path='onthefly', xc_eval='gpu', vmat_mode='radial_precomp', vmat_grid_splits=64)
 
 # Full GPU with relaxed SCF
 mf.with_df.backend = 2
@@ -278,6 +301,7 @@ See **Path naming glossary** in `doc/rho_vmat_vxc_GPU_optimization.report.md` §
 |--------------|-------------------|
 | `gpu_hermite_otf` | `production_otf` |
 | `gpu_otf_radial_vmat` | `production_otf_radial_vmat` |
+| `gpu_otf_radial_vmat_splitk` | `production_otf_radial_vmat_splitk` |
 | `gpu_otf_quintic` | `production_otf_quintic` |
 | `gpu_precomp_coalesced` | `production_coalesced` |
 | `gpu_precomp_radial` | `production_radial` |

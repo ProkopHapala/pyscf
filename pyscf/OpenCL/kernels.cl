@@ -3491,6 +3491,117 @@ __kernel void vmat_gga_radial_precomp_pair(
     }
 }
 
+__kernel void vmat_gga_radial_precomp_pair_splitk(
+    __global const float4 *coords,       // [ngrids], xyz in Bohr
+    __global const float4 *atom_coords,  // [natoms], xyz in Bohr
+    __global const float *rad_val,       // [nradial, ngrids], R(ir,g)
+    __global const float *rad_dr,        // [nradial, ngrids], dR/dr(ir,g)
+    __global const int *radial_l,        // [nradial]
+    __global const int *atom_radial_offset,
+    __global const int *atom_radial_list,
+    __global const int *atom_ao0,        // Cartesian atom AO offsets
+    __global const int *atom_nao,        // Cartesian AOs per atom
+    __global const float *wv,            // [4, ngrids]
+    __global float *partial_vmat,        // [nsplit, ncart, ncart], one-sided GGA partials
+    int ncart, int ngrids, int natoms, int nsplit)
+{
+    int lid = get_local_id(1);
+    int ia = get_group_id(0);
+    int ja = get_group_id(1);
+    int isplit = get_group_id(2);
+
+    __local float aowI[NPTILE][MAX_AO_ATOM];
+    __local float aoJ[NPTILE][MAX_AO_ATOM];
+    __local int l_i_ns;
+    __local int l_j_ns;
+    __local int l_i_ir[MAX_SHELL];
+    __local int l_j_ir[MAX_SHELL];
+    __local int l_i_l[MAX_SHELL];
+    __local int l_j_l[MAX_SHELL];
+
+    if (lid == 0) {
+        load_single_atom_meta_l(ia, natoms, atom_radial_offset, atom_radial_list, radial_l, &l_i_ns, l_i_ir, l_i_l);
+        load_single_atom_meta_l(ja, natoms, atom_radial_offset, atom_radial_list, radial_l, &l_j_ns, l_j_ir, l_j_l);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    float acc[PAIR_QPT];
+    for (int t = 0; t < PAIR_QPT; t++) acc[t] = 0.0f;
+
+    int i0 = (ia < natoms) ? atom_ao0[ia] : 0;
+    int j0 = (ja < natoms) ? atom_ao0[ja] : 0;
+    int nia = (ia < natoms) ? atom_nao[ia] : 0;
+    int nja = (ja < natoms) ? atom_nao[ja] : 0;
+    int n_gtiles = (ngrids + NPTILE - 1) >> LOG_NPTILE;
+    int tiles_per_split = (n_gtiles + nsplit - 1) / nsplit;
+    int gTile0 = isplit * tiles_per_split * NPTILE;
+    int gTile1 = min(ngrids, (isplit + 1) * tiles_per_split * NPTILE);
+
+    for (int gTile = gTile0; gTile < gTile1; gTile += NPTILE) {
+        for (int k = lid; k < NPTILE; k += WGS_VMAT) {
+            int ip = k;
+            int g = gTile + ip;
+            for (int a = 0; a < MAX_AO_ATOM; a++) {
+                aowI[ip][a] = 0.0f;
+                aoJ[ip][a] = 0.0f;
+            }
+            if (g < ngrids && ia < natoms && ja < natoms) {
+                float w0 = wv[g];
+                float wx = wv[ngrids + g];
+                float wy = wv[2 * ngrids + g];
+                float wz = wv[3 * ngrids + g];
+                fill_atom_aow_gga_radial_precomp(l_i_ns, l_i_ir, l_i_l, rad_val, rad_dr,
+                                                 g, ngrids, coords[g] - atom_coords[ia],
+                                                 w0, wx, wy, wz, aowI[ip]);
+                fill_atom_ao_radial_precomp(l_j_ns, l_j_ir, l_j_l, rad_val,
+                                            g, ngrids, coords[g] - atom_coords[ja], aoJ[ip]);
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (int t = 0; t < PAIR_QPT; t++) {
+            int q = lid + t * WGS_VMAT;
+            if (q >= PAIR_BLK_SIZE) continue;
+            int a = q >> LOG_MAX_AO_ATOM;
+            int b = q & (MAX_AO_ATOM - 1);
+            if (a >= nia || b >= nja) continue;
+            float s = 0.0f;
+            for (int ip = 0; ip < NPTILE; ip++) {
+                int g = gTile + ip;
+                if (g >= ngrids) continue;
+                s += aowI[ip][a] * aoJ[ip][b];
+            }
+            acc[t] += s;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    for (int t = 0; t < PAIR_QPT; t++) {
+        int q = lid + t * WGS_VMAT;
+        if (q >= PAIR_BLK_SIZE) continue;
+        int a = q >> LOG_MAX_AO_ATOM;
+        int b = q & (MAX_AO_ATOM - 1);
+        if (ia < natoms && ja < natoms && a < nia && b < nja) {
+            int idx = (i0 + a) * ncart + (j0 + b);
+            partial_vmat[isplit * ncart * ncart + idx] = acc[t];
+        }
+    }
+}
+
+__kernel void reduce_split_vmat(
+    __global const float *partial_vmat,  // [nsplit, ncart, ncart]
+    __global float *vmat,                // [ncart, ncart]
+    int ncart, int nsplit)
+{
+    int idx = get_global_id(0);
+    int n = ncart * ncart;
+    if (idx >= n) return;
+    float s = 0.0f;
+    for (int isplit = 0; isplit < nsplit; isplit++)
+        s += partial_vmat[isplit * n + idx];
+    vmat[idx] = s;
+}
+
 __kernel void rho_lda_precomp_tiled(
     __global const float *ao0,
     __global const float *dm,

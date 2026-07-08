@@ -10,6 +10,8 @@ Usage:
 '''
 from __future__ import annotations
 
+from dataclasses import replace
+
 # Profile record keys:
 #   label, description, mf_backend, df_backend, xc_path, setup_kw, scf_kw, accuracy
 
@@ -95,6 +97,20 @@ GPU_PROFILES = {
         'accuracy': {
             'vxc_max_vs_cpu': '~3e-6',
             'energy_note': 'Hybrid: OTF rho_gga_tiled + vmat_gga_radial_precomp_pair',
+            'converges_default_scf': True,
+        },
+    },
+    'production_otf_radial_vmat_splitk': {
+        'label': 'production_otf_radial_vmat_splitk',
+        'description': 'OTF Hermite rho + split-K radial-precomp vmat; GPU PBE; CPU DF J. WGS_VMAT=128 + splits=64 from benzene 1-neighborhood sweep.',
+        'mf_backend': 2,
+        'df_backend': 1,
+        'xc_path': 'onthefly',
+        'setup_kw': {'xc_eval': 'gpu', 'gpu_xc': 'auto', 'vmat_mode': 'radial_precomp', 'vmat_grid_splits': 64},
+        'scf_kw': {'conv_tol': 1e-8, 'conv_tol_grad': 1e-5},
+        'accuracy': {
+            'vxc_max_vs_cpu': '~3e-5',
+            'energy_note': 'Split grid dimension in vmat_gga_radial_precomp_pair_splitk; reduce partial vmat on GPU.',
             'converges_default_scf': True,
         },
     },
@@ -216,6 +232,20 @@ def apply_scf_kw(mf, scf_kw):
         setattr(mf, k, v)
 
 
+def _ensure_splitk_tile_config(setup_kw, quiet=True):
+    '''Recompile kernels with WGS_VMAT=128 for split-K pair vmat (benzene sweep winner).'''
+    if setup_kw.get('vmat_grid_splits', 1) <= 1:
+        return
+    from pyscf.OpenCL import init_device, reset_opencl
+    from pyscf.OpenCL.tile_config import get_active_tile_config, TileConfig
+    tc = get_active_tile_config()
+    target_wgs = 128
+    if tc.WGS_VMAT == target_wgs:
+        return
+    reset_opencl()
+    init_device(tile_config=replace(tc, WGS_VMAT=target_wgs), force_rebuild=True, quiet=quiet)
+
+
 def apply_gpu_profile(mf, name=DEFAULT_PROFILE, setup=True, dm=None):
     '''Configure mf (and DF backend) from a named profile; optionally run OpenCL setup.'''
     prof = get_profile(name)
@@ -230,6 +260,7 @@ def apply_gpu_profile(mf, name=DEFAULT_PROFILE, setup=True, dm=None):
         mf.initialize_grids(mol, dm)
         setup_kw = dict(prof.get('setup_kw', {}))
         gpu_xc = setup_kw.pop('gpu_xc', 'auto')
+        _ensure_splitk_tile_config(setup_kw)
         if xc_path == 'precomputed':
             from pyscf.OpenCL.xc_grid import setup_precomputed_gto
             mf._xc_gpu_plan = setup_precomputed_gto(

@@ -449,3 +449,259 @@ I can turn this into a `doc/small_mol_cpu_grid_plan.md` in the repo, or go deepe
 
 ---
 
+Yes. There are still good CPU optimization opportunities, and the biggest one is not “more threads” yet. It is fixing memory layout inside the C kernels so each thread has stride-1 work.
+
+I followed `cpu-perf` workflow as far as possible: `perf stat` is blocked on this machine (`perf_event_paranoid=4`), so I used source inspection, current timings, and GCC vectorization diagnostics.
+
+## Highest-Value Opportunities
+
+### 1. Rewrite tile loops to use stride-1 over grid points
+
+Current C kernels keep PySCF’s F-contiguous AO layout, which is good for BLAS tile GEMM. But some scalar post-processing loops walk AO index `mu` for a fixed grid point `g`, which means huge-stride memory access:
+
+```34:49:pyscf/lib/smalldft/small_grid.c
+static void _rho_tile_lda(double *rho, const double *chi0, const double *dm,
+                          double *c0, int tile, int nao, int ig0, int ngrids)
+{
+        // ...
+        for (t = 0; t < tile; t++) {
+                rho[ig0 + t] = ddot_(&nao, chi0 + ig0 + t, &inc_chi,
+                                     c0 + t, &inc_c0);
+        }
+}
+```
+
+This is cache-unfriendly: `inc_chi = ngrids`, so each AO component jumps by ~143k doubles for benzene. GCC also reported these loops as not vectorized.
+
+Better structure:
+
+```c
+// pseudo
+rho0[tile] = 0
+rho1[tile] = 0
+rho2[tile] = 0
+rho3[tile] = 0
+
+for mu in nao:
+    chi0_mu = chi0 + mu*ngrids + ig0
+    c0_mu   = c0   + mu*tile
+    chi1_mu = chi1 + mu*ngrids + ig0
+    ...
+    #pragma omp simd
+    for t in tile:
+        rho0[t] += chi0_mu[t] * c0_mu[t]
+        rho1[t] += 2 * chi1_mu[t] * c0_mu[t]
+        rho2[t] += 2 * chi2_mu[t] * c0_mu[t]
+        rho3[t] += 2 * chi3_mu[t] * c0_mu[t]
+```
+
+This makes the inner loop stride-1 and SIMD-friendly. It should improve `rho_gga`, currently ~20 ms @8 CPU.
+
+### 2. Store `aow` / `chi_w` as F-order tile buffers
+
+`vmat_gga` currently builds `aow[t*nao + mu]`, then calls BLAS with `dgemm("T","T")`:
+
+```235:249:pyscf/lib/smalldft/small_grid.c
+for (t = 0; t < tile; t++) {
+        int g = ig0 + t;
+        for (mu = 0; mu < nao; mu++) {
+                double val = 0.;
+                for (c = 0; c < 4; c++) {
+                        val += wv[(size_t)c * ngrids + g]
+                             * chi[(size_t)c * ao_size + g
+                                   + (size_t)mu * ngrids];
+                }
+                aow[(size_t)t * nao + mu] = val;
+        }
+}
+
+dgemm_("T", "T", &nao, &nao, &tile, &one,
+       chi + ig0, &ngrids, aow, &nao, &one, v_priv, &nao);
+```
+
+This again reads `chi` with poor stride in the inner loop. Better: store `aow` as F-order `(tile, nao)` using `aow[t + mu*tile]`, loop `mu` outside and `t` inside, then call:
+
+```c
+dgemm_("T", "N", &nao, &nao, &tile, &one,
+       chi + ig0, &ngrids, aow, &tile, &one, v_priv, &nao);
+```
+
+This should improve vmat formation and make the non-BLAS part vectorize cleanly. It also removes the awkward Fortran/C transpose interpretation.
+
+### 3. Fuse C rho + libxc/PBE + vmat per tile
+
+Today the path is:
+
+```text
+C rho_gga → Python libxc full-grid call → C vmat_gga
+```
+
+That forces two full AO passes plus full `rho`/`wv` materialization. True fusion requires moving XC evaluation into the tile loop:
+
+```text
+for tile:
+    c0 = chi0 @ DM
+    rho(tile)
+    PBE vxc(tile)
+    aow(tile)
+    V_thread += chi0.T @ aow
+```
+
+This is likely the largest remaining structural win after stride-1 fixes. But it needs either:
+
+- call libxc C API safely per tile, or
+- implement the unpolarized PBE formula in C with parity tests.
+
+For production PBE, this is probably worth it. It would cut memory traffic and Python orchestration.
+
+### 4. Make `GridWorkspace` the default patched path
+
+Current numbers show this clearly:
+
+| path @8 CPU | cycle `nr_rks` |
+|-------------|---------------:|
+| ref | ~120 ms |
+| smallDFT_ws | ~42 ms |
+
+The workspace avoids AO inside `nr_rks`. But this only helps when users explicitly build/use `GridWorkspace`. `patch.enable()` should attach and reuse workspace on `mf` automatically per geometry/grid.
+
+This is not a low-level CPU trick, but it is a big real-path win.
+
+### 5. Remove heap allocation from C hot calls
+
+`small_grid.c` allocates per-thread buffers inside each call: `malloc/free` for `c0`, `aow`, `chi_w`, `v_priv`, and hermi temp. This is not the main cost for benzene, but it violates the CPU-perf rule and will matter over many SCF cycles.
+
+Better options:
+
+- pass scratch buffers from `GridWorkspace`
+- or introduce a C workspace object with per-thread scratch:
+  - `scratch_tile[nthreads][tile*nao]`
+  - `scratch_vmat[nthreads][nao*nao]`
+  - aligned to 64 bytes
+  - first-touch initialized inside parallel region
+
+### 6. Build with optional `-march=native`
+
+GCC diagnostics showed only 16-byte vectorization in key loops. The standalone build uses:
+
+```bash
+gcc -shared -fPIC -O3 -fopenmp -std=c99
+```
+
+For local performance builds, add optional:
+
+```bash
+-march=native -mtune=native
+```
+
+Not portable as default, but useful behind e.g. `SMALLDFT_NATIVE=1`.
+
+## Priority Order
+
+1. **Rewrite rho/vmat tile loops for stride-1 grid inner loops.** Lowest risk, likely immediate speedup.
+2. **Change `aow`/`chi_w` to F-order tile buffers and use `dgemm("T","N")`.**
+3. **Auto-attach `GridWorkspace` in `patch.enable()`**, so real SCF always gets AO caching.
+4. **Preallocate C scratch buffers** to remove malloc/free and support first-touch.
+5. **Fused PBE tile kernel** (`rho → PBE → vmat`) for the next big jump.
+6. **Grid-parallel AO / eval_gto** if we need better first-geometry or moving-geometry performance.
+
+The next concrete implementation I’d do is the stride-1 rewrite of `SMALL_rho_gga` and `SMALL_vmat_gga`, then run parity + `profile_xc_bottleneck()` before touching fusion.
+
+---
+
+## Test machine (benchmark host)
+
+Recorded **2026-07-08** on host `GTX3090`. All CPU smallDFT timings in this thread and in `doc/CPU_benchmark.md` were measured on this system unless noted.
+
+### Host OS
+
+| Item | Value |
+|------|-------|
+| Hostname | `GTX3090` |
+| Kernel | Linux `6.8.0-51-generic` (`#52-Ubuntu SMP PREEMPT_DYNAMIC`) |
+| Arch | x86_64, little-endian |
+| `perf` | **`perf_event_paranoid=4`** — hardware counters blocked; profiling used wall time, GCC `-fopt-info-vec`, cProfile |
+
+### CPU — AMD Ryzen 7 5800X (Zen 3, Vermeer)
+
+| Item | Value |
+|------|-------|
+| Model | **AMD Ryzen 7 5800X 8-Core Processor** |
+| Family / model / stepping | 25 / 33 / 0 |
+| Sockets | 1 |
+| Cores / threads | **8 cores / 16 threads** (SMT on) |
+| NUMA | 1 node (CPUs 0–15) |
+| Base / boost | min **2.2 GHz**; max **~4.85 GHz** (boost enabled) |
+| Governor | `schedutil` (sampled ~4.2–4.6 GHz under load) |
+| ISA (relevant) | AVX2, FMA, BMI1/2, AES, SHA, CLZERO |
+
+**Cache hierarchy** (`lscpu`):
+
+| Level | Size | Notes |
+|-------|------|-------|
+| L1d | **256 KiB** | 8× 32 KiB (per core) |
+| L1i | **256 KiB** | 8× 32 KiB (per core) |
+| L2 | **4 MiB** | 8× 512 KiB (per core) |
+| L3 | **32 MiB** | shared, 1 instance |
+
+**Relevance for smallDFT:** benzene GGA χ is ~525 MB (`4 × nao × ngrids × 8`); does not fit L3 — kernels are **memory-bandwidth bound**. DM (`nao²`) and tile buffers (`TILE×nao`, `TILE=512`) fit in L2/L3 and should be reused across the inner grid loop.
+
+### Memory
+
+| Item | Value |
+|------|-------|
+| RAM | **32 GiB** (`MemTotal` 31.3 GiB) |
+| Swap | none |
+| Typical free under load | ~18 GiB available (buff/cache heavy) |
+
+Working sets for benzene SCF (χ + DM + vmat + scratch) are well below RAM; no paging concern.
+
+### Storage
+
+| Item | Value |
+|------|-------|
+| Primary | **WD SN850 2 TB** NVMe (`WDS200T1X0E-00AFY0`, `nvme0n1`) |
+
+Not a bottleneck for in-memory grid XC; relevant only for build I/O and large ref data.
+
+### Threading defaults in CPU benchmarks
+
+| Knob | Value |
+|------|-------|
+| Grid / libcint OMP | `lib.num_threads(N)` — authoritative for `libsmalldft` + libcint |
+| BLAS | **`OPENBLAS_NUM_THREADS=1`** (avoid nested OMP + threaded GEMM) |
+| Typical sweeps | N = 1, 2, 4, 8 (physical cores); 16 threads rarely faster for grid kernels |
+
+### GPU on same host (context only)
+
+OpenCL benchmarks on this machine use **NVIDIA GeForce RTX 3090** (24 GB, 82 CUs). See `doc/GPU_benchmark.md` § Test machine for full GPU stack. CPU smallDFT work does not use the GPU.
+
+### Reproduce machine query
+
+```bash
+lscpu
+free -h
+grep -E 'model name|cpu MHz' /proc/cpuinfo | head -2
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq   # kHz
+uname -a
+```
+
+Full `lscpu` snapshot (2026-07-08):
+
+```
+Architecture:            x86_64
+CPU(s):                  16
+Model name:              AMD Ryzen 7 5800X 8-Core Processor
+Thread(s) per core:      2
+Core(s) per socket:      8
+Socket(s):               1
+CPU max MHz:             4850.19
+CPU min MHz:             2200.00
+L1d cache:               256 KiB (8 instances)
+L1i cache:               256 KiB (8 instances)
+L2 cache:                4 MiB (8 instances)
+L3 cache:                32 MiB (1 instance)
+NUMA node(s):            1
+Flags:                   ... avx2 fma bmi2 ...
+```

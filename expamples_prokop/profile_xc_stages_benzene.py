@@ -21,6 +21,7 @@ MODES = (
     ('OTF quintic', 'production_otf_quintic'),
     ('Radial precomp', 'production_radial'),
     ('OTF ρ + rad vmat', 'production_otf_radial_vmat'),
+    ('OTF ρ + rad vmat splitK', 'production_otf_radial_vmat_splitk'),
 )
 
 

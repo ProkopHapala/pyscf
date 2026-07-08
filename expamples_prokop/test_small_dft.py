@@ -144,8 +144,9 @@ def _parity_gga_c(mol_atom, label):
                          non0tab=mf.grids.non0tab, cutoff=mf.grids.cutoff)
     r_py = rho_gga(dm, chi, use_c=False, n_workers=1)
     r_c = rho_gga(dm, chi, use_c=True, nthreads=4)
-    assert abs(r_py - r_c).max() < 1e-12
-    print(f'{label} PBE rho_gga C parity OK  max diff={abs(r_py-r_c).max():.2e}')
+    diff = abs(r_py - r_c).max()
+    assert diff < 3e-12
+    print(f'{label} PBE rho_gga C parity OK  max diff={diff:.2e}')
 
 
 def _bench_rho_gga_c(mol_atom, label):

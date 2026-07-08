@@ -16,7 +16,9 @@
 #include "smalldft/small_grid.h"
 
 #define MIN(X, Y) ((X) < (Y) ? (X) : (Y))
+#ifndef TILE
 #define TILE 512
+#endif
 
 static int _nthreads(int nthreads)
 {
@@ -36,16 +38,23 @@ static void _rho_tile_lda(double *rho, const double *chi0, const double *dm,
 {
         const double one = 1.;
         const double zero = 0.;
-        int t;
-        int inc_chi = ngrids;
-        int inc_c0 = tile;
+        int t, mu;
 
         dgemm_("N", "T", &tile, &nao, &nao, &one,
                chi0 + ig0, &ngrids, dm, &nao, &zero, c0, &tile);
 
         for (t = 0; t < tile; t++) {
-                rho[ig0 + t] = ddot_(&nao, chi0 + ig0 + t, &inc_chi,
-                                     c0 + t, &inc_c0);
+                rho[ig0 + t] = 0.;
+        }
+        for (mu = 0; mu < nao; mu++) {
+                const double *chi_mu = chi0 + ig0 + (size_t)mu * ngrids;
+                const double *c0_mu = c0 + (size_t)mu * tile;
+#ifdef _OPENMP
+#pragma omp simd
+#endif
+                for (t = 0; t < tile; t++) {
+                        rho[ig0 + t] += chi_mu[t] * c0_mu[t];
+                }
         }
 }
 
@@ -96,7 +105,6 @@ void SMALL_rho_gga(double *rho, const double *chi, const double *dm,
 #endif
 {
         const double two = 2.;
-        int inc_chi = ngrids;
         double *c0 = NULL;
         size_t bufsz = 0;
 #ifdef _OPENMP
@@ -104,9 +112,7 @@ void SMALL_rho_gga(double *rho, const double *chi, const double *dm,
 #endif
         for (ig0 = 0; ig0 < ngrids; ig0 += TILE) {
                 int tile = MIN(TILE, ngrids - ig0);
-                int inc_c0 = tile;
                 size_t need = (size_t)tile * nao;
-                double val;
 
                 if (bufsz < need) {
                         free(c0);
@@ -117,12 +123,23 @@ void SMALL_rho_gga(double *rho, const double *chi, const double *dm,
                 _rho_tile_lda(rho, chi, dm, c0, tile, nao, ig0, ngrids);
 
                 for (k = 1; k < 4; k++) {
-                        const double *chi_k = chi + (size_t)k * ao_size;
+                        double *rho_k = rho + (size_t)k * ngrids + ig0;
                         for (t = 0; t < tile; t++) {
-                                int g = ig0 + t;
-                                val = ddot_(&nao, chi_k + g, &inc_chi,
-                                              c0 + t, &inc_c0);
-                                rho[(size_t)k * ngrids + g] = two * val;
+                                rho_k[t] = 0.;
+                        }
+                }
+                for (k = 1; k < 4; k++) {
+                        const double *chi_k = chi + (size_t)k * ao_size + ig0;
+                        double *rho_k = rho + (size_t)k * ngrids + ig0;
+                        for (int mu = 0; mu < nao; mu++) {
+                                const double *chi_mu = chi_k + (size_t)mu * ngrids;
+                                const double *c0_mu = c0 + (size_t)mu * tile;
+#ifdef _OPENMP
+#pragma omp simd
+#endif
+                                for (t = 0; t < tile; t++) {
+                                        rho_k[t] += two * chi_mu[t] * c0_mu[t];
+                                }
                         }
                 }
         }
@@ -175,16 +192,19 @@ void SMALL_vmat_lda(double *vmat, const double *chi, const double *wv,
                         bufsz = need;
                 }
 
-                for (t = 0; t < tile; t++) {
-                        double wt = wv[ig0 + t];
-                        for (mu = 0; mu < nao; mu++) {
-                                chi_w[(size_t)t * nao + mu] =
-                                        chi[ig0 + t + (size_t)mu * ngrids] * wt;
+                for (mu = 0; mu < nao; mu++) {
+                        const double *chi_mu = chi + ig0 + (size_t)mu * ngrids;
+                        double *chi_w_mu = chi_w + (size_t)mu * tile;
+#ifdef _OPENMP
+#pragma omp simd
+#endif
+                        for (t = 0; t < tile; t++) {
+                                chi_w_mu[t] = chi_mu[t] * wv[ig0 + t];
                         }
                 }
 
-                dgemm_("T", "T", &nao, &nao, &tile, &one,
-                       chi + ig0, &ngrids, chi_w, &nao, &one, v_priv, &nao);
+                dgemm_("T", "N", &nao, &nao, &tile, &one,
+                       chi + ig0, &ngrids, chi_w, &tile, &one, v_priv, &nao);
         }
         free(chi_w);
 #ifdef _OPENMP
@@ -223,7 +243,7 @@ void SMALL_vmat_gga(double *vmat, const double *chi, const double *wv,
 #endif
         for (ig0 = 0; ig0 < ngrids; ig0 += TILE) {
                 int tile = MIN(TILE, ngrids - ig0);
-                int t, mu, c;
+                int t, mu;
                 size_t need = (size_t)tile * nao;
 
                 if (bufsz < need) {
@@ -232,21 +252,26 @@ void SMALL_vmat_gga(double *vmat, const double *chi, const double *wv,
                         bufsz = need;
                 }
 
-                for (t = 0; t < tile; t++) {
-                        int g = ig0 + t;
-                        for (mu = 0; mu < nao; mu++) {
-                                double val = 0.;
-                                for (c = 0; c < 4; c++) {
-                                        val += wv[(size_t)c * ngrids + g]
-                                             * chi[(size_t)c * ao_size + g
-                                                   + (size_t)mu * ngrids];
-                                }
-                                aow[(size_t)t * nao + mu] = val;
+                for (mu = 0; mu < nao; mu++) {
+                        double *aow_mu = aow + (size_t)mu * tile;
+                        const double *chi0_mu = chi + ig0 + (size_t)mu * ngrids;
+                        const double *chi1_mu = chi + ao_size + ig0 + (size_t)mu * ngrids;
+                        const double *chi2_mu = chi + 2 * ao_size + ig0 + (size_t)mu * ngrids;
+                        const double *chi3_mu = chi + 3 * ao_size + ig0 + (size_t)mu * ngrids;
+#ifdef _OPENMP
+#pragma omp simd
+#endif
+                        for (t = 0; t < tile; t++) {
+                                int g = ig0 + t;
+                                aow_mu[t] = wv[g] * chi0_mu[t]
+                                          + wv[(size_t)ngrids + g] * chi1_mu[t]
+                                          + wv[2 * (size_t)ngrids + g] * chi2_mu[t]
+                                          + wv[3 * (size_t)ngrids + g] * chi3_mu[t];
                         }
                 }
 
-                dgemm_("T", "T", &nao, &nao, &tile, &one,
-                       chi + ig0, &ngrids, aow, &nao, &one, v_priv, &nao);
+                dgemm_("T", "N", &nao, &nao, &tile, &one,
+                       chi + ig0, &ngrids, aow, &tile, &one, v_priv, &nao);
         }
         free(aow);
 #ifdef _OPENMP

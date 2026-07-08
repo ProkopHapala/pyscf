@@ -6,22 +6,23 @@ tags: [opencl, dft, xc, gpu]
 
 ## Summary
 
-GPU offload of the RKS exchange–correlation grid integral (ρ projection → PBE vxc → vmat) and density-fitting Coulomb J is implemented in `pyscf/OpenCL/`, integrated into `pyscf/dft/rks.py` via `mf.backend` and `mf.setup_gpu()`. **Best per-cycle XC path (benzene cc-pVDZ):** `production_otf_radial_vmat` — OTF Hermite ρ + radial-gather vmat (~21 ms vs ~29 ms full OTF). Default general path remains `production_otf` (no radial setup). Quintic spline (`production_otf_quintic`) halves setup table build. Stage timing uses `gpu_timing.py` (wall+`queue.finish()` and `clGetEventProfilingInfo`). Precomputed paths (coalesced, radial-precomp) exist for parity/debug. PBE on GPU verified vs libxc; max |vxc| ~3e-5 vs CPU on benzene (f32 ρ).
+GPU offload of the RKS exchange–correlation grid integral (ρ projection → PBE vxc → vmat) and density-fitting Coulomb J is implemented in `pyscf/OpenCL/`, integrated into `pyscf/dft/rks.py` via `mf.backend` and `mf.setup_gpu()`. **Best per-cycle XC path (benzene cc-pVDZ, RTX 3090):** `production_otf_radial_vmat_splitk` — OTF Hermite ρ + split-K radial-gather vmat (~12 ms gpu CL vs ~21 ms non-split hybrid vs ~29 ms full OTF). Non-split hybrid `production_otf_radial_vmat` remains valid. Default general path: `production_otf` (no radial setup). Stage timing: `gpu_timing.py` (wall+`queue.finish()` and `clGetEventProfilingInfo`). PBE on GPU verified vs libxc; max |vxc| ~3e-5 on benzene (f32 ρ).
 
 ## Implementations
 
 | Location | Status | Notes |
 |----------|--------|-------|
-| `pyscf/OpenCL/xc_grid.py` — `XCGridPlan`, setup/run API | active | ρ/PBE/vmat; `vmat_mode='radial_precomp'` hybrid; `spline_order`; `plan.last_timing` |
+| `pyscf/OpenCL/xc_grid.py` — `XCGridPlan`, setup/run API | active | ρ/PBE/vmat; `vmat_mode='radial_precomp'`; `vmat_grid_splits` split-K; `plan.last_timing` |
 | `pyscf/OpenCL/gpu_timing.py` — kernel profiling helpers | active | `profile_kernel` (wall+CL events), `profile_call`; requires `PROFILING_ENABLE` queue |
-| `pyscf/OpenCL/kernels.cl` — tiled ρ/vmat, pair kernels | active | OTF tiled/pair, quintic Hermite, radial precomp ρ/vmat, PBE, reductions |
+| `pyscf/OpenCL/kernels.cl` — tiled ρ/vmat, pair kernels | active | OTF tiled/pair, quintic Hermite, radial precomp, **split-K vmat + reduce**, PBE, reductions |
 | `pyscf/OpenCL/pbe.cl` — GPU PBE vxc | active | f32 default; f64 path with D2H for high precision; unpolarized PBE only |
 | `pyscf/OpenCL/hermite_spline.py` + `radial_hermite.py` | active | Host radial table build; mapped u-grid, cubic/quintic |
 | `pyscf/OpenCL/ao_hermite.py` — GPU Hermite AO setup | active | Optional pre-SCF AO materialization (`ao_proj='hermite_gpu'`) |
 | `pyscf/OpenCL/grid_screen.py` — atom tile screening | active | Rcut from Hermite tails; sparse pair atom lists |
 | `pyscf/OpenCL/df_jk.py` — RI J/K on GPU | active | Separate from XC; `mf.with_df.backend=2` |
-| `pyscf/OpenCL/gpu_profiles.py` | active | `production_otf_radial_vmat`, `production_otf_quintic`; cookbook in `doc/opencl_gpu_paths_cookbook.md` |
+| `pyscf/OpenCL/gpu_profiles.py` | active | `production_otf_radial_vmat_splitk`, `production_otf_radial_vmat`, `production_otf_quintic`; cookbook in `doc/opencl_gpu_paths_cookbook.md` |
 | `expamples_prokop/profile_xc_stages_benzene.py` | active | Per-stage wall vs CL timing; benzene benchmark driver for `doc/GPU_benchmark.md` |
+| `expamples_prokop/sweep_splitk_tiles.py` | active | `--neighbor` tile/WGS/splits sweep for split-K profile |
 | `pyscf/dft/rks.py` — `backend`, `setup_gpu`, `get_veff` | active | Entry point for SCF; backend 3 = CPU/GPU compare |
 | CPU reference — `pyscf/dft/numint.py` | active | libxc + CPU `eval_ao`; parity baseline |
 
@@ -34,6 +35,7 @@ GPU offload of the RKS exchange–correlation grid integral (ρ projection → P
 | GPU vmat vs CPU (given same wv) | max rel ~1e-5 | `test_opencl_xc_vmat_precomp.py` |
 | Full path ρ→PBE→vmat vs CPU vxc | max ~3e-5 (benzene cc-pVDZ, f32) | `test_opencl_xc_onthefly.py`, `test_opencl_xc_full_gpu_parity.py` |
 | Hybrid OTF ρ + radial vmat vs CPU vxc | max ~3.15e-5 | `profile_xc_stages_benzene.py`, `production_otf_radial_vmat` |
+| Split-K OTF ρ + radial vmat vs CPU vxc | max ~3.16e-5 | `profile_xc_stages_benzene.py`, `production_otf_radial_vmat_splitk` |
 | Quintic OTF ρ vs cubic OTF | shell-dependent; memory-equivalent du | `test_quintic_rho_otf.py` |
 | SCF energy convergence | matches CPU at conv_tol 1e-8 | `profile_gpu_scf.py`, `test_opencl_xc_scf.py` |
 | Hermite AO vs exact GTO | shell-dependent; see quintic report | `test_opencl_hermite_ao.py`, `hermite_radial_study.py` |
@@ -43,6 +45,8 @@ GPU offload of the RKS exchange–correlation grid integral (ρ projection → P
 - XC limited to **LDA + GGA PBE** on GPU eval path; other functionals fall back to CPU libxc (`xc_eval='cpu'`)
 - **Meta-GGA / hybrid / range-separated** not ported
 - Large molecules (nao≈300+): precomp χ can exceed GPU memory; OTF path required
+- Tile defaults tuned on **benzene** — re-validate on other molecules before hard-locking (`sweep_splitk_tiles.py --neighbor`)
+- `WGS_VMAT` optimal value is **profile-specific** (128 for split-K; 256 default for OTF tiled)
 - `MAX_ITILE` / `MAX_AO_ATOM` compile-time caps — molecules with many atoms per tile need tile reconfig or kernel extension
 - K matrix on GPU via DF exists but PBE RKS production profile uses J only
 - `generate_pbe_cl.py` must be re-run when updating libxc PBE source
@@ -92,7 +96,7 @@ Doc: `/home/prokop/git/pyscf/doc/smallDFT_cpu_path.md` · Benchmarks: `/home/pro
 
 ### Summary
 
-Inter-fragment distance scans (E_bind vs separation) are the acceptance test for GPU XC paths on non-covalent interactions: each geometry runs full PBE/DF SCF with dm warm-start, comparing CPU libxc to all six OpenCL profiles on the same rigid trajectory. Documented in `/home/prokophapala/git/pyscf/doc/dimer_scan_benchmarks.md`.
+Inter-fragment distance scans (E_bind vs separation) are the acceptance test for GPU XC paths on non-covalent interactions: each geometry runs full PBE/DF SCF with dm warm-start, comparing CPU libxc to all six OpenCL profiles on the same rigid trajectory. Documented in `/home/prokop/git/pyscf/doc/dimer_scan_benchmarks.md`.
 
 ### Implementations
 

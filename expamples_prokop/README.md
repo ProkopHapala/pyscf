@@ -1,6 +1,6 @@
 # expamples_prokop
 
-Custom benchmarks and parity checks for the OpenCL XC/DF GPU path — not upstream `examples/`. Run from repo root: `PYTHONPATH=/home/prokophapala/git/pyscf python3 expamples_prokop/<script>.py`. Dimer scan workflow: `/home/prokophapala/git/pyscf/doc/dimer_scan_benchmarks.md`.
+Custom benchmarks and parity checks for the OpenCL XC/DF GPU path — not upstream `examples/`. Run from repo root: `PYTHONPATH=/home/prokop/git/pyscf python3 expamples_prokop/<script>.py`. Dimer scan workflow: `/home/prokop/git/pyscf/doc/dimer_scan_benchmarks.md`.
 
 ## XC pipeline — end-to-end and parity
 
@@ -38,7 +38,10 @@ Custom benchmarks and parity checks for the OpenCL XC/DF GPU path — not upstre
 
 ## SCF profiling and tuning
 
+- **profile_xc_stages_benzene.py** — per-stage XC timing table (wall + CL events); all paths including split-K; feeds `doc/GPU_benchmark.md`
+- **profile_scf_cycle.py** — full SCF cycle breakdown (J + XC per iteration)
 - **profile_gpu_scf.py** — full SCF convergence profile, per-cycle vxc accuracy
 - **profile_dft.py** — CPU DFT bottleneck profiler (cProfile + PySCF timers)
-- **sweep_opencl_tiles.py** — benchmark grid over `TileConfig` (NPTILE, NATILE, WGS_VMAT, …)
+- **sweep_splitk_tiles.py** — **recommended** tile sweep for split-K: `--neighbor` 1-step lattice walk from `--seed`
+- **sweep_opencl_tiles.py** — legacy brute-force `TileConfig` grid (NPTILE, NATILE, WGS_VMAT, …)
 - **test_opencl.py** — early integration smoke tests (xc_grid, df_jk, `mf.backend=2`)

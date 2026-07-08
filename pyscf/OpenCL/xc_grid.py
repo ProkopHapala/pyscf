@@ -60,7 +60,7 @@ def _finalize_gpu_timing(timing):
 TIMING_STAGE_ORDER = (
     'host_h2d_dm', 'gpu_dm_cart', 'host_dm_cart', 'gpu_rho', 'host_rho_d2h',
     'gpu_xc_pbe', 'host_xc_libxc', 'host_xc_reduce', 'gpu_xc_reduce',
-    'gpu_vmat', 'host_vmat_d2h', 'host_pair_mask', 'host_cpu_projection',
+    'gpu_vmat_split', 'gpu_vmat_reduce', 'gpu_vmat', 'host_vmat_d2h', 'host_pair_mask', 'host_cpu_projection',
     'gpu_total', 'gpu_total_cl', 'host_total', 'wall_profiled', 'n_blocks',
 )
 
@@ -1252,12 +1252,13 @@ class XCGridPlan:
     def _nr_rks_precomputed_gpu_dense(self, dm, profile=False):
         return self._nr_rks_precomputed_gpu(dm, profile=profile)
 
-    def setup_onthefly(self, r0_ang=0.002, du=0.02, rmax_ang=None, xc_eval='gpu', gpu_xc='auto', spline_order='cubic', vmat_mode='otf'):
+    def setup_onthefly(self, r0_ang=0.002, du=0.02, rmax_ang=None, xc_eval='gpu', gpu_xc='auto', spline_order='cubic', vmat_mode='otf', vmat_grid_splits=1):
         '''One-time prep before SCF: OpenCL compile, Hermite tables, GPU buffers, kernel args.
 
         xc_eval: 'gpu' (default, PBE on device) | 'cpu' (libxc debug with rho D2H).
         spline_order: 'cubic' | 'quintic' (analytic GTO tangents; quintic uses 2× coarser du).
         vmat_mode: 'otf' (Hermite in vmat kernel) | 'radial_precomp' (gather R,dR for vmat only).
+        vmat_grid_splits: split radial-precomp vmat over grid chunks; 1 keeps the original kernel.
         '''
         from . import init_device
         init_device(quiet=getattr(self, '_otf_ready', False))
@@ -1306,7 +1307,12 @@ class XCGridPlan:
         coords4 = np.zeros((ngrids, 4), dtype=np.float32)
         coords4[:, :3] = self.grids.coords
         buf_coords4 = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, coords4.nbytes, coords4)
-        buf_rad_val = buf_rad_dr = None
+        vmat_grid_splits = int(vmat_grid_splits)
+        if vmat_grid_splits < 1:
+            raise ValueError(f'vmat_grid_splits must be >= 1; got {vmat_grid_splits}')
+        if vmat_grid_splits > 1 and vmat_mode != 'radial_precomp':
+            raise NotImplementedError('vmat_grid_splits>1 is implemented only for vmat_mode=radial_precomp')
+        buf_rad_val = buf_rad_dr = buf_vmat_partial = None
         buf_atom_coords_h = buf_radial_l_h = buf_atom_radial_offset_h = buf_atom_radial_list_h = None
         t_rad = 0.0
         if vmat_mode == 'radial_precomp':
@@ -1320,9 +1326,9 @@ class XCGridPlan:
             t_rad0 = _time.perf_counter()
             ao_eval.build_radial_on_grid_gpu(buf_coords4, buf_rad_val, buf_rad_dr, ngrids)
             t_rad = _time.perf_counter() - t_rad0
-            vmat_knl = 'vmat_gga_radial_precomp_pair'
-            vmat_global = (natoms, natoms * WGS_VMAT)
-            vmat_local = (1, WGS_VMAT)
+            vmat_knl = 'vmat_gga_radial_precomp_pair_splitk' if vmat_grid_splits > 1 else 'vmat_gga_radial_precomp_pair'
+            vmat_global = (natoms, natoms * WGS_VMAT, vmat_grid_splits) if vmat_grid_splits > 1 else (natoms, natoms * WGS_VMAT)
+            vmat_local = (1, WGS_VMAT, 1) if vmat_grid_splits > 1 else (1, WGS_VMAT)
         else:
             vmat_knl = vmat_knl_otf
             vmat_global = vmat_global_otf
@@ -1344,6 +1350,8 @@ class XCGridPlan:
         buf_rho = cl.Buffer(self.ctx, mf.READ_WRITE, 4 * ngrids * fbytes)
         buf_wv = cl.Buffer(self.ctx, mf.READ_WRITE, 4 * ngrids * fbytes)
         buf_vmat = cl.Buffer(self.ctx, mf.READ_WRITE, ncart * ncart * fbytes)
+        if vmat_mode == 'radial_precomp' and vmat_grid_splits > 1:
+            buf_vmat_partial = cl.Buffer(self.ctx, mf.READ_WRITE, vmat_grid_splits * ncart * ncart * fbytes)
         buf_dm_sph = cl.Buffer(self.ctx, mf.READ_ONLY, self.nao * self.nao * fbytes)
         buf_vmat_sph = cl.Buffer(self.ctx, mf.READ_WRITE, self.nao * self.nao * fbytes)
         buf_c2s_scratch = cl.Buffer(self.ctx, mf.READ_WRITE, ncart * self.nao * fbytes)
@@ -1361,16 +1369,25 @@ class XCGridPlan:
         k_rho = cl.Kernel(self.prg, rho_knl)
         k_rho.set_args(buf_coords4, *hermite_bufs[1:], buf_dm_cart, buf_atom_ao0, buf_atom_nao, buf_rho, *hermite_params)
         k_vmat = cl.Kernel(self.prg, vmat_knl)
+        k_vmat_reduce = None
         if vmat_mode == 'radial_precomp':
-            k_vmat.set_args(buf_coords4, buf_atom_coords_h, buf_rad_val, buf_rad_dr,
-                            buf_radial_l_h, buf_atom_radial_offset_h, buf_atom_radial_list_h,
-                            buf_atom_ao0, buf_atom_nao, buf_wv, buf_vmat,
-                            np.int32(ncart), np.int32(ngrids), np.int32(natoms))
+            if vmat_grid_splits > 1:
+                k_vmat.set_args(buf_coords4, buf_atom_coords_h, buf_rad_val, buf_rad_dr,
+                                buf_radial_l_h, buf_atom_radial_offset_h, buf_atom_radial_list_h,
+                                buf_atom_ao0, buf_atom_nao, buf_wv, buf_vmat_partial,
+                                np.int32(ncart), np.int32(ngrids), np.int32(natoms), np.int32(vmat_grid_splits))
+                k_vmat_reduce = cl.Kernel(self.prg, 'reduce_split_vmat')
+                k_vmat_reduce.set_args(buf_vmat_partial, buf_vmat, np.int32(ncart), np.int32(vmat_grid_splits))
+            else:
+                k_vmat.set_args(buf_coords4, buf_atom_coords_h, buf_rad_val, buf_rad_dr,
+                                buf_radial_l_h, buf_atom_radial_offset_h, buf_atom_radial_list_h,
+                                buf_atom_ao0, buf_atom_nao, buf_wv, buf_vmat,
+                                np.int32(ncart), np.int32(ngrids), np.int32(natoms))
         else:
             k_vmat.set_scalar_arg_dtypes([None] * 11 + [np.float32, np.float32, np.int32, np.int32, np.int32, np.int32, np.int32])
             k_vmat.set_args(buf_coords4, *hermite_bufs[1:], buf_atom_ao0, buf_atom_nao, buf_wv, buf_vmat, *hermite_params)
         self.otf = {
-            'ao_eval': ao_eval, 'ncart': ncart, 'natoms': natoms, 'vmat_mode': vmat_mode,
+            'ao_eval': ao_eval, 'ncart': ncart, 'natoms': natoms, 'vmat_mode': vmat_mode, 'vmat_grid_splits': vmat_grid_splits,
             'setup_radial_gpu': t_rad,
             'buf_rad_val': buf_rad_val, 'buf_rad_dr': buf_rad_dr,
             'buf_atom_coords_h': buf_atom_coords_h, 'buf_radial_l_h': buf_radial_l_h,
@@ -1380,9 +1397,9 @@ class XCGridPlan:
             'buf_coords4': buf_coords4, 'buf_dm_cart': buf_dm_cart,
             'buf_dm_sph': buf_dm_sph, 'buf_vmat_sph': buf_vmat_sph, 'buf_c2s_scratch': buf_c2s_scratch,
             'buf_atom_ao0': buf_atom_ao0, 'buf_atom_nao': buf_atom_nao,
-            'buf_rho': buf_rho, 'buf_wv': buf_wv, 'buf_vmat': buf_vmat,
+            'buf_rho': buf_rho, 'buf_wv': buf_wv, 'buf_vmat': buf_vmat, 'buf_vmat_partial': buf_vmat_partial,
             'xc_eval_mode': xc_eval_mode, 'xc_gpu_prec': xc_gpu_prec,
-            'k_rho': k_rho, 'k_vmat': k_vmat,
+            'k_rho': k_rho, 'k_vmat': k_vmat, 'k_vmat_reduce': k_vmat_reduce,
             'rho_global': rho_global, 'rho_local': rho_local,
             'vmat_global': vmat_global, 'vmat_local': vmat_local,
             'use_pair_kernels': use_pair,
@@ -1423,12 +1440,19 @@ class XCGridPlan:
         ot_xc = {**ot, 'rho_host': ot['rho32_full'], 'wv_host': ot['wv_full'], 'weight64': ot['weight']}
         nelec, excsum = self._xc_after_rho(ot_xc, ngrids, self.xctype, timing=timing)
 
-        if timing is not None:
-            zero_buffer_gpu(ot['buf_vmat'], ncart * ncart)
-            self.queue.finish()
+        if ot.get('k_vmat_reduce') is not None:
+            profile_kernel(self.queue, ot['k_vmat'], ot['vmat_global'], ot['vmat_local'], timing, 'gpu_vmat_split', 'gpu_vmat_split_cl')
+            profile_kernel(self.queue, ot['k_vmat_reduce'], (round_up(ncart * ncart, TILE),), (TILE,), timing, 'gpu_vmat_reduce', 'gpu_vmat_reduce_cl')
+            if timing is not None:
+                timing['gpu_vmat'] = timing.get('gpu_vmat_split', 0.0) + timing.get('gpu_vmat_reduce', 0.0)
+                timing['gpu_vmat_cl'] = timing.get('gpu_vmat_split_cl', 0.0) + timing.get('gpu_vmat_reduce_cl', 0.0)
         else:
-            zero_buffer_gpu(ot['buf_vmat'], ncart * ncart)
-        profile_kernel(self.queue, ot['k_vmat'], ot['vmat_global'], ot['vmat_local'], timing, 'gpu_vmat', 'gpu_vmat_cl')
+            if timing is not None:
+                zero_buffer_gpu(ot['buf_vmat'], ncart * ncart)
+                self.queue.finish()
+            else:
+                zero_buffer_gpu(ot['buf_vmat'], ncart * ncart)
+            profile_kernel(self.queue, ot['k_vmat'], ot['vmat_global'], ot['vmat_local'], timing, 'gpu_vmat', 'gpu_vmat_cl')
 
         t0 = _time.perf_counter()
         _gpu_vmat_cart_to_sph(buf_c2s, ot['buf_vmat'], ot['buf_c2s_scratch'], ot['buf_vmat_sph'], nao, ncart)
@@ -1486,7 +1510,7 @@ class XCGridPlan:
                 buf.release()
         ot = getattr(self, 'otf', None)
         if ot is not None:
-            for key in ('buf_coords4', 'buf_dm_cart', 'buf_dm_sph', 'buf_vmat_sph', 'buf_c2s_scratch', 'buf_rad_val', 'buf_rad_dr', 'buf_atom_ao0', 'buf_atom_nao', 'buf_rho', 'buf_wv', 'buf_vmat', 'buf_nelec_exc', 'buf_reduce0', 'buf_reduce1'):
+            for key in ('buf_coords4', 'buf_dm_cart', 'buf_dm_sph', 'buf_vmat_sph', 'buf_c2s_scratch', 'buf_rad_val', 'buf_rad_dr', 'buf_atom_ao0', 'buf_atom_nao', 'buf_rho', 'buf_wv', 'buf_vmat', 'buf_vmat_partial', 'buf_nelec_exc', 'buf_reduce0', 'buf_reduce1'):
                 buf = ot.get(key)
                 if buf is not None:
                     buf.release()
@@ -1537,13 +1561,13 @@ def nr_rks_precomputed_gto(mol, grids, xc_code, dm, projection='gpu', profile=Fa
     return plan.nr_rks_precomputed_gto(dm, projection=projection, profile=profile)
 
 
-def setup_xc_grid_gpu(mol, grids, xc_code, blk=8192, r0_ang=0.002, du=0.02, rmax_ang=None, xc_eval='gpu', gpu_xc='auto', spline_order='cubic', vmat_mode='otf', **kwargs):
+def setup_xc_grid_gpu(mol, grids, xc_code, blk=8192, r0_ang=0.002, du=0.02, rmax_ang=None, xc_eval='gpu', gpu_xc='auto', spline_order='cubic', vmat_mode='otf', vmat_grid_splits=1, **kwargs):
     '''Pre-SCF setup: compile OpenCL kernels, build Hermite tables, alloc/upload GPU buffers.
 
     Must be called once after grids.build() and before the SCF loop when using GPU XC.
   '''
     plan = get_xc_grid_plan(mol, grids, xc_code, blk=blk)
-    plan.setup_onthefly(r0_ang=r0_ang, du=du, rmax_ang=rmax_ang, xc_eval=xc_eval, gpu_xc=gpu_xc, spline_order=spline_order, vmat_mode=vmat_mode, **kwargs)
+    plan.setup_onthefly(r0_ang=r0_ang, du=du, rmax_ang=rmax_ang, xc_eval=xc_eval, gpu_xc=gpu_xc, spline_order=spline_order, vmat_mode=vmat_mode, vmat_grid_splits=vmat_grid_splits, **kwargs)
     return plan
 
 

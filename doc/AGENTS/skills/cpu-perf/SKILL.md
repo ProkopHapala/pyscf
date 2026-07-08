@@ -261,8 +261,48 @@ Useful metrics: IPC, L1/L2/L3 miss rate, TLB misses, effective memory bandwidth,
 | Good single-thread, poor scaling | False sharing, NUMA, oversubscription | Pad accumulators, first-touch, thread pinning |
 | OpenMP overhead dominates | Too many fork/join | Persistent parallel region |
 
+## Repo-specific: PySCF CPU smallDFT (grid XC arc)
+
+Validated on benzene PBE 6-31g (`nao=66`, `ngrids≈144k`). Full numbers: `doc/CPU_benchmark.md`; distilled lessons: `doc/CPU_optimixation_experience.md`.
+
+### Problem shape
+
+Grid XC is **memory-bandwidth bound**: stream χ `(ngrids, nao)` F-contiguous; reuse DM in cache; parallel axis is **grid index `g`**, not atoms or Python threads.
+
+### Profiling (MUST for this repo)
+
+Three levels — run all after each change:
+
+1. **Parity + sub-task scaling:** `expamples_prokop/test_small_dft.py` (`--rho`, C vmat)
+2. **XC waterfall:** `pyscf.smallDFT.profile_xc_bottleneck`
+3. **Full SCF cycle (Amdahl):** `expamples_prokop/profile_scf_cycle.py` — real `mf.kernel()`, init vs cycle columns; not `--manual`
+
+Patch **`RHF.get_jk`** for J timing (RKS inherits RHF). Set `OPENBLAS_NUM_THREADS=1`; authoritative OMP via `lib.num_threads(N)`.
+
+If `perf_event_paranoid` blocks hardware counters, use wall time + GCC `-fopt-info-vec` + cProfile (`--profile`).
+
+### Structural fixes that worked
+
+1. **Grid OpenMP tiles** — private ρ writes; private `V_t` + reduction for vmat (no hot-loop atomics).
+2. **Keep libcint F-layout** — BLAS `lda=ngrids` on tiles; do not transpose χ at the Python boundary.
+3. **Stride-1 inner loop over `g`** — AO outer, grid inner; not `ddot` per point with stride `ngrids`.
+4. **F-order tile buffers** — `dgemm("T","N")` for vmat, not `("T","T")` on C-order tiles.
+5. **AO cache** — `GridWorkspace.eval_ao()` once per geometry (~4× cycle win vs ref).
+
+### False premises (benchmark-disproved)
+
+- Python `ThreadPoolExecutor` over grid tiles scales (caps ~2×; use C/OpenMP).
+- Bigger `TILE` always helps (512 optimal for benzene; 2048 slower @8 CPU).
+- Coulomb J is next bottleneck for benzene 6-31g (incremental J ~2 ms; XC ~26 ms/cycle).
+- `eval_ao` scales with more CPUs (flat ~55–66 ms; libcint serial on grid axis).
+- Hand-rolled `get_veff` timing equals real kernel (misses `RHF.get_jk`, wrong `energy_tot`).
+
+### Open issues
+
+Fuse ρ+PBE+vmat in one χ pass; grid-parallel `eval_gto`; preallocated C scratch (no malloc in hot path); auto-attach `GridWorkspace` in `patch.enable()`.
+
 ## Related Skills
 
 - skill:`python-perf` — Python harness overhead, NumPy temporaries, when to escape to compiled code
-- skill:`gpu-optimize` — GPU-specific optimization (tiling, local memory, atomics)
+- skill:`gpu-optimize` — GPU-specific optimization (tiling, local memory, atomics); same physics, different parallel axis
 - skill:`numerical-parity` — validate optimized path against reference

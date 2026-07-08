@@ -24,8 +24,13 @@ if [[ -n "$OPENBLAS" ]]; then
 else
     BLAS_EXTRA=(-lopenblas)
 fi
+TILE_FLAG=()
+if [[ -n "${SMALLDFT_TILE:-}" ]]; then
+    TILE_FLAG=(-DTILE="$SMALLDFT_TILE")
+fi
 gcc -shared -fPIC -O3 -fopenmp -std=c99 \
     -I"$INC" \
+    "${TILE_FLAG[@]}" \
     "$SRC" -o "$OUT" \
     -L"$LIBDIR" -lnp_helper -Wl,-rpath,"$LIBDIR" -lgomp \
     "${BLAS_EXTRA[@]}"

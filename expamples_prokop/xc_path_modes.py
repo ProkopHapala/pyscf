@@ -1,6 +1,6 @@
 '''xc_path_modes.py — SSOT for OpenCL XC execution path labels used in benchmarks.
 
-Maps scan CLI keys (cpu, gpu_otf, gpu_coalesced, gpu_radial, gpu_gto, gpu_full) to
+Maps scan CLI keys (cpu, gpu_otf, gpu_coalesced, gpu_radial, gpu_gto, gpu_full, gpu_otf_radial_vmat, gpu_otf_radial_vmat_splitk) to
 gpu_profiles.py presets, kernel names, and plot colors. gpu_full shares ρ/vmat kernels with
 gpu_otf; differs only in GPU J and conv_tol 1e-6 — document this when interpreting scan scatter.
 '''
@@ -52,6 +52,15 @@ XC_PATH_MODES = {
         'ao_setup': 'Hermite tables + build_radial_on_grid_tiled at setup',
         'scf_tol': '1e-8',
     },
+    'gpu_otf_radial_vmat_splitk': {
+        'profile': 'production_otf_radial_vmat_splitk',
+        'short': 'OTF ρ + split-K vmat',
+        'rho': 'rho_gga_tiled — OTF Hermite',
+        'vmat': 'vmat_gga_radial_precomp_pair_splitk + reduce_split_vmat',
+        'j': 'CPU RI-J',
+        'ao_setup': 'Hermite tables + radial R,dR; WGS=128 compile for split-K',
+        'scf_tol': '1e-8',
+    },
     'gpu_gto': {
         'profile': 'production_gto_exact',
         'short': 'Exact GTO χ',
@@ -76,6 +85,7 @@ MODE_COLORS = {
     'cpu': '#1f77b4', 'gpu_otf': '#ff7f0e', 'gpu_coalesced': '#9467bd',
     'gpu_radial': '#d62728', 'gpu_gto': '#8c564b', 'gpu_full': '#2ca02c',
     'gpu_otf_radial_vmat': '#17becf',
+    'gpu_otf_radial_vmat_splitk': '#bcbd22',
 }
 
 SCAN_MODE_KEYS = ['cpu', 'gpu_otf', 'gpu_coalesced', 'gpu_radial', 'gpu_gto', 'gpu_full']

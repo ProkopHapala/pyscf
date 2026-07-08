@@ -431,6 +431,56 @@ Record per kernel: time, global/local size, launches, H↔D bytes, approx bytes 
 | Worse after adding `__local` | Insufficient reuse / occupancy | Remove local copy or shrink tile |
 | Many tiny kernels | Launch overhead | Fuse, device-side loop, batch |
 
+## Repo-specific: PySCF OpenCL XC (benzene arc)
+
+Validated on small molecules (benzene `nao≈114`). Full numbers: `doc/GPU_benchmark.md`; distilled lessons: `doc/GPU_optimixation_experience.md`.
+
+### Profiling (MUST for this repo)
+
+- Queue: `PROFILING_ENABLE` in `pyscf/OpenCL/__init__.py:init_device`.
+- Stage wall: `queue.finish()` + `perf_counter` (`gpu_timing.py`).
+- Kernel CL: `clGetEventProfilingInfo` → `plan.last_timing['gpu_*_cl']`.
+- Do **not** trust async wall without drain. Driver: `expamples_prokop/profile_xc_stages_benzene.py`.
+
+### Small-molecule parallelism (Type B)
+
+ρ is **grid-outer** (thousands of WGs); vmat tiled was **atom-outer** (tens of WGs) with a **serial grid loop inside each WG** — dominant structural bug, not inner-loop arithmetic.
+
+Fix order that worked:
+
+1. **Setup precompute + gather** — radial `R,dR[ir,g]` at setup; vmat hot loop gathers (no Hermite).
+2. **Split-K** — shard grid dimension → partial vmat + device reduce (`vmat_grid_splits`).
+3. **Hybrid pipeline** — best kernel per stage (OTF ρ + radial/split-K vmat).
+4. **Tile tune** — only after structure is right.
+
+### Tile-parameter sweep (coupled lattice)
+
+Knobs `{NPTILE, NATILE, WGS_VMAT, splits}` are power-of-2 and coupled (`WGS ≥ NPTILE×NATILE`; tiles trade `__local` vs occupancy).
+
+**Do not** brute-force full Cartesian product. Use **1-neighborhood coordinate descent**:
+
+- **Axis:** one parameter ± one ×2/÷2 step.
+- **Diagonal:** two parameters ± one step (often opposite: `NPTILE×2, WGS÷2`).
+
+Tool: `expamples_prokop/sweep_splitk_tiles.py --neighbor --seed NPTILE,NATILE,WGS,splits`.
+
+### Profile-specific compile flags
+
+`WGS_VMAT=128` won for split-K pair vmat but **regressed OTF tiled vmat ~2×** as a global default. Apply via `apply_gpu_profile` → `_ensure_splitk_tile_config()`, not `tile_config.py` default alone.
+
+### False premises (benchmark-disproved)
+
+- Quintic “half nodes” → faster **per SCF cycle** (memory-equivalent `du`; setup wins, cycle ≈ cubic).
+- ρ is the bottleneck (vmat was 3–4× ρ until remap).
+- Larger WGS always better (256 worse than 128 for pair fill).
+- Fuse PBE into ρ (PBE ~0.3 ms).
+
+### Pitfalls
+
+- OpenCL buffer refs must live on Python plan object — GC → `INVALID_MEM_OBJECT`.
+- Parity gate every sweep point: `|vxc − CPU| < 1e-4`.
+- Benzene-tuned tiles may not transfer — re-run `--neighbor` on other molecules.
+
 ## Related Skills
 
 - skill:`gpu-debug` — barrier deadlocks, CPU↔GPU tracing, gated debug macros

@@ -103,9 +103,9 @@ Or full PySCF cmake: `add_subdirectory(smalldft)` in `pyscf/lib/CMakeLists.txt`.
 | `SMALL_rho_lda` | ρ(g) = χᵀ DM χ; OpenMP over grid tiles |
 | `SMALL_rho_gga` | GGA ρ + ∇ρ; one `DM@χ₀` GEMM per tile, hermi=1 convention |
 | `SMALL_vmat_lda` | V += Σ_g wv(g) χᵀ χ; private `V_t` + critical reduce |
-| `SMALL_vmat_gga` | V += χ₀ᵀ aow; `aow = Σ_c wv_c χ_c`; hermi `V += Vᵀ` via temp buffer |
+| `SMALL_vmat_gga` | V += χ₀ᵀ aow; F-order tile `aow = Σ_c wv_c χ_c`; hermi `V += Vᵀ` via temp buffer |
 
-Tile size `TILE=512`. ρ/vmat use strided `dgemm` + `ddot`; vmat accumulates in Fortran layout then transposes into C-order `vmat`.
+Tile size `TILE=512` (build-time override: `SMALLDFT_TILE=1024 pyscf/lib/smalldft/build.sh`). ρ/vmat use strided `dgemm`; scalar tile loops are ordered as AO outer / grid inner so the hot inner loop is stride-1 over grid points. `TILE=1024/2048` was slower for benzene 6-31g after the stride-1 rewrite.
 
 ## Parity
 
@@ -125,7 +125,7 @@ from pyscf.smallDFT import profile_xc_bottleneck, profile_compare
 profile_xc_bottleneck('benzene', nthreads=8)  # ρ / libxc / vmat breakdown
 ```
 
-Benchmark tables: `/home/prokop/git/pyscf/doc/CPU_benchmark.md`
+Benchmark tables: `/home/prokop/git/pyscf/doc/CPU_benchmark.md` (includes one-SCF-cycle Amdahl profile)
 
 ## Design decisions
 
@@ -145,6 +145,7 @@ Benchmark tables: `/home/prokop/git/pyscf/doc/CPU_benchmark.md`
 
 ## Related docs
 
+- Lessons learned: `/home/prokop/git/pyscf/doc/CPU_optimixation_experience.md` — strategies, caveats, false premises, generalization
 - Plan / analysis chat: `/home/prokop/git/pyscf/doc/CPU_small_DFT.chat.md`
 - Benchmarks: `/home/prokop/git/pyscf/doc/CPU_benchmark.md`
 - OpenCL analogue: `/home/prokop/git/pyscf/doc/OpenCL_rho_vmat_how_it_works.md`

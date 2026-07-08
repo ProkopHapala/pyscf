@@ -11,9 +11,9 @@ TILE = 16
 
 
 class OpenCLAOHermiteEvaluator:
-    def __init__(self, mol, r0_ang=0.01, du=0.02, rmax_ang=8.0, midpoint_fit=True):
+    def __init__(self, mol, r0_ang=0.01, du=0.02, rmax_ang=8.0, midpoint_fit=True, spline_order='cubic'):
         self.mol = mol
-        self.plan = MappedHermiteRadialBasis(mol, r0_ang=r0_ang, du=du, rmax_ang=rmax_ang, midpoint_fit=midpoint_fit)
+        self.plan = MappedHermiteRadialBasis(mol, r0_ang=r0_ang, du=du, rmax_ang=rmax_ang, midpoint_fit=midpoint_fit, spline_order=spline_order)
         self.ctx = get_ctx()
         self.queue = get_queue()
         self.prg = get_prg()
@@ -79,7 +79,7 @@ class OpenCLAOHermiteEvaluator:
             self.buf_atom_radial_offset, self.buf_atom_radial_list,
             self.buf_cart,
             np.float32(self.plan.r0), np.float32(self.plan.du),
-            np.int32(self.plan.nrad), np.int32(self.plan.ncart), np.int32(ngrids), np.int32(self.natoms)
+            np.int32(self.plan.nrad), np.int32(self.plan.ncart), np.int32(ngrids), np.int32(self.natoms), np.int32(self.plan.spline_order_code)
         )
         return self.buf_cart, ngrids
 
@@ -114,7 +114,7 @@ class OpenCLAOHermiteEvaluator:
             self.buf_atom_radial_offset, self.buf_atom_radial_list,
             self.buf_cart_deriv[0], self.buf_cart_deriv[1], self.buf_cart_deriv[2], self.buf_cart_deriv[3],
             np.float32(self.plan.r0), np.float32(self.plan.du),
-            np.int32(self.plan.nrad), np.int32(self.plan.ncart), np.int32(ngrids), np.int32(self.natoms)
+            np.int32(self.plan.nrad), np.int32(self.plan.ncart), np.int32(ngrids), np.int32(self.natoms), np.int32(self.plan.spline_order_code)
         )
         return self.buf_cart_deriv, ngrids
 
@@ -158,7 +158,7 @@ class OpenCLAOHermiteEvaluator:
             self.buf_atom_radial_offset, self.buf_atom_radial_list,
             self.buf_cart_deriv[0], self.buf_cart_deriv[1], self.buf_cart_deriv[2], self.buf_cart_deriv[3],
             np.float32(self.plan.r0), np.float32(self.plan.du),
-            np.int32(self.plan.nrad), np.int32(self.plan.ncart), np.int32(ngrids), np.int32(self.natoms)
+            np.int32(self.plan.nrad), np.int32(self.plan.ncart), np.int32(ngrids), np.int32(self.natoms), np.int32(self.plan.spline_order_code)
         )
         return self.buf_cart_deriv, ngrids
 
@@ -198,7 +198,7 @@ class OpenCLAOHermiteEvaluator:
             buf_coords4, self.buf_atom_coords, self.buf_radial_atom, self.buf_rad_node,
             buf_rad_val, buf_rad_dr,
             np.float32(self.plan.r0), np.float32(self.plan.du),
-            np.int32(self.plan.nrad), np.int32(nradial), np.int32(ngrids)
+            np.int32(self.plan.nrad), np.int32(nradial), np.int32(ngrids), np.int32(self.plan.spline_order_code),
         )
         self.queue.finish()
 

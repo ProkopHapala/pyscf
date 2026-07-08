@@ -141,14 +141,28 @@ Not a separate “path” — applies on top of any variant above.
 | `cpu_reference` | — | — | — | CPU | CPU | 1e-8 | 1e-5 | 0 (ref) | reference |
 | `debug_compare` | OTF | — | — | gpu | both | 1e-8 | 1e-5 | ~3e-6 | debug, max_cycle=5 |
 | `debug_xc_libxc` | precomp | coalesced | auto | **cpu** | CPU | 1e-8 | 1e-5 | ~3e-6 | converges |
-| **`production_otf`** | OTF | — | — | gpu | CPU | 1e-8 | 1e-5 | ~3e-6 | **default production** |
+| **`production_otf`** | OTF | — | — | gpu | CPU | 1e-8 | 1e-5 | ~3e-5 | default OTF (ρ+vmat Hermite) |
+| **`production_otf_radial_vmat`** | OTF | — | — | gpu | CPU | 1e-8 | 1e-5 | ~3e-5 | **fastest per-cycle** — OTF ρ + radial vmat |
+| `production_otf_quintic` | OTF | — | — | gpu | CPU | 1e-8 | 1e-5 | ~3e-5 | quintic spline; half setup table |
 | `production_coalesced` | precomp | coalesced | auto | gpu | CPU | 1e-8 | 1e-5 | ~3e-6 | small/fixed geom |
 | `production_radial` | precomp | radial | hermite_gpu | gpu | CPU | 1e-8 | 1e-5 | ~3e-6 | low χ memory |
 | `production_gto_exact` | precomp | coalesced | **cpu** | gpu | CPU | 1e-8 | 1e-5 | ~2.6e-6 | small mols only |
 | **`fast_full_gpu`** | OTF | — | — | gpu | **GPU** | **1e-6** | **1e-4** | ~8e-6/veff | ~7e-5 Ha (~0.04 kcal/mol) |
 | `legacy_tiled_rowmajor` | precomp | tiled | auto | gpu | CPU | 1e-8 | 1e-5 | ~3e-6 | use coalesced instead |
 
-**Default:** `production_otf`.
+**Default:** `production_otf` (general). **Fastest XC per cycle (benzene):** `production_otf_radial_vmat` — see `doc/GPU_benchmark.md`.
+
+### Hybrid OTF ρ + radial vmat
+
+```python
+apply_gpu_profile(mf, 'production_otf_radial_vmat')
+# equivalent manual:
+mf.setup_gpu(xc_path='onthefly', xc_eval='gpu', vmat_mode='radial_precomp')
+```
+
+- ρ: `rho_gga_tiled` (OTF Hermite, same as `production_otf`)
+- vmat: `vmat_gga_radial_precomp_pair` (`R,dR` gathered at setup via `build_radial_on_grid_gpu`)
+- Requires GGA; radial metadata buffers must stay alive in `plan.otf` (see topical audit)
 
 ### Accuracy notes (benzene cc-pVDZ, grid level 3, PBE, DF)
 
@@ -172,12 +186,12 @@ flowchart TD
     D -->|no| F{chi fits in GPU RAM?}
     F -->|yes, want fastest precomp rho| G[production_coalesced]
     F -->|tight on RAM| H[production_radial]
-    C --> I{Need max speed per cycle?}
+    C --> I{Optimize veff XC speed?}
     G --> I
     H --> I
-    I -->|yes, ~0.04 kcal/mol OK| J[fast_full_gpu]
-    I -->|no, tight energy| K[keep CPU DF J + default tol]
-    C --> K
+    I -->|yes, same accuracy| L[production_otf_radial_vmat]
+    I -->|yes, relaxed SCF tol OK| J[fast_full_gpu]
+    I -->|no| K[keep CPU DF J + default tol]
 ```
 
 ---
@@ -196,6 +210,9 @@ mf.kernel()
 # Precomp coalesced
 mf.setup_gpu(xc_path='precomputed', fused='coalesced', ao_proj='auto', xc_eval='gpu')
 
+# Hybrid OTF rho + radial vmat (fastest per-cycle XC on benzene)
+mf.setup_gpu(xc_path='onthefly', xc_eval='gpu', vmat_mode='radial_precomp')
+
 # Full GPU with relaxed SCF
 mf.with_df.backend = 2
 mf.conv_tol, mf.conv_tol_grad = 1e-6, 1e-4
@@ -204,11 +221,25 @@ mf.setup_gpu(profile='fast_full_gpu')
 
 ### Stage timing
 
+Per-stage wall + OpenCL event times (`plan.last_timing`):
+
+```python
+plan = mf._xc_gpu_plan
+_, _, vxc = plan.nr_rks_hermite_onthefly(dm, profile=True)
+print(plan.last_timing)  # gpu_rho, gpu_rho_cl, gpu_vmat, gpu_vmat_cl, gpu_total_cl, ...
+```
+
+Benzene benchmark table: `expamples_prokop/profile_xc_stages_benzene.py` → `doc/GPU_benchmark.md`.
+
+SCF-accumulated timers (coarser):
+
 ```python
 mf._gpu_profile = True
 mf.kernel()
 print(mf._gpu_timing_acc)  # rho, xc, vmat, sync per get_veff
 ```
+
+**Profiling rules:** queue must use `PROFILING_ENABLE`; always `queue.finish()` before wall clock; use `gpu_*_cl` keys for true kernel time. cProfile under-reports GPU work.
 
 ---
 
@@ -220,7 +251,8 @@ print(mf._gpu_timing_acc)  # rho, xc, vmat, sync per get_veff
 | `expamples_prokop/test_opencl_xc_e2e_mols.py` | Speed + accuracy, arbitrary XYZ |
 | `expamples_prokop/test_opencl_xc_cpu_threads.py` | CPU thread scaling vs GPU |
 | `expamples_prokop/profile_gpu_scf.py` | Full converged SCF, cProfile + timers |
-| `expamples_prokop/test_opencl_xc_scf.py` | All paths matrix (legacy) |
+| `expamples_prokop/profile_xc_stages_benzene.py` | Per-stage wall vs CL timing; hybrid path comparison |
+| `expamples_prokop/test_quintic_rho_otf.py` | Quintic vs cubic OTF ρ parity |
 
 ```bash
 PYTHONPATH=/home/prokop/git/pyscf OMP_NUM_THREADS=15 python3 -u expamples_prokop/profile_gpu_scf.py --mode cpu gpu_otf gpu_full
@@ -234,7 +266,7 @@ PYTHONPATH=/home/prokop/git/pyscf OMP_NUM_THREADS=15 python3 -u expamples_prokop
 - `gpu_full` + `conv_tol_grad=1e-5`: DIIS stuck at ‖g‖~1e-4 (f32 XC).
 - `ao_proj='cpu'` on pentacene-scale χ: multi-GB upload; tests skip >4 GB.
 - Hermite ∇ρ pointwise error ~1e-4; PBE vxc integration still ~1e-6.
-- cProfile under-reports GPU time; use `_gpu_timing_acc`.
+- cProfile under-reports GPU time; use `plan.last_timing` (profile=True) or `_gpu_timing_acc`.
 
 ---
 
@@ -245,6 +277,8 @@ See **Path naming glossary** in `doc/rho_vmat_vxc_GPU_optimization.report.md` §
 | Report label | Profile equivalent |
 |--------------|-------------------|
 | `gpu_hermite_otf` | `production_otf` |
+| `gpu_otf_radial_vmat` | `production_otf_radial_vmat` |
+| `gpu_otf_quintic` | `production_otf_quintic` |
 | `gpu_precomp_coalesced` | `production_coalesced` |
 | `gpu_precomp_radial` | `production_radial` |
 | `gpu_precomp_tiled` | `legacy_tiled_rowmajor` |

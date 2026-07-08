@@ -58,7 +58,7 @@ GPU_PROFILES = {
     },
     'production_otf': {
         'label': 'production_otf',
-        'description': 'Hermite OTF rho/vmat + GPU PBE; CPU DF J. Best default for medium/large molecules.',
+        'description': 'Hermite OTF rho/vmat + GPU PBE; CPU DF J. Default for medium/large molecules. For faster veff XC use production_otf_radial_vmat.',
         'mf_backend': 2,
         'df_backend': 1,
         'xc_path': 'onthefly',
@@ -67,6 +67,34 @@ GPU_PROFILES = {
         'accuracy': {
             'vxc_max_vs_cpu': '~3e-6',
             'energy_note': 'Converges; final E within ~1e-6 Ha of CPU.',
+            'converges_default_scf': True,
+        },
+    },
+    'production_otf_quintic': {
+        'label': 'production_otf_quintic',
+        'description': 'Hermite OTF quintic spline (2× coarser du, analytic GTO d²R); GPU PBE; CPU DF J.',
+        'mf_backend': 2,
+        'df_backend': 1,
+        'xc_path': 'onthefly',
+        'setup_kw': {'xc_eval': 'gpu', 'gpu_xc': 'auto', 'spline_order': 'quintic'},
+        'scf_kw': {'conv_tol': 1e-8, 'conv_tol_grad': 1e-5},
+        'accuracy': {
+            'vxc_max_vs_cpu': '~3e-6 (compare vs cubic OTF)',
+            'energy_note': 'Half radial table size vs cubic; parity test expamples_prokop/test_quintic_rho_otf.py',
+            'converges_default_scf': True,
+        },
+    },
+    'production_otf_radial_vmat': {
+        'label': 'production_otf_radial_vmat',
+        'description': 'OTF Hermite rho + radial-precomp vmat (R,dR gather); GPU PBE; CPU DF J.',
+        'mf_backend': 2,
+        'df_backend': 1,
+        'xc_path': 'onthefly',
+        'setup_kw': {'xc_eval': 'gpu', 'gpu_xc': 'auto', 'vmat_mode': 'radial_precomp'},
+        'scf_kw': {'conv_tol': 1e-8, 'conv_tol_grad': 1e-5},
+        'accuracy': {
+            'vxc_max_vs_cpu': '~3e-6',
+            'energy_note': 'Hybrid: OTF rho_gga_tiled + vmat_gga_radial_precomp_pair',
             'converges_default_scf': True,
         },
     },

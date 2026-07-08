@@ -4,7 +4,7 @@
 Each configuration recompiles kernels.cl with -D flags (see pyscf/OpenCL/tile_config.py).
 
 Usage:
-  PYTHONPATH=/home/prokophapala/git/pyscf OMP_NUM_THREADS=1 python3 expamples_prokop/sweep_opencl_tiles.py
+  PYTHONPATH=/home/prokop/git/pyscf OMP_NUM_THREADS=1 python3 expamples_prokop/sweep_opencl_tiles.py
   PYTHONPATH=... python3 expamples_prokop/sweep_opencl_tiles.py --quick   # fewer combos
 """
 import argparse
@@ -66,7 +66,8 @@ def main():
     ap.add_argument('--quick', action='store_true', help='smaller search grid')
     args = ap.parse_args()
 
-    mol = gto.M(atom=read_xyz('/home/prokophapala/git/pyscf/data/xyz/benzene.xyz'), basis='ccpvdz', verbose=0)
+    _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    mol = gto.M(atom=read_xyz(os.path.join(_REPO, 'data', 'xyz', 'benzene.xyz')), basis='ccpvdz', verbose=0)
     grids = dft.gen_grid.Grids(mol)
     grids.level = 3
     grids.build()

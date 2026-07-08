@@ -76,7 +76,7 @@ def init_device(device_name=None, quiet=False, tile_config=None, force_rebuild=F
         raise RuntimeError('No OpenCL device found')
 
     _ctx = cl.Context([selected_device])
-    _queue = cl.CommandQueue(_ctx)
+    _queue = cl.CommandQueue(_ctx, properties=cl.command_queue_properties.PROFILING_ENABLE)
 
     with open(_PBE_FILE, 'r') as f:
         pbe_src = f.read()

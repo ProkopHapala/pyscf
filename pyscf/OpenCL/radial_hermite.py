@@ -1,6 +1,8 @@
 import numpy as np
 from pyscf.data import nist
 
+from .hermite_spline import chain_rule_du, eval_radial_d2r, memory_equivalent_du
+
 
 ANG = nist.BOHR
 SP_CART_FACTOR = {0: 0.282094791773878143, 1: 0.488602511902919921}
@@ -26,6 +28,12 @@ def _eval_radial_dr(r, expn, coeff):
     return ((-2.0 * r[:, None] * expn[None, :]) * e).dot(coeff)
 
 
+def _eval_radial_d2r(r, expn, coeff):
+    e = np.exp(-np.outer(r * r, expn))
+    a = expn[None, :]
+    return ((-2.0 * a + 4.0 * r[:, None] ** 2 * a * a) * e).dot(coeff)
+
+
 def _midpoint_fit(y, d, h, ymid):
     b = 8.0 / h[:, None] * (ymid - 0.5 * (y[:-1] + y[1:]))
     out = d.copy()
@@ -42,12 +50,17 @@ def _midpoint_fit(y, d, h, ymid):
 
 
 class MappedHermiteRadialBasis:
-    def __init__(self, mol, r0_ang=0.01, du=0.02, rmax_ang=8.0, midpoint_fit=True):
+    def __init__(self, mol, r0_ang=0.01, du=0.02, rmax_ang=8.0, midpoint_fit=True, spline_order='cubic'):
         self.mol = mol
         self.r0 = float(r0_ang) / ANG
-        self.du = float(du)
+        self.spline_order = str(spline_order).lower()
+        if self.spline_order not in ('cubic', 'quintic'):
+            raise ValueError(f'spline_order must be cubic or quintic, got {spline_order!r}')
+        du_in = float(du)
+        self.du = memory_equivalent_du(du_in) if self.spline_order == 'quintic' else du_in
+        self.du_cubic_ref = du_in
         self.rmax = float(rmax_ang) / ANG
-        self.midpoint_fit = bool(midpoint_fit)
+        self.midpoint_fit = bool(midpoint_fit) and self.spline_order == 'cubic'
         self._build()
 
     def _build(self):
@@ -60,6 +73,7 @@ class MappedHermiteRadialBasis:
         nctr_max = max(mol.bas_nctr(ib) for ib in range(nshell))
         self.values = np.zeros((nshell, nctr_max, self.nrad), dtype=np.float32)
         self.du_values = np.zeros_like(self.values)
+        self.d2u_values = np.zeros_like(self.values)
         self.dy_values = np.zeros_like(self.values)
         self.shell_nctr = np.empty(nshell, dtype=np.int32)
         self.shell_l = np.empty(nshell, dtype=np.int32)
@@ -75,6 +89,10 @@ class MappedHermiteRadialBasis:
             y = _eval_radial(self.r, expn, coeff)
             dy_dr = _eval_radial_dr(self.r, expn, coeff)
             dy_du = dy_dr * (self.r + self.r0)[:, None]
+            if self.spline_order == 'quintic':
+                d2y_dr2 = _eval_radial_d2r(self.r, expn, coeff)
+                _, d2y_du2 = chain_rule_du(self.r, self.r0, dy_dr, d2y_dr2, map_b=1.0)
+                self.d2u_values[ib, :nctr] = d2y_du2.T.astype(np.float32)
             if self.midpoint_fit:
                 um = self.u[:-1] + 0.5 * self.du
                 rm = self.r0 * np.expm1(um)
@@ -95,6 +113,7 @@ class MappedHermiteRadialBasis:
         self.nradial = int(self.shell_nctr.sum())
         self.radial_values = np.empty((self.nradial, self.nrad), dtype=np.float32)
         self.radial_du_values = np.empty_like(self.radial_values)
+        self.radial_d2u_values = np.empty_like(self.radial_values)
         self.radial_dy_values = np.empty_like(self.radial_values)
         self.radial_l = np.empty(self.nradial, dtype=np.int32)
         self.radial_atom = np.empty(self.nradial, dtype=np.int32)
@@ -107,14 +126,18 @@ class MappedHermiteRadialBasis:
                 self.shell_ctr_ir[ib * nctr_max + ic] = ir
                 self.radial_values[ir] = self.values[ib, ic]
                 self.radial_du_values[ir] = self.du_values[ib, ic]
+                self.radial_d2u_values[ir] = self.d2u_values[ib, ic]
                 self.radial_dy_values[ir] = self.dy_values[ib, ic]
                 self.radial_l[ir] = l
                 self.radial_atom[ir] = self.shell_atom[ib]
                 self.radial_cart0[ir] = self.shell_cart0[ib] + ic * ncart_l
                 ir += 1
-        self.radial_nodes = np.empty((self.nradial, self.nrad, 2), dtype=np.float32)
+        self.radial_nodes = np.zeros((self.nradial, self.nrad, 4), dtype=np.float32)
         self.radial_nodes[:, :, 0] = self.radial_values
         self.radial_nodes[:, :, 1] = self.radial_du_values
+        if self.spline_order == 'quintic':
+            self.radial_nodes[:, :, 2] = self.radial_d2u_values
+        self.spline_order_code = 1 if self.spline_order == 'quintic' else 0
         atom_radial_offset = np.zeros(mol.natm + 1, dtype=np.int32)
         for ir in range(self.nradial):
             atom_radial_offset[self.radial_atom[ir] + 1] += 1
@@ -217,9 +240,16 @@ def build_radial_on_grid(plan, coords):
         y1 = rv[ir, ik + 1].astype(np.float64)
         d0 = du_vals[ir, ik].astype(np.float64)
         d1 = du_vals[ir, ik + 1].astype(np.float64)
-        dy = y1 - y0
-        R = y0 + t * t * (3.0 - 2.0 * t) * dy + t * t1m * t1m * du * d0 + t * t * t1m * du * d1
-        dR_du = (6.0 * t * (1.0 - t) * dy + (3.0 * t - 1.0) * t1m * du * d0 + t * (3.0 * t - 2.0) * du * d1) / du
+        if getattr(plan, 'spline_order', 'cubic') == 'quintic':
+            from .hermite_spline import quintic_eval, quintic_eval_du
+            c0 = plan.radial_d2u_values[ir, ik].astype(np.float64)
+            c1 = plan.radial_d2u_values[ir, ik + 1].astype(np.float64)
+            R = quintic_eval(t, du, y0, y1, d0, d1, c0, c1)
+            dR_du = quintic_eval_du(t, du, y0, y1, d0, d1, c0, c1)
+        else:
+            dy = y1 - y0
+            R = y0 + t * t * (3.0 - 2.0 * t) * dy + t * t1m * t1m * du * d0 + t * t * t1m * du * d1
+            dR_du = (6.0 * t * (1.0 - t) * dy + (3.0 * t - 1.0) * t1m * du * d0 + t * (3.0 * t - 2.0) * du * d1) / du
         rad_val[ir] = R.astype(np.float32)
         rad_dr[ir] = (dR_du / (r + r0)).astype(np.float32)
     return rad_val, rad_dr

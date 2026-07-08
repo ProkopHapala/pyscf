@@ -1,241 +1,440 @@
 ---
 name: gpu-optimize
-description: Optimizing GPU/OpenCL kernel performance — memory hierarchy, gather vs scatter, tiling, auxiliary arrays, local memory reductions, kernel launch overhead
+description: Optimize OpenCL/CUDA kernels — coalesced access, data layout, gather ownership, local-memory tiling, register pressure, launch overhead, profiling
 trigger:
   glob:
     - "**/*.cl"
+    - "**/*.cu"
     - "**/kernels/**/*"
-    - "**/spammm/utils/**/*"
+    - "**/OpenCL/**/*"
+    - "**/*opencl*"
 ---
 
-## Memory Latency & Cache
+## Project Context
 
-- Design around memory latency — coalesced global reads, cache-friendly access patterns
-- Prefer contiguous access patterns; avoid random-access into global memory
-- Use `__attribute__((aligned(16)))` for structs to match cache line boundaries
+Typical workloads in this repo:
 
-## Data Layout & Aligned Types
+- OpenCL kernels (`pyscf/OpenCL/kernels.cl`, PyOpenCL host code)
+- Scientific simulation: DFT grids, AO values, XC integration, molecular forces
+- Many independent atoms, grid points, molecules, replicas, or small matrices
+- Performance-critical paths use `float32`; correctness and debuggability beat clever micro-opts
 
-- Prefer `float4` / `float2` / `int4` — hardware loads 16-byte aligned vectors in single transaction
-- **Avoid structs in kernels** — OpenCL allows them but they cause poor coalescing and padding waste
-- **Structure-of-Arrays (SoA) over Array-of-Structs (AoS)**: separate `float4* pos`, `float4* vel`, `float* charge` — not `struct Atom{ float4 pos; float4 vel; float q; }* atoms`
-- SoA enables coalesced reads: all threads read `pos[i]` from contiguous memory. AoS scatters reads across struct stride.
-- **Pack heterogeneous data into single `float4*` or `int4*`**: e.g. `{x, y, z, type}` in one float4, `{charge, mass, flags, _pad}` in another — one load fetches multiple fields
-- We often use flat `float4*` arrays for positions, velocities, forces — packed as `{x, y, z, w}` where w carries extra scalar data
+Use these rules as strong defaults. Deviate only when profiling shows another design is faster.
 
+## Optimization Workflow (MUST)
+
+1. Preserve a correct reference implementation (CPU or high-precision GPU).
+2. Measure end-to-end; use `clGetEventProfilingInfo` per kernel.
+3. Count launches, host↔device bytes, approximate bytes read/written per output.
+4. Classify bottleneck: launch/sync, bandwidth, latency, compute, divergence, register spill, insufficient parallelism.
+5. Form one explicit hypothesis; change one structural issue.
+6. Validate numerics against reference.
+7. Benchmark representative sizes; keep change only if improvement is meaningful.
+8. Document chosen workgroup size and data layout.
+
+## Optimization Order
+
+Do not tune arithmetic while the kernel is dominated by transfers or launch overhead.
+
+1. Remove unnecessary host↔device transfers.
+2. Remove unnecessary kernel launches.
+3. Fix uncoalesced or random global-memory access.
+4. Reduce total global-memory reads and writes per useful output.
+5. Increase reuse in registers or workgroup-local memory.
+6. Increase independent workgroups (batch replicas/systems).
+7. Reduce register/private-memory pressure.
+8. Reduce divergence and synchronization cost.
+9. Optimize arithmetic and transcendental functions.
+
+## Rules by Strength
+
+### MUST
+
+- Profile before optimizing; keep a reference result.
+- **One owner per output element** — other work-items provide input, not contested writes.
+- Neighboring work-items read neighboring addresses when possible.
+- Persistent GPU buffers — allocate once, reuse across SCF/MD iterations.
+- All work-items in a workgroup must reach every `barrier()` — never return or diverge around a required barrier.
+- No cross-workgroup synchronization inside a normal kernel — use separate kernel launches.
+- Guard global loads/stores at tile boundaries (`row < M`, `gid < n`).
+- Query device and kernel limits before tuning workgroup size.
+
+Query at runtime:
+
+```text
+CL_DEVICE_LOCAL_MEM_SIZE
+CL_DEVICE_MAX_WORK_GROUP_SIZE
+CL_KERNEL_WORK_GROUP_SIZE
+CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE
+CL_KERNEL_LOCAL_MEM_SIZE
+CL_KERNEL_PRIVATE_MEM_SIZE
 ```
-// Bad: AoS — strided access, poor coalescing
-struct Atom { float4 pos; float4 vel; float q; };
-__global struct Atom* atoms;  // each thread reads atoms[i].pos = 48-byte stride
 
-// Good: SoA — coalesced, each field contiguous
-__global float4* pos;   // atoms[i].pos = pos[i], 16-byte stride
-__global float4* vel;   // atoms[i].vel = vel[i]
-__global float*  q;     // atoms[i].q   = q[i]
+### PREFER
 
-// Also good: pack into float4 arrays
-__global float4* pos;   // {x, y, z, type}
-__global float4* props; // {charge, mass, flags, _pad}
+- Gather over scatter; flat contiguous arrays over pointer chasing.
+- Hot/cold field split — load only fields the kernel uses.
+- Reuse loaded values in registers before loading more.
+- Reconstruct cheap values (grid coords from index) instead of materializing large arrays.
+- Tree reduction in workgroup-local memory over global atomics for large reductions.
+- Batch independent systems until GPU has many runnable workgroups.
+
+### CONSIDER / BENCHMARK
+
+- `float4` / vector loads — only when all components are used and alignment is right.
+- SoA vs AoS vs AoSoA — choose by access pattern, not dogma.
+- Workgroup-local memory tiling — only when measured reuse amortizes barriers and resource cost.
+- Atomics vs auxiliary-buffer + assembly vs per-owner recomputation.
+- Kernel fusion — when intermediate stays in registers and pressure stays manageable.
+- `native_*` / relaxed math — under documented accuracy budget.
+- Kahan summation vs tree reduction for parallel accumulations.
+
+## Memory Hierarchy (OpenCL terminology)
+
+Use neutral vocabulary — do not mix CUDA "local memory" (spill space) with OpenCL `__local`:
+
+| Level | OpenCL | Notes |
+|-------|--------|-------|
+| Registers | per-work-item private | fastest |
+| Spill / private arrays | implementation-managed off-chip private memory | slow; not `__local` |
+| Workgroup-shared | `__local` | shared within one workgroup; reduces residency if overused |
+| Device/global | `__global` | GB-scale; ~100–400+ cycles latency |
+| Cache | hardware-managed | coalescing + spatial locality matter |
+
+- Register spills go to **private spill memory**, not into `__local`.
+- Too much `__local` reduces resident workgroups (occupancy) — it does not spill transparently to global.
+- Occupancy is not the goal; enough active work to hide latency without sacrificing registers/local memory unnecessarily.
+
+## Bottleneck Decision Tree
+
+### A: High memory traffic, bandwidth near peak → memory-bound
+
+Reduce bytes per useful output:
+
+- fuse producer + consumer; keep intermediates in registers
+- tile with reuse; recompute cheap values instead of loading
+- procedural grid coords / basis reconstruction
+- hot/cold split; narrow storage (`float` vs `double`, 32-bit indices)
+- compact active elements; eliminate redundant output arrays
+
+Effective bandwidth = bytes transferred / runtime (not inferred from GFLOP/s alone).
+
+### B: Low bandwidth, low compute → access or scheduling problem
+
+Look for: uncoalesced access, random gathers, too few workgroups, dependency chains, divergence, barriers, atomic contention, register spills, serial inner loops, tiny kernels dominated by launch overhead.
+
+### C: High compute utilization → arithmetic-bound
+
+Fewer ops, CSE, algebraic simplification, lower precision under error budget, `native_*` functions, lookup tables vs transcendentals.
+
+### D: Launch- or sync-bound
+
+Batch systems/iterations; fuse adjacent kernels; device-side loops; reduce host round-trips; persistent buffers; avoid readback per iteration.
+
+## Data-Oriented Design
+
+Ask before choosing layout:
+
+1. What is the unit of work?
+2. Which fields does one work-item consume?
+3. Which fields are hot in this kernel?
+4. Who owns each output?
+5. Can objects be reordered or compacted?
+6. Is topology static enough to preprocess?
+
+| Access pattern | Layout |
+|----------------|--------|
+| Neighbors read same field from neighbor objects | **SoA** |
+| One work-item consumes nearly all fields of one object | **AoS** or packed `float4` |
+| Fixed-width SIMD/workgroup blocks | **AoSoA** |
+| Few hot fields in large records | **Hot/cold split** |
+
+```c
+// Hot every kernel
+__global float4 *pos_type;
+__global float4 *force_energy;
+
+// Cold / topology
+__global float4 *atom_params;
+__global int4   *topology;
 ```
 
-## Gather Over Scatter
+- `float3` in OpenCL structs is often 16-byte aligned (not packed 12 bytes).
+- Do not put integer flags into float slots unless documented bit-level encoding.
+- Vector loads (`float4`) help when all components are used; they hurt when only one scalar is needed.
 
-- Prefer "gather" (each thread reads from fixed indices) over "scatter" (each thread writes to arbitrary indices)
-- Scatter requires atomics or serialization; gather is naturally parallel
-- If scatter is unavoidable, use atomic operations sparingly or restructure as gather + reduction
+## Coalesced Global-Memory Access
 
-## Local Memory & Workgroups
+Ideal: `array[get_global_id(0)]` — neighbors access consecutive addresses.
 
-- NVIDIA: 48KB local memory per compute unit (shared across workgroups on same CU)
-- Workgroup size: 32 (warp) minimum, 64/128/256 typical, 1024 max — must be multiple of 32
-- Tune workgroup size to occupancy — too small wastes SMs, too large causes register spilling
-- Maximize shared/local memory usage for data reused across work-items
-- Use `barrier(CLK_LOCAL_MEM_FENCE)` to synchronize local memory access within workgroup
-- Never return early before a barrier (see skill:`gpu-debug` for barrier deadlock patterns)
-- Consider if algorithm needs global reductions — e.g. Jacobi avoids local memory reductions that CG requires
+```c
+// Good
+float4 p = positions[get_global_id(0)];
 
-## Minimize Host-Device Transfers & Kernel Launches
+// Bad when stride is large
+float4 p = positions[get_global_id(0) * stride];
+```
 
-- Avoid unnecessary `clEnqueueReadBuffer`/`clEnqueueWriteBuffer` in hot paths
-- Batch multiple operations on GPU before reading results back
-- Use persistent buffers (allocate once, reuse) — see `spammm/utils/OpenCLBase.py` `try_make_buffers()`
-- Guard allocation with `bTryAllocate` to skip dict creation in hot paths
-- **PyOpenCL kernel launch overhead is large** — minimize number of kernel executions in iterative methods (MD timesteps, Jacobi iterations)
-- Parallelize as much work as possible in a single kernel (broad parallelism) rather than calling many small kernels in sequence
-- Fuse multiple kernel operations into one where possible
+Multidimensional grids: fastest-changing work-item dimension → fastest-changing array index (`ix = get_global_id(0)` for `ix + iy*nx + iz*nx*ny`).
 
-## Branching & Atomics
+Reorder data when cheaper than random reads every step: sort by cell/type, compact active lists, CSR neighbor lists, fixed neighbor slots for bounded valence.
 
-- Avoid divergent branching (warp/workgroup divergence) — all threads should take same path
-- **Avoid atomics especially in OpenCL** — they serialize execution and performance is unpredictable across vendors
-- Prefer reduction trees (see Local Memory Reduction below) or separate kernels over atomic counters
+## Converting Memory-Bound Kernels
 
-## Precision
+```c
+// Reuse in registers
+float4 p = positions[i];
+float3 d = p.xyz - center;
+float r2 = dot(d, d);
+// reuse d, r2 — do not reload positions[i]
 
-- GPU is always single-precision (float32). Use `%f` not `%g` in printf
-- Avoid double precision unless absolutely required — <10x slower on my GPU
-- Be aware of float32 precision limits in accumulation — use Kahan summation or compensated reduction if needed
+// Several results per load
+float e = native_exp(-a * r);
+float e2 = e * e;
+energy = D * (e2 - 2.0f * e);
+force  = 2.0f * D * a * (e2 - e);
 
-## Thread Saturation
+// Reconstruct coords — do not store full 3D grid unless reuse justifies it
+int ix = get_global_id(0);
+float x = x0 + ix * dx;
+```
 
-- Typical GPU has ~10k threads — ensure problem size saturates this
-- If problem is too small, GPU is underutilized — consider running multiple systems/replicas in parallel
-- If workgroups exceed thread count, they queue — balance workgroup count vs size
+Fusion removes buffer + write + read + launch — but split again if fusion causes register spilling, divergence, or I-cache pressure.
 
-## Profiling
+## Gather Instead of Scatter
 
-- Use `clGetEventProfilingInfo` to measure kernel execution time
-- Identify bottlenecks: memory-bound vs compute-bound kernels
-- Compare actual GFLOPs/s to theoretical peak to assess optimization headroom
+> Avoid **uncontrolled write contention**. Atomics are one implementation, not automatically wrong — benchmark against alternatives.
+
+### Pattern 1: One owner per atom (gather neighbors)
+
+```c
+int ia = get_global_id(0);
+float3 f = (float3)(0.0f);
+for (int k = neighborOffset[ia]; k < neighborOffset[ia + 1]; k++) {
+    int ja = neighbors[k];
+    f += pairForce(ia, ja);
+}
+forces[ia] = (float4)(f, 0.0f);
+```
+
+May compute each pair twice (once per endpoint) — usually still better than contended atomics.
+
+### Pattern 2: Interaction buffer + signed assembly
+
+```c
+// Kernel 1: one bond per work-item
+int ibond = get_global_id(0);
+int2 ij = bonds[ibond];
+float3 f = computeBondForce(positions[ij.x], positions[ij.y]);
+bondForce[ibond] = (float4)(f, 0.0f);
+
+// Kernel 2: gather signed contributions — NOT f_i[b]+f_j[b] (that sums to zero!)
+int ia = get_global_id(0);
+float3 f = (float3)(0.0f);
+for (int k = atomBondOffset[ia]; k < atomBondOffset[ia + 1]; k++) {
+    int2 ref = atomBondRefs[k];   // ref.x = bond index, ref.y = sign (+1 or -1)
+    f += convert_float(ref.y) * bondForce[ref.x].xyz;
+}
+forces[ia] = (float4)(f, 0.0f);
+```
+
+### Pattern 3: Fixed neighbor slots (molecular topology)
+
+```c
+int4 ng = neighbors[ia];
+if (ng.x >= 0) f += pairForce(ia, ng.x);
+if (ng.y >= 0) f += pairForce(ia, ng.y);
+if (ng.z >= 0) f += pairForce(ia, ng.z);
+if (ng.w >= 0) f += pairForce(ia, ng.w);
+```
+
+Benchmark atomics when: few contributions per output, low contention, auxiliary buffer traffic dominates.
+
+## Ping-Pong Buffers
+
+Separate src/dst for iterative updates — avoids read-write races.
+
+```c
+__kernel void iterate(__global const float4 *src, __global float4 *dst) {
+    int i = get_global_id(0);
+    dst[i] = update(src, i);
+}
+// Host alternates A→B, B→A each iteration
+```
+
+This is **Jacobi-style** (read all old, write all new). Gauss–Seidel consumes newly updated values and needs a different algorithm.
+
+## Workgroup-Local Memory
+
+Use `__local` only when measured reuse amortizes cooperative load + barriers, and resource cost does not kill residency.
+
+```c
+#define WG 128
+
+__kernel void tiledInteraction(
+    __global const float4 *source, __global float4 *output, const int n)
+{
+    __local float4 tile[WG];
+    int lid = get_local_id(0);
+    int gid = get_global_id(0);
+    float4 acc = (float4)(0.0f);
+
+    for (int i0 = 0; i0 < n; i0 += WG) {
+        int j = i0 + lid;
+        tile[lid] = (j < n) ? source[j] : (float4)(0.0f);
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        int nt = min(WG, n - i0);
+        for (int k = 0; k < nt; k++)
+            acc += interaction(gid, tile[k]);
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (gid < n)
+        output[gid] = acc;
+}
+```
+
+Local-memory rules:
+
+- Collaborative load; barrier after fill; barrier before overwrite.
+- Never `return` before a barrier; never barrier inside divergent branch.
+- Do not copy to `__local` just because it is "faster" — hardware cache may already capture reuse.
+
+### Guarded tiled matmul template
+
+```c
+// row, col, kx, ky from get_global_id; TS = tile size; M, N, K dimensions
+A_tile[ly][lx] = (row < M && kx < K) ? A[row*K + kx] : 0.0f;
+B_tile[ly][lx] = (ky  < K && col < N) ? B[ky*N + col] : 0.0f;
+// ... accumulate ...
+if (row < M && col < N)
+    C[row*N + col] = acc;
+```
+
+## Synchronization
+
+- `barrier(CLK_LOCAL_MEM_FENCE)` synchronizes **one workgroup only** — also orders `__local` visibility.
+- **No global barrier** between workgroups in a normal kernel.
+- Workgroups execute in undefined order.
+- Never communicate between workgroups via global memory without a valid atomic protocol.
+
+```c
+// BAD: early return skips barrier → deadlock
+if (gid >= n) return;
+barrier(CLK_LOCAL_MEM_FENCE);
+
+// GOOD: all threads reach barrier; guard work separately
+bool active = gid < n;
+if (active) { /* load/compute */ }
+barrier(CLK_LOCAL_MEM_FENCE);
+if (active) { /* store */ }
+```
+
+## Register / Private-Memory Pressure
+
+Reduce simultaneous live state:
+
+- fewer accumulators; avoid large per-thread private arrays (`float buf[128]` spills)
+- avoid excessive manual unrolling; avoid giant fused kernels
+- split unrelated phases into separate kernels if profiling shows spills
+- reuse variables when earlier values are dead
+- lexical scopes *may* help compiler shorten lifetimes — not a reliable register-control mechanism
+
+Inspect: `CL_KERNEL_PRIVATE_MEM_SIZE`, compiler resource reports, profiler spill metrics.
+
+## Workgroup Size
+
+Start with `CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE`. Benchmark multiples around 64, 128, 256 subject to kernel max and resource usage.
+
+- NVIDIA: multiples of 32 are typical starting points — not an OpenCL universal rule (AMD wave32/wave64 varies).
+- Small workgroups when: high register use, much `__local` memory, one workgroup per small system.
+- Large workgroups when: lightweight work-items, local reduction benefits, too few workgroups to saturate GPU.
+- For small-matrix kernels, 16–32 work-items handling one independent system may be correct — saturate via many systems.
+
+## GPU Saturation
+
+Provide many more workgroups than compute units for latency-bound kernels.
+
+If one molecule/grid/matrix is too small, batch: multiple molecules, replicas, scan points, orientations, matrix instances.
+
+Do not inflate work-item count when each does negligible work and launch overhead dominates.
+
+## Host Runtime (PyOpenCL)
+
+Persistent buffers — do not per-iteration:
+
+- `clCreateBuffer`, `clEnqueueWriteBuffer`, `clEnqueueReadBuffer`
+- kernel recompilation, Python dict/wrapper construction
+
+```text
+Bad:  launch → readback → Python modify → write → launch
+Good: write input once → several kernels → read final result once
+```
+
+PyOpenCL launch overhead is significant — fuse tiny consecutive kernels only when same iteration space, single-use intermediate, fusion removes a global round-trip, and register pressure stays acceptable.
+
+Device-side iteration: multiple steps in one kernel when sync is workgroup-local and host decisions are not needed per step.
+
+## Branching
+
+Avoid divergent branches in hot inner loops when measured cost is high.
+
+Prefer: sort by type, separate kernels for different cases, fixed neighbor counts, arithmetic masks.
+
+Simple boundary branches are fine — do not replace cheap predictable branches with expensive always-on arithmetic.
+
+## Floating-Point Policy
+
+OpenCL devices may support `half`, `float`, `double` — query and benchmark; GPU is not "always float32."
+
+- Use lowest precision meeting error requirements.
+- Separate storage precision from accumulation precision (`float` storage, `double` accum for sensitive reductions).
+- Prefer tree reduction; sum similar magnitudes together.
+- Kahan increases dependencies — benchmark vs tree reduction.
+- Expect non-deterministic order in parallel reductions.
+- `native_sqrt`, `native_exp`, etc. under documented accuracy budget.
+
+## Workgroup Reduction
+
+```c
+#define WG 128
+__kernel void reduceSum(__global const float *input, __global float *partial, const int n)
+{
+    __local float scratch[WG];
+    int lid = get_local_id(0), gid = get_global_id(0);
+
+    scratch[lid] = (gid < n) ? input[gid] : 0.0f;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int stride = WG / 2; stride > 0; stride >>= 1) {
+        if (lid < stride)
+            scratch[lid] += scratch[lid + stride];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0)
+        partial[get_group_id(0)] = scratch[0];
+}
+```
+
+Second kernel (or CPU) reduces partials. For tiny final arrays, CPU reduction of partials may be fine.
+
+## Profiling Checklist
+
+Record per kernel: time, global/local size, launches, H↔D bytes, approx bytes R/W, approx FLOPs, end-to-end time.
+
+| Symptom | Likely cause | Try |
+|---------|-------------|-----|
+| High time + high traffic | Memory-bound | Fewer loads/stores, fusion, tiling, compact layout |
+| Low utilization + long per-thread loops | Insufficient parallelism | More workgroups, batch systems, decompose serial loops |
+| Worse after fusion/unroll | Register spill / I-cache | Split kernel, reduce live state |
+| Worse after adding `__local` | Insufficient reuse / occupancy | Remove local copy or shrink tile |
+| Many tiny kernels | Launch overhead | Fuse, device-side loop, batch |
 
 ## Related Skills
 
-- skill:`port-to-opencl` — porting workflow, OpenCLBase class, kernel caching
-- skill:`gpu-debug` — gated debug macros, CPU↔GPU tracing, barrier pitfalls
-
----
-
-## Memory Hierarchy & Register Pressure
-
-GPU memory hierarchy (fast → slow): **registers** (per-thread) → **local/shared memory** (per-workgroup) → **global memory** (device-wide). Each level is ~10-100x slower than the previous. Algorithm is usually limited by the smallest level.
-
-| Level | Size | Latency | Scope |
-|-------|------|---------|-------|
-| Registers | ~255 per thread | 1 cycle | per-thread |
-| Local memory | 48KB per CU | ~20 cycles | per-workgroup |
-| Global memory | GBs | ~400 cycles | device-wide |
-
-- **Register spilling**: too many live variables → spill to local memory (slow). Too much local memory → spill to global (very slow)
-- **Scoping**: enclose independent computation blocks in `{ }` to release registers between blocks — variables from one block don't occupy registers in the next
-- **Memory-conscious design**: prefer algorithms that use less memory at each level. Reading from small 1MB local memory is much faster than same number of random reads from 1GB global memory
-- **Don't materialize large grids**: e.g. don't build full 3D basis function grid — materialize only 1D radial part per atom type, reconstruct 3D on the fly
-- Workgroup occupancy is limited by register count per thread: more registers/thread → fewer concurrent workgroups → lower latency hiding
-
-```
-// Bad: registers i,j,k live simultaneously
-float sum = 0;
-for(int i=0; i<N; i++) sum += A[i];
-float prod = 1;
-for(int j=0; j<M; j++) prod *= B[j];
-float norm = 0;
-for(int k=0; k<K; k++) norm += C[k];
-
-// Good: scopes release registers between blocks
-float sum, prod, norm;
-{
-    float s = 0;
-    for(int i=0; i<N; i++) s += A[i];
-    sum = s;
-}
-{
-    float p = 1;
-    for(int j=0; j<M; j++) p *= B[j];
-    prod = p;
-}
-{
-    float n = 0;
-    for(int k=0; k<K; k++) n += C[k];
-    norm = n;
-}
-```
-
-# GPU Design Patterns / Templates
-
-Reusable kernel patterns for common GPU computation patterns.
-
-## Tiled Design
-
-Most N-body / matrix operations can use tiling instead of naive O(N²) global reads. Divide work into tiles that fit in local memory, fill collaboratively, then compute from local — amortizes global reads by factor of tile size.
-
-```
-// Tiled matrix multiply: C[i,j] = sum_k A[i,k]*B[k,j]
-// Tile size TS (e.g. 32), workgroup = (TS, TS)
-__local float A_tile[TS][TS], B_tile[TS][TS];
-
-int tx = get_local_id(0), ty = get_local_id(1);
-int i  = get_global_id(0), j  = get_global_id(1);
-float acc = 0.0f;
-
-for(int kt = 0; kt < N; kt += TS){
-    // Collaborative load: each work-item loads one element of each tile
-    A_tile[ty][tx] = A[i * N + kt + tx];
-    B_tile[ty][tx] = B[(kt + ty) * N + j];
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    // Compute from local memory — TS reads from global amortized into 1
-    for(int k = 0; k < TS; k++){
-        acc += A_tile[ty][k] * B_tile[k][tx];
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);  // before overwriting tile
-}
-C[i * N + j] = acc;
-```
-
-Same pattern applies to: N-body force calculation (tile of neighbor positions), pairwise distance matrices, convolution with shared tiles.
-
-## Auxiliary Arrays & Ping-Pong (Avoid Scatter Without Atomics)
-
-When each thread needs to write results to multiple neighbors (scatter), use auxiliary arrays written by one kernel and assembled by another — no atomics needed.
-
-**Example: Newton's 3rd law in force calculation** — each bond/interaction produces forces on both atoms i and j. Instead of atomic-add to `f[atom]`, write recoils to auxiliary array, then sum in a second kernel.
-
-```
-// Kernel 1: compute forces, write to auxiliary arrays (no atomics)
-// Each thread handles one bond (i,j), writes force on i and recoil on j
-int ibond = get_global_id(0);
-int i = bond_i[ibond], j = bond_j[ibond];
-float3 f = computeForce(pos[i], pos[j], ...);
-
-f_i[ibond] = f;        // force on atom i from this bond
-f_j[ibond] = -f;       // recoil on atom j (Newton's 3rd law)
-
-// Kernel 2: assemble — gather all contributions per atom
-// Each thread handles one atom, sums all bond contributions
-int iatom = get_global_id(0);
-float3 total = (float3)(0,0,0);
-for(int b : bonds_of[iatom]){   // gather, not scatter
-    total += f_i[b] + f_j[b];   // or separate assembly kernels
-}
-force[iatom] = total;
-```
-
-**Ping-pong variant**: for iterative methods, alternate between two buffers (read A → write B, then read B → write A) to avoid read-write conflicts without synchronization.
-
-```
-// Iterative solver: alternate src/dst each iteration
-// Even iterations: read bufA, write bufB
-// Odd iterations:  read bufB, write bufA
-__kernel void iterate(__global float* src, __global float* dst, ...){
-    int i = get_global_id(0);
-    dst[i] = update(src, i);  // no race: src and dst are different buffers
-}
-// Host: swap src/dst pointers between iterations
-```
-
-Use when: force assembly, neighbor contributions, iterative solvers (Jacobi, Gauss-Seidel), any scatter pattern that can be decomposed into write-then-gather.
-
-## Local Memory Reduction
-
-When you need a sum/max/min across work-items, use tree reduction in local memory — much faster than atomics.
-
-```
-// Reduce sum of N values within a workgroup (N = workgroup size, power of 2)
-__local float sdata[WG_SIZE];
-int tx = get_local_id(0);
-
-sdata[tx] = input[get_global_id(0)];  // load
-barrier(CLK_LOCAL_MEM_FENCE);
-
-// Tree reduction: halve active threads each step
-for(int stride = WG_SIZE / 2; stride > 0; stride >>= 1){
-    if(tx < stride){
-        sdata[tx] += sdata[tx + stride];
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-}
-
-// Thread 0 has the result
-if(tx == 0) output[get_group_id(0)] = sdata[0];
-```
-
-For non-power-of-2: pad with zeros or handle remainder in first stride. For multi-group reductions: write per-group results to global, launch a second small kernel to reduce those.
+- skill:`gpu-debug` — barrier deadlocks, CPU↔GPU tracing, gated debug macros
+- skill:`port-to-opencl` — PyOpenCL workflow, kernel caching, buffer management
+- skill:`python-perf` — Python harness overhead, when to keep work on GPU
+- skill:`cpu-perf` — CPU reference paths, OpenMP, cache locality
+- skill:`numerical-parity` — validate optimized GPU path against reference

@@ -221,6 +221,7 @@ endif()
 
 if(NOT DISABLE_DFT)
 add_subdirectory(dft)
+add_subdirectory(smalldft)
 
 if(ENABLE_LIBXC)
   add_subdirectory(pdft)

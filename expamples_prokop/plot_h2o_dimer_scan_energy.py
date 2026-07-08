@@ -18,7 +18,7 @@ if hasattr(sys.stdout, 'reconfigure'):
 
 _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 _DEFAULT_CSV = os.path.join(_REPO, 'debug', 'profile_h2o_dimer_scan', 'scan_scf_profile.csv')
-_DEFAULT_XTB = '/home/prokophapala/git/CompChemUtils/tmp/H2O_dimer_scan_dftb/scan.dat'
+_DEFAULT_XTB = os.path.join(os.path.normpath(os.path.join(_REPO, '..', 'CompChemUtils')), 'tmp', 'H2O_dimer_scan_dftb', 'scan.dat')
 _DEFAULT_OUTDIR = os.path.join(_REPO, 'debug', 'profile_h2o_dimer_scan')
 
 HA_TO_KCAL = 627.5094740631

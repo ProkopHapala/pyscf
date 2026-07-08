@@ -852,6 +852,31 @@ __kernel void reduce_sum(
     }
 }
 
+__kernel void reduce_sum_offset(
+    __global const float *input,
+    int offset,
+    __global float *output,
+    int n)
+{
+    __local float sdata[TILE];
+    int tid = get_local_id(0);
+    int i = get_group_id(0) * TILE + tid;
+
+    sdata[tid] = (i < n) ? input[offset + i] : 0.0f;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int s = TILE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (tid == 0) {
+        output[get_group_id(0)] = sdata[0];
+    }
+}
+
 // ============================================================
 // Kernel: unpack_tril
 // Unpack triangular packed matrix to full matrix
@@ -1064,7 +1089,7 @@ __kernel void compute_nelec_exc(
     nelec_exc[1 * ngrids + igrid] = den * exc[igrid];
 }
 
-// float2 knot: (y, dy/du). Interval [ik, ik+1] uses rad_node[ik], rad_node[ik+1].
+// float4 knot: (y, dy/du, d2y/du2, pad). Cubic uses .xy only.
 inline void hermite_map_point(float4 d, float r0, float du, int nrad, float *t, float *t1m, int *ik)
 {
     float r = sqrt(d.x*d.x + d.y*d.y + d.z*d.z);
@@ -1075,36 +1100,72 @@ inline void hermite_map_point(float4 d, float r0, float du, int nrad, float *t, 
     *t1m = *t - 1.0f;
 }
 
-inline float hermite_eval_node(float t, float t1m, float du, float2 n0, float2 n1)
+inline float hermite_eval_node(float t, float t1m, float h, float4 n0, float4 n1)
 {
-    float y0 = n0.x, d0 = n0.y, y1 = n1.x, d1 = n1.y;
+    float y0 = n0.s0, d0 = n0.s1, y1 = n1.s0, d1 = n1.s1;
     float dy = y1 - y0;
-    return y0 + t*t*(3.0f-2.0f*t)*dy + t*t1m*t1m*du*d0 + t*t*t1m*du*d1;
+    return y0 + t*t*(3.0f-2.0f*t)*dy + t*t1m*t1m*h*d0 + t*t*t1m*h*d1;
 }
 
-inline float hermite_eval_deriv_node(float t, float t1m, float du, float2 n0, float2 n1)
+inline float hermite_eval_deriv_node(float t, float t1m, float h, float4 n0, float4 n1)
 {
-    float dy = n1.x - n0.x;
-    float d0 = n0.y, d1 = n1.y;
-    return (6.0f*t*(1.0f-t)*dy + (3.0f*t-1.0f)*t1m*du*d0 + t*(3.0f*t-2.0f)*du*d1) / du;
+    float dy = n1.s0 - n0.s0;
+    float d0 = n0.s1, d1 = n1.s1;
+    return (6.0f*t*(1.0f-t)*dy + (3.0f*t-1.0f)*t1m*h*d0 + t*(3.0f*t-2.0f)*h*d1) / h;
 }
 
-inline float hermite_eval_ir(float t, float t1m, float du, int ik, int ir, int nrad, __global const float2 *rad_node)
+inline float hermite_eval_quintic_node(float t, float h, float4 n0, float4 n1)
+{
+    float y0 = n0.s0, d0 = n0.s1, c0 = n0.s2;
+    float y1 = n1.s0, d1 = n1.s1, c1 = n1.s2;
+    float t2 = t*t, t3 = t2*t, t4 = t3*t, t5 = t4*t;
+    float H00 = 1.0f - 10.0f*t3 + 15.0f*t4 - 6.0f*t5;
+    float H10 = t - 6.0f*t3 + 8.0f*t4 - 3.0f*t5;
+    float H20 = 0.5f*(t2 - 3.0f*t3 + 3.0f*t4 - t5);
+    float H01 = 10.0f*t3 - 15.0f*t4 + 6.0f*t5;
+    float H11 = -4.0f*t3 + 7.0f*t4 - 3.0f*t5;
+    float H21 = 0.5f*(t3 - 2.0f*t4 + t5);
+    float h2 = h*h;
+    return H00*y0 + h*H10*d0 + h2*H20*c0 + H01*y1 + h*H11*d1 + h2*H21*c1;
+}
+
+inline float hermite_eval_quintic_deriv_node(float t, float h, float4 n0, float4 n1)
+{
+    float y0 = n0.s0, d0 = n0.s1, c0 = n0.s2;
+    float y1 = n1.s0, d1 = n1.s1, c1 = n1.s2;
+    float t2 = t*t, t3 = t2*t, t4 = t3*t;
+    float dH00 = -30.0f*t2 + 60.0f*t3 - 30.0f*t4;
+    float dH10 = 1.0f - 18.0f*t2 + 32.0f*t3 - 15.0f*t4;
+    float dH20 = 0.5f*(2.0f*t - 9.0f*t2 + 12.0f*t3 - 5.0f*t4);
+    float dH01 = 30.0f*t2 - 60.0f*t3 + 30.0f*t4;
+    float dH11 = -12.0f*t2 + 28.0f*t3 - 15.0f*t4;
+    float dH21 = 0.5f*(3.0f*t2 - 8.0f*t3 + 5.0f*t4);
+    float h2 = h*h;
+    return (dH00*y0 + h*dH10*d0 + h2*dH20*c0 + dH01*y1 + h*dH11*d1 + h2*dH21*c1) / h;
+}
+
+inline float hermite_eval_ir(float t, float t1m, float h, int ik, int ir, int nrad, int order, __global const float4 *rad_node)
 {
     int base = ir * nrad + ik;
-    return hermite_eval_node(t, t1m, du, rad_node[base], rad_node[base + 1]);
+    float4 n0 = rad_node[base];
+    float4 n1 = rad_node[base + 1];
+    if (order == 0) return hermite_eval_node(t, t1m, h, n0, n1);
+    return hermite_eval_quintic_node(t, h, n0, n1);
 }
 
-inline float hermite_eval_deriv_ir(float t, float t1m, float du, int ik, int ir, int nrad, __global const float2 *rad_node)
+inline float hermite_eval_deriv_ir(float t, float t1m, float h, int ik, int ir, int nrad, int order, __global const float4 *rad_node)
 {
     int base = ir * nrad + ik;
-    return hermite_eval_deriv_node(t, t1m, du, rad_node[base], rad_node[base + 1]);
+    float4 n0 = rad_node[base];
+    float4 n1 = rad_node[base + 1];
+    if (order == 0) return hermite_eval_deriv_node(t, t1m, h, n0, n1);
+    return hermite_eval_quintic_deriv_node(t, h, n0, n1);
 }
 
 __kernel void eval_ao_mapped_hermite_cart(
     __global const float *coords,
     __global const float *atom_coords,
-    __global const float2 *rad_node,
+    __global const float4 *rad_node,
     __global const int   *shell_ctr_ir,
     __global const int   *cart_shell,
     __global const int   *cart_ctr,
@@ -1112,7 +1173,7 @@ __kernel void eval_ao_mapped_hermite_cart(
     __global const int   *shell_atom,
     __global float       *ao,
     float r0, float du,
-    int nrad, int nctr_max, int ncart, int ngrids)
+    int nrad, int nctr_max, int ncart, int ngrids, int spline_order)
 {
     int g = get_global_id(0);
     int iao = get_global_id(1);
@@ -1133,7 +1194,7 @@ __kernel void eval_ao_mapped_hermite_cart(
     float t = clamp(uf - (float)i, 0.0f, 1.0f);
     float t1m = t - 1.0f;
     int ir = shell_ctr_ir[sh * nctr_max + ctr];
-    float radial = hermite_eval_ir(t, t1m, du, i, ir, nrad, rad_node);
+    float radial = hermite_eval_ir(t, t1m, du, i, ir, nrad, spline_order, rad_node);
     int p0 = iao * 3;
     int ix = cart_ixyz[p0];
     int iy = cart_ixyz[p0 + 1];
@@ -1148,7 +1209,7 @@ __kernel void eval_ao_mapped_hermite_cart(
 __kernel void eval_ao_mapped_hermite_cart_deriv1(
     __global const float *coords,
     __global const float *atom_coords,
-    __global const float2 *rad_node,
+    __global const float4 *rad_node,
     __global const int   *shell_ctr_ir,
     __global const int   *cart_shell,
     __global const int   *cart_ctr,
@@ -1159,7 +1220,7 @@ __kernel void eval_ao_mapped_hermite_cart_deriv1(
     __global float       *ao2,
     __global float       *ao3,
     float r0, float du,
-    int nrad, int nctr_max, int ncart, int ngrids)
+    int nrad, int nctr_max, int ncart, int ngrids, int spline_order)
 {
     int g = get_global_id(0);
     int iao = get_global_id(1);
@@ -1180,8 +1241,8 @@ __kernel void eval_ao_mapped_hermite_cart_deriv1(
     float t = clamp(uf - (float)i, 0.0f, 1.0f);
     float t1m = t - 1.0f;
     int ir = shell_ctr_ir[sh * nctr_max + ctr];
-    float radial = hermite_eval_ir(t, t1m, du, i, ir, nrad, rad_node);
-    float drad_du = hermite_eval_deriv_ir(t, t1m, du, i, ir, nrad, rad_node);
+    float radial = hermite_eval_ir(t, t1m, du, i, ir, nrad, spline_order, rad_node);
+    float drad_du = hermite_eval_deriv_ir(t, t1m, du, i, ir, nrad, spline_order, rad_node);
     float drad_dr = drad_du / (r + r0);
     float invr = r > 1.0e-20f ? 1.0f / r : 0.0f;
 
@@ -1281,14 +1342,14 @@ inline void eval_radial_cart_deriv1(float4 d, int l, int out, float radial, floa
 __kernel void eval_ao_mapped_hermite_cart_atom(
     __global const float4 *coords,
     __global const float4 *atom_coords,
-    __global const float2 *rad_node,
+    __global const float4 *rad_node,
     __global const int   *radial_l,
     __global const int   *radial_cart0,
     __global const int   *atom_radial_offset,
     __global const int   *atom_radial_list,
     __global float       *ao,
     float r0, float du,
-    int nrad, int ncart, int ngrids, int natoms)
+    int nrad, int ncart, int ngrids, int natoms, int spline_order)
 {
     int g = get_global_id(0);
     int iat = get_global_id(1);
@@ -1306,7 +1367,7 @@ __kernel void eval_ao_mapped_hermite_cart_atom(
     int nr = atom_radial_offset[iat + 1] - off;
     for (int ii = 0; ii < nr; ii++) {
         int ir = atom_radial_list[off + ii];
-        float radial = hermite_eval_ir(t, t1m, du, i, ir, nrad, rad_node);
+        float radial = hermite_eval_ir(t, t1m, du, i, ir, nrad, spline_order, rad_node);
         eval_radial_cart(d, radial_l[ir], g * ncart + radial_cart0[ir], radial, ncart, ao);
     }
 }
@@ -1314,7 +1375,7 @@ __kernel void eval_ao_mapped_hermite_cart_atom(
 __kernel void eval_ao_mapped_hermite_cart_deriv1_atom(
     __global const float4 *coords,
     __global const float4 *atom_coords,
-    __global const float2 *rad_node,
+    __global const float4 *rad_node,
     __global const int   *radial_l,
     __global const int   *radial_cart0,
     __global const int   *atom_radial_offset,
@@ -1324,7 +1385,7 @@ __kernel void eval_ao_mapped_hermite_cart_deriv1_atom(
     __global float       *ao2,
     __global float       *ao3,
     float r0, float du,
-    int nrad, int ncart, int ngrids, int natoms)
+    int nrad, int ncart, int ngrids, int natoms, int spline_order)
 {
     int g = get_global_id(0);
     int iat = get_global_id(1);
@@ -1343,8 +1404,8 @@ __kernel void eval_ao_mapped_hermite_cart_deriv1_atom(
     int nr = atom_radial_offset[iat + 1] - off;
     for (int ii = 0; ii < nr; ii++) {
         int ir = atom_radial_list[off + ii];
-        float radial = hermite_eval_ir(t, t1m, du, i, ir, nrad, rad_node);
-        float drad_du = hermite_eval_deriv_ir(t, t1m, du, i, ir, nrad, rad_node);
+        float radial = hermite_eval_ir(t, t1m, du, i, ir, nrad, spline_order, rad_node);
+        float drad_du = hermite_eval_deriv_ir(t, t1m, du, i, ir, nrad, spline_order, rad_node);
         eval_radial_cart_deriv1(d, radial_l[ir], g * ncart + radial_cart0[ir], radial, drad_du / (r + r0), invr, ncart, ao0, ao1, ao2, ao3);
     }
 }
@@ -1414,18 +1475,18 @@ inline void decode_q_vmat(int q, int *iao_l, int *jao_l, int *il, int *jl, int *
 }
 
 // Evaluate all radial channels for one atom at one point (ir_list in private or local).
-inline void eval_radials_slice(int ns, const int *ir_list, float t, float t1m, float du, int ik, int nrad, __global const float2 *rad_node, float *Ri)
+inline void eval_radials_slice(int ns, const int *ir_list, float t, float t1m, float h, int ik, int nrad, int order, __global const float4 *rad_node, float *Ri)
 {
     for (int s = 0; s < ns; s++)
-        Ri[s] = hermite_eval_ir(t, t1m, du, ik, ir_list[s], nrad, rad_node);
+        Ri[s] = hermite_eval_ir(t, t1m, h, ik, ir_list[s], nrad, order, rad_node);
     for (int s = ns; s < MAX_SHELL; s++) Ri[s] = 0.0f;
 }
 
-inline void eval_radials_slice_deriv(int ns, const int *ir_list, float t, float t1m, float du, int ik, int nrad, float r, float r0, __global const float2 *rad_node, float *Ri, float *dRi)
+inline void eval_radials_slice_deriv(int ns, const int *ir_list, float t, float t1m, float h, int ik, int nrad, int order, float r, float r0, __global const float4 *rad_node, float *Ri, float *dRi)
 {
     for (int s = 0; s < ns; s++) {
-        Ri[s] = hermite_eval_ir(t, t1m, du, ik, ir_list[s], nrad, rad_node);
-        dRi[s] = hermite_eval_deriv_ir(t, t1m, du, ik, ir_list[s], nrad, rad_node) / (r + r0);
+        Ri[s] = hermite_eval_ir(t, t1m, h, ik, ir_list[s], nrad, order, rad_node);
+        dRi[s] = hermite_eval_deriv_ir(t, t1m, h, ik, ir_list[s], nrad, order, rad_node) / (r + r0);
     }
     for (int s = ns; s < MAX_SHELL; s++) { Ri[s] = 0.0f; dRi[s] = 0.0f; }
 }
@@ -1681,7 +1742,7 @@ inline void contract_pair_rho_gga_v2(int il, int jl, float *Ri, float *dRi, __lo
 __kernel void rho_lda_tiled(
     __global const float4 *coords,
     __global const float4 *atom_coords,
-    __global const float2 *rad_node,
+    __global const float4 *rad_node,
     __global const int *radial_l,
     __global const int *radial_cart0,
     __global const int *atom_radial_offset,
@@ -1691,7 +1752,7 @@ __kernel void rho_lda_tiled(
     __global const int *atom_nao,
     __global float *rho,
     float r0, float du,
-    int nrad, int ncart, int ngrids, int natoms)
+    int nrad, int ncart, int ngrids, int natoms, int spline_order)
 {
     int ip = get_local_id(0);
     int il = get_local_id(1);
@@ -1723,7 +1784,7 @@ __kernel void rho_lda_tiled(
         if (g < ngrids && ia < natoms) {
             di_tile[it] = coords[g] - atom_coords[ia];
             hermite_map_point(di_tile[it], r0, du, nrad, &t_i, &t1m_i, &ik_i);
-            eval_radials_slice(i_ns_tile[it], i_ir_tile[it], t_i, t1m_i, du, ik_i, nrad, rad_node, Ri_tile[it]);
+            eval_radials_slice(i_ns_tile[it], i_ir_tile[it], t_i, t1m_i, du, ik_i, nrad, spline_order, rad_node, Ri_tile[it]);
         }
     }
 
@@ -1740,7 +1801,7 @@ __kernel void rho_lda_tiled(
                 float t, t1m; int ik;
                 hermite_map_point(coords[gj] - atom_coords[ja], r0, du, nrad, &t, &t1m, &ik);
                 for (int s = 0; s < l_j_ns[jj]; s++)
-                    wfRj[pp][jj][s] = hermite_eval_ir(t, t1m, du, ik, l_j_ir[jj][s], nrad, rad_node);
+                    wfRj[pp][jj][s] = hermite_eval_ir(t, t1m, du, ik, l_j_ir[jj][s], nrad, spline_order, rad_node);
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -1791,7 +1852,7 @@ __kernel void rho_lda_tiled(
 __kernel void rho_gga_tiled(
     __global const float4 *coords,
     __global const float4 *atom_coords,
-    __global const float2 *rad_node,
+    __global const float4 *rad_node,
     __global const int *radial_l,
     __global const int *radial_cart0,
     __global const int *atom_radial_offset,
@@ -1801,7 +1862,7 @@ __kernel void rho_gga_tiled(
     __global const int *atom_nao,
     __global float *rho,
     float r0, float du,
-    int nrad, int ncart, int ngrids, int natoms)
+    int nrad, int ncart, int ngrids, int natoms, int spline_order)
 {
     int ip = get_local_id(0);
     int il = get_local_id(1);
@@ -1843,7 +1904,7 @@ __kernel void rho_gga_tiled(
             r_i = sqrt(di_tile[it].x*di_tile[it].x + di_tile[it].y*di_tile[it].y + di_tile[it].z*di_tile[it].z);
             invr_i_tile[it] = r_i > 1e-20f ? 1.0f/r_i : 0.0f;
             hermite_map_point(di_tile[it], r0, du, nrad, &t_i, &t1m_i, &ik_i);
-            eval_radials_slice_deriv(i_ns_tile[it], i_ir_tile[it], t_i, t1m_i, du, ik_i, nrad, r_i, r0, rad_node, Ri_tile[it], dRi_tile[it]);
+            eval_radials_slice_deriv(i_ns_tile[it], i_ir_tile[it], t_i, t1m_i, du, ik_i, nrad, spline_order, r_i, r0, rad_node, Ri_tile[it], dRi_tile[it]);
         }
     }
 
@@ -1862,8 +1923,8 @@ __kernel void rho_gga_tiled(
                 float t, t1m; int ik;
                 hermite_map_point(dj, r0, du, nrad, &t, &t1m, &ik);
                 for (int s = 0; s < l_j_ns[jj]; s++) {
-                    wfRj[pp][jj][s] = hermite_eval_ir(t, t1m, du, ik, l_j_ir[jj][s], nrad, rad_node);
-                    dwfRj[pp][jj][s] = hermite_eval_deriv_ir(t, t1m, du, ik, l_j_ir[jj][s], nrad, rad_node) / (rj + r0);
+                    wfRj[pp][jj][s] = hermite_eval_ir(t, t1m, du, ik, l_j_ir[jj][s], nrad, spline_order, rad_node);
+                    dwfRj[pp][jj][s] = hermite_eval_deriv_ir(t, t1m, du, ik, l_j_ir[jj][s], nrad, spline_order, rad_node) / (rj + r0);
                 }
             }
         }
@@ -1936,12 +1997,12 @@ __kernel void rho_gga_tiled(
 #define PT_ATOM_SIZE (NPTILE * NATILE)
 
 // Fill local AO values for one atom at one grid point (LDA: just phi)
-inline void fill_atom_ao_lda(int ns, const int *ir_list, float4 d, int base, __local float *ao, float r0, float du, int nrad, __global const float2 *rad_node, __global const int *radial_l)
+inline void fill_atom_ao_lda(int ns, const int *ir_list, float4 d, int base, __local float *ao, float r0, float du, int nrad, int order, __global const float4 *rad_node, __global const int *radial_l)
 {
     float t, t1m; int ik;
     hermite_map_point(d, r0, du, nrad, &t, &t1m, &ik);
     float R[MAX_SHELL];
-    eval_radials_slice(ns, ir_list, t, t1m, du, ik, nrad, rad_node, R);
+    eval_radials_slice(ns, ir_list, t, t1m, du, ik, nrad, order, rad_node, R);
     int ao0 = 0;
     for (int s = 0; s < ns; s++) {
         float f[6];
@@ -1951,13 +2012,13 @@ inline void fill_atom_ao_lda(int ns, const int *ir_list, float4 d, int base, __l
     }
 }
 
-inline void fill_atom_aow_gga(int ns, const int *ir_list, float4 d, float w0, float wx, float wy, float wz, int base, __local float *ao, float r0, float du, int nrad, __global const float2 *rad_node, __global const int *radial_l)
+inline void fill_atom_aow_gga(int ns, const int *ir_list, float4 d, float w0, float wx, float wy, float wz, int base, __local float *ao, float r0, float du, int nrad, int order, __global const float4 *rad_node, __global const int *radial_l)
 {
     float t, t1m; int ik;
     hermite_map_point(d, r0, du, nrad, &t, &t1m, &ik);
     float r = sqrt(d.x*d.x + d.y*d.y + d.z*d.z);
     float R[MAX_SHELL], dR[MAX_SHELL];
-    eval_radials_slice_deriv(ns, ir_list, t, t1m, du, ik, nrad, r, r0, rad_node, R, dR);
+    eval_radials_slice_deriv(ns, ir_list, t, t1m, du, ik, nrad, order, r, r0, rad_node, R, dR);
     float invr = (r > 1e-20f) ? 1.0f / r : 0.0f;
     int ao0 = 0;
     for (int s = 0; s < ns; s++) {
@@ -1971,7 +2032,7 @@ inline void fill_atom_aow_gga(int ns, const int *ir_list, float4 d, float w0, fl
 __kernel void vmat_lda_tiled(
     __global const float4 *coords,
     __global const float4 *atom_coords,
-    __global const float2 *rad_node,
+    __global const float4 *rad_node,
     __global const int *radial_l,
     __global const int *radial_cart0,
     __global const int *atom_radial_offset,
@@ -1981,7 +2042,7 @@ __kernel void vmat_lda_tiled(
     __global const float *wv,
     __global float *vmat,
     float r0, float du,
-    int nrad, int ncart, int ngrids, int natoms)
+    int nrad, int ncart, int ngrids, int natoms, int spline_order)
 {
     int lid = get_local_id(1);
     int iTile = get_group_id(0);
@@ -2014,7 +2075,7 @@ __kernel void vmat_lda_tiled(
             for (int a = 0; a < MAX_AO_ATOM; a++) aoI[ip][base + a] = 0.0f;
             if (g < ngrids && ia < natoms) {
                 float4 d = coords[g] - atom_coords[ia];
-                fill_atom_ao_lda(l_i_ns[il], &l_i_ir[il][0], d, base, aoI[ip], r0, du, nrad, rad_node, radial_l);
+                fill_atom_ao_lda(l_i_ns[il], &l_i_ir[il][0], d, base, aoI[ip], r0, du, nrad, spline_order, rad_node, radial_l);
             }
         }
 
@@ -2028,7 +2089,7 @@ __kernel void vmat_lda_tiled(
             for (int b = 0; b < MAX_AO_ATOM; b++) aoJ[ip][base + b] = 0.0f;
             if (g < ngrids && ja < natoms) {
                 float4 d = coords[g] - atom_coords[ja];
-                fill_atom_ao_lda(l_j_ns[jl], &l_j_ir[jl][0], d, base, aoJ[ip], r0, du, nrad, rad_node, radial_l);
+                fill_atom_ao_lda(l_j_ns[jl], &l_j_ir[jl][0], d, base, aoJ[ip], r0, du, nrad, spline_order, rad_node, radial_l);
             }
         }
 
@@ -2081,7 +2142,7 @@ __kernel void vmat_lda_tiled(
 __kernel void vmat_gga_tiled(
     __global const float4 *coords,
     __global const float4 *atom_coords,
-    __global const float2 *rad_node,
+    __global const float4 *rad_node,
     __global const int *radial_l,
     __global const int *radial_cart0,
     __global const int *atom_radial_offset,
@@ -2091,7 +2152,7 @@ __kernel void vmat_gga_tiled(
     __global const float *wv,
     __global float *vmat,
     float r0, float du,
-    int nrad, int ncart, int ngrids, int natoms)
+    int nrad, int ncart, int ngrids, int natoms, int spline_order)
 {
     int lid = get_local_id(1);
     int iTile = get_group_id(0);
@@ -2124,7 +2185,7 @@ __kernel void vmat_gga_tiled(
             if (g < ngrids && ia < natoms) {
                 float4 d = coords[g] - atom_coords[ia];
                 float w0 = wv[g], wx = wv[ngrids + g], wy = wv[2*ngrids + g], wz = wv[3*ngrids + g];
-                fill_atom_aow_gga(l_i_ns[il], &l_i_ir[il][0], d, w0, wx, wy, wz, base, aoI[ip], r0, du, nrad, rad_node, radial_l);
+                fill_atom_aow_gga(l_i_ns[il], &l_i_ir[il][0], d, w0, wx, wy, wz, base, aoI[ip], r0, du, nrad, spline_order, rad_node, radial_l);
             }
         }
 
@@ -2138,7 +2199,7 @@ __kernel void vmat_gga_tiled(
             for (int b = 0; b < MAX_AO_ATOM; b++) aoJ[ip][base + b] = 0.0f;
             if (g < ngrids && ja < natoms) {
                 float4 d = coords[g] - atom_coords[ja];
-                fill_atom_ao_lda(l_j_ns[jl], &l_j_ir[jl][0], d, base, aoJ[ip], r0, du, nrad, rad_node, radial_l);
+                fill_atom_ao_lda(l_j_ns[jl], &l_j_ir[jl][0], d, base, aoJ[ip], r0, du, nrad, spline_order, rad_node, radial_l);
             }
         }
 
@@ -2217,14 +2278,14 @@ inline void load_single_atom_meta_l(int ia, int natoms, __global const int *atom
 __kernel void eval_ao_hermite_cart_tiled(
     __global const float4 *coords,
     __global const float4 *atom_coords,
-    __global const float2 *rad_node,
+    __global const float4 *rad_node,
     __global const int *radial_l,
     __global const int *radial_cart0,
     __global const int *atom_radial_offset,
     __global const int *atom_radial_list,
     __global float *ao,
     float r0, float du,
-    int nrad, int ncart, int ngrids, int natoms)
+    int nrad, int ncart, int ngrids, int natoms, int spline_order)
 {
     int ip = get_local_id(0);
     int lid = ip;
@@ -2248,7 +2309,7 @@ __kernel void eval_ao_hermite_cart_tiled(
                 float t, t1m; int ik;
                 hermite_map_point(dj, r0, du, nrad, &t, &t1m, &ik);
                 for (int s = 0; s < l_ns; s++)
-                    wfR[pp][s] = hermite_eval_ir(t, t1m, du, ik, l_ir[s], nrad, rad_node);
+                    wfR[pp][s] = hermite_eval_ir(t, t1m, du, ik, l_ir[s], nrad, spline_order, rad_node);
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -2264,7 +2325,7 @@ __kernel void eval_ao_hermite_cart_tiled(
 __kernel void eval_ao_hermite_cart_deriv1_tiled(
     __global const float4 *coords,
     __global const float4 *atom_coords,
-    __global const float2 *rad_node,
+    __global const float4 *rad_node,
     __global const int *radial_l,
     __global const int *radial_cart0,
     __global const int *atom_radial_offset,
@@ -2274,7 +2335,7 @@ __kernel void eval_ao_hermite_cart_deriv1_tiled(
     __global float *ao2,
     __global float *ao3,
     float r0, float du,
-    int nrad, int ncart, int ngrids, int natoms)
+    int nrad, int ncart, int ngrids, int natoms, int spline_order)
 {
     int ip = get_local_id(0);
     int lid = ip;
@@ -2300,8 +2361,8 @@ __kernel void eval_ao_hermite_cart_deriv1_tiled(
                 float t, t1m; int ik;
                 hermite_map_point(dj, r0, du, nrad, &t, &t1m, &ik);
                 for (int s = 0; s < l_ns; s++) {
-                    wfR[pp][s] = hermite_eval_ir(t, t1m, du, ik, l_ir[s], nrad, rad_node);
-                    dwfR[pp][s] = hermite_eval_deriv_ir(t, t1m, du, ik, l_ir[s], nrad, rad_node) / (rj + r0);
+                    wfR[pp][s] = hermite_eval_ir(t, t1m, du, ik, l_ir[s], nrad, spline_order, rad_node);
+                    dwfR[pp][s] = hermite_eval_deriv_ir(t, t1m, du, ik, l_ir[s], nrad, spline_order, rad_node) / (rj + r0);
                 }
             }
         }
@@ -2335,11 +2396,11 @@ __kernel void build_radial_on_grid_tiled(
     __global const float4 *coords,
     __global const float4 *atom_coords,
     __global const int *radial_atom,
-    __global const float2 *rad_node,
+    __global const float4 *rad_node,
     __global float *rad_val,
     __global float *rad_dr,
     float r0, float du,
-    int nrad, int nradial, int ngrids)
+    int nrad, int nradial, int ngrids, int spline_order)
 {
     int ip = get_local_id(0);
     int gTile = get_group_id(0);
@@ -2352,8 +2413,8 @@ __kernel void build_radial_on_grid_tiled(
     float r = sqrt(d.x*d.x + d.y*d.y + d.z*d.z);
     float t, t1m; int ik;
     hermite_map_point(d, r0, du, nrad, &t, &t1m, &ik);
-    float R = hermite_eval_ir(t, t1m, du, ik, ir, nrad, rad_node);
-    float dR_du = hermite_eval_deriv_ir(t, t1m, du, ik, ir, nrad, rad_node);
+    float R = hermite_eval_ir(t, t1m, du, ik, ir, nrad, spline_order, rad_node);
+    float dR_du = hermite_eval_deriv_ir(t, t1m, du, ik, ir, nrad, spline_order, rad_node);
     int idx = ir * ngrids + g;
     rad_val[idx] = R;
     rad_dr[idx] = dR_du / (r + r0);
@@ -2406,7 +2467,7 @@ inline void contract_rho_pair_gga(float *Ri, float *dRi, float *Rj, float *dRj, 
 __kernel void rho_lda_pair(
     __global const float4 *coords,
     __global const float4 *atom_coords,
-    __global const float2 *rad_node,
+    __global const float4 *rad_node,
     __global const int *radial_l,
     __global const int *radial_cart0,
     __global const int *atom_radial_offset,
@@ -2416,7 +2477,7 @@ __kernel void rho_lda_pair(
     __global const int *atom_nao,
     __global float *rho,
     float r0, float du,
-    int nrad, int ncart, int ngrids, int natoms)
+    int nrad, int ncart, int ngrids, int natoms, int spline_order)
 {
     int ip = get_local_id(0);
     int lid = ip;
@@ -2446,7 +2507,7 @@ __kernel void rho_lda_pair(
                 float t, t1m; int ik;
                 hermite_map_point(coords[gj] - atom_coords[ja], r0, du, nrad, &t, &t1m, &ik);
                 for (int s = 0; s < l_j_ns; s++)
-                    wfRj[pp][s] = hermite_eval_ir(t, t1m, du, ik, l_j_ir[s], nrad, rad_node);
+                    wfRj[pp][s] = hermite_eval_ir(t, t1m, du, ik, l_j_ir[s], nrad, spline_order, rad_node);
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -2460,7 +2521,7 @@ __kernel void rho_lda_pair(
                 ns_i = load_atom_ir_l(ia, natoms, atom_radial_offset, atom_radial_list, radial_l, i_ir, i_l);
                 di = coords[g] - atom_coords[ia];
                 hermite_map_point(di, r0, du, nrad, &t_i, &t1m_i, &ik_i);
-                eval_radials_slice(ns_i, i_ir, t_i, t1m_i, du, ik_i, nrad, rad_node, Ri);
+                eval_radials_slice(ns_i, i_ir, t_i, t1m_i, du, ik_i, nrad, spline_order, rad_node, Ri);
             }
 
             for (int k = lid; k < PAIR_BLK_SIZE; k += NPTILE) {
@@ -2487,7 +2548,7 @@ __kernel void rho_lda_pair(
 __kernel void rho_gga_pair(
     __global const float4 *coords,
     __global const float4 *atom_coords,
-    __global const float2 *rad_node,
+    __global const float4 *rad_node,
     __global const int *radial_l,
     __global const int *radial_cart0,
     __global const int *atom_radial_offset,
@@ -2497,7 +2558,7 @@ __kernel void rho_gga_pair(
     __global const int *atom_nao,
     __global float *rho,
     float r0, float du,
-    int nrad, int ncart, int ngrids, int natoms)
+    int nrad, int ncart, int ngrids, int natoms, int spline_order)
 {
     int ip = get_local_id(0);
     int lid = ip;
@@ -2531,8 +2592,8 @@ __kernel void rho_gga_pair(
                 float t, t1m; int ik;
                 hermite_map_point(dj, r0, du, nrad, &t, &t1m, &ik);
                 for (int s = 0; s < l_j_ns; s++) {
-                    wfRj[pp][s] = hermite_eval_ir(t, t1m, du, ik, l_j_ir[s], nrad, rad_node);
-                    dwfRj[pp][s] = hermite_eval_deriv_ir(t, t1m, du, ik, l_j_ir[s], nrad, rad_node) / (rj + r0);
+                    wfRj[pp][s] = hermite_eval_ir(t, t1m, du, ik, l_j_ir[s], nrad, spline_order, rad_node);
+                    dwfRj[pp][s] = hermite_eval_deriv_ir(t, t1m, du, ik, l_j_ir[s], nrad, spline_order, rad_node) / (rj + r0);
                 }
             }
         }
@@ -2551,7 +2612,7 @@ __kernel void rho_gga_pair(
                 r_i = sqrt(di.x*di.x + di.y*di.y + di.z*di.z);
                 invr_i = r_i > 1e-20f ? 1.0f/r_i : 0.0f;
                 hermite_map_point(di, r0, du, nrad, &t_i, &t1m_i, &ik_i);
-                eval_radials_slice_deriv(ns_i, i_ir, t_i, t1m_i, du, ik_i, nrad, r_i, r0, rad_node, Ri, dRi);
+                eval_radials_slice_deriv(ns_i, i_ir, t_i, t1m_i, du, ik_i, nrad, spline_order, r_i, r0, rad_node, Ri, dRi);
             }
 
             for (int k = lid; k < PAIR_BLK_SIZE; k += NPTILE) {
@@ -2588,7 +2649,7 @@ __kernel void rho_gga_pair(
 __kernel void vmat_lda_pair(
     __global const float4 *coords,
     __global const float4 *atom_coords,
-    __global const float2 *rad_node,
+    __global const float4 *rad_node,
     __global const int *radial_l,
     __global const int *radial_cart0,
     __global const int *atom_radial_offset,
@@ -2598,7 +2659,7 @@ __kernel void vmat_lda_pair(
     __global const float *wv,
     __global float *vmat,
     float r0, float du,
-    int nrad, int ncart, int ngrids, int natoms)
+    int nrad, int ncart, int ngrids, int natoms, int spline_order)
 {
     int lid = get_local_id(1);
     int ia = get_group_id(0);
@@ -2627,14 +2688,14 @@ __kernel void vmat_lda_pair(
             int g = gTile + ip;
             for (int a = 0; a < MAX_AO_ATOM; a++) aoI[ip][a] = 0.0f;
             if (g < ngrids && ia < natoms)
-                fill_atom_ao_lda(l_i_ns, l_i_ir, coords[g] - atom_coords[ia], 0, aoI[ip], r0, du, nrad, rad_node, radial_l);
+                fill_atom_ao_lda(l_i_ns, l_i_ir, coords[g] - atom_coords[ia], 0, aoI[ip], r0, du, nrad, spline_order, rad_node, radial_l);
         }
         for (int k = lid; k < NPTILE; k += WGS_VMAT) {
             int ip = k;
             int g = gTile + ip;
             for (int b = 0; b < MAX_AO_ATOM; b++) aoJ[ip][b] = 0.0f;
             if (g < ngrids && ja < natoms)
-                fill_atom_ao_lda(l_j_ns, l_j_ir, coords[g] - atom_coords[ja], 0, aoJ[ip], r0, du, nrad, rad_node, radial_l);
+                fill_atom_ao_lda(l_j_ns, l_j_ir, coords[g] - atom_coords[ja], 0, aoJ[ip], r0, du, nrad, spline_order, rad_node, radial_l);
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
@@ -2672,7 +2733,7 @@ __kernel void vmat_lda_pair(
 __kernel void vmat_gga_pair(
     __global const float4 *coords,
     __global const float4 *atom_coords,
-    __global const float2 *rad_node,
+    __global const float4 *rad_node,
     __global const int *radial_l,
     __global const int *radial_cart0,
     __global const int *atom_radial_offset,
@@ -2682,7 +2743,7 @@ __kernel void vmat_gga_pair(
     __global const float *wv,
     __global float *vmat,
     float r0, float du,
-    int nrad, int ncart, int ngrids, int natoms)
+    int nrad, int ncart, int ngrids, int natoms, int spline_order)
 {
     int lid = get_local_id(1);
     int ia = get_group_id(0);
@@ -2711,7 +2772,7 @@ __kernel void vmat_gga_pair(
             for (int a = 0; a < MAX_AO_ATOM; a++) aoI[ip][a] = 0.0f;
             if (g < ngrids && ia < natoms) {
                 float w0 = wv[g], wx = wv[ngrids + g], wy = wv[2*ngrids + g], wz = wv[3*ngrids + g];
-                fill_atom_aow_gga(l_i_ns, l_i_ir, coords[g] - atom_coords[ia], w0, wx, wy, wz, 0, aoI[ip], r0, du, nrad, rad_node, radial_l);
+                fill_atom_aow_gga(l_i_ns, l_i_ir, coords[g] - atom_coords[ia], w0, wx, wy, wz, 0, aoI[ip], r0, du, nrad, spline_order, rad_node, radial_l);
             }
         }
         for (int k = lid; k < NPTILE; k += WGS_VMAT) {
@@ -2719,7 +2780,7 @@ __kernel void vmat_gga_pair(
             int g = gTile + ip;
             for (int b = 0; b < MAX_AO_ATOM; b++) aoJ[ip][b] = 0.0f;
             if (g < ngrids && ja < natoms)
-                fill_atom_ao_lda(l_j_ns, l_j_ir, coords[g] - atom_coords[ja], 0, aoJ[ip], r0, du, nrad, rad_node, radial_l);
+                fill_atom_ao_lda(l_j_ns, l_j_ir, coords[g] - atom_coords[ja], 0, aoJ[ip], r0, du, nrad, spline_order, rad_node, radial_l);
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 

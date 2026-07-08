@@ -38,9 +38,18 @@ XC_PATH_MODES = {
         'profile': 'production_radial',
         'short': 'Radial precomp',
         'rho': 'rho_gga_radial_precomp_pair — R,dR on grid, no full χ',
-        'vmat': 'vmat_gga_precomp_coalesced_pair — Hermite χ for vmat only',
+        'vmat': 'vmat_gga_radial_precomp_pair — R,dR gather + shell unfold',
         'j': 'CPU RI-J',
-        'ao_setup': 'build_radial_on_grid_tiled + Hermite χ for vmat',
+        'ao_setup': 'build_radial_on_grid_tiled at setup',
+        'scf_tol': '1e-8',
+    },
+    'gpu_otf_radial_vmat': {
+        'profile': 'production_otf_radial_vmat',
+        'short': 'OTF ρ + radial vmat',
+        'rho': 'rho_gga_tiled — OTF Hermite (same as gpu_otf)',
+        'vmat': 'vmat_gga_radial_precomp_pair — R,dR gather (no Hermite in vmat)',
+        'j': 'CPU RI-J',
+        'ao_setup': 'Hermite tables + build_radial_on_grid_tiled at setup',
         'scf_tol': '1e-8',
     },
     'gpu_gto': {
@@ -66,6 +75,7 @@ XC_PATH_MODES = {
 MODE_COLORS = {
     'cpu': '#1f77b4', 'gpu_otf': '#ff7f0e', 'gpu_coalesced': '#9467bd',
     'gpu_radial': '#d62728', 'gpu_gto': '#8c564b', 'gpu_full': '#2ca02c',
+    'gpu_otf_radial_vmat': '#17becf',
 }
 
 SCAN_MODE_KEYS = ['cpu', 'gpu_otf', 'gpu_coalesced', 'gpu_radial', 'gpu_gto', 'gpu_full']

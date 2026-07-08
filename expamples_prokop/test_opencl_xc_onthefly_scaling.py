@@ -3,7 +3,7 @@ import numpy as np
 from pyscf import gto, dft
 from pyscf.OpenCL.xc_grid import nr_rks_gpu_hermite_onthefly, nr_rks_gpu_hermite_ao
 
-XYZ_DIR = '/home/prokophapala/git/pyscf/data/xyz'
+XYZ_DIR = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')), 'data', 'xyz')
 
 systems = [
     ('benzene',   'ccpvdz', 3),

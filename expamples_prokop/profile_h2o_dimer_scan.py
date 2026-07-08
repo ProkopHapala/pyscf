@@ -5,10 +5,11 @@ import subprocess
 import sys
 
 _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+_CCU = os.path.normpath(os.path.join(_REPO, '..', 'CompChemUtils'))
 _SCRIPT = os.path.join(os.path.dirname(__file__), 'profile_dimer_scan.py')
-_SCAN = '/home/prokophapala/git/CompChemUtils/tmp/H2O_dimer_scan_dftb/scan_out.xyz'
-_DIST = '/home/prokophapala/git/CompChemUtils/tmp/H2O_dimer_scan_dftb/distances.dat'
-_REF = '/home/prokophapala/git/CompChemUtils/tmp/H2O_dimer_scan_dftb/scan.dat'
+_SCAN = os.path.join(_CCU, 'tmp', 'H2O_dimer_scan_dftb', 'scan_out.xyz')
+_DIST = os.path.join(_CCU, 'tmp', 'H2O_dimer_scan_dftb', 'distances.dat')
+_REF = os.path.join(_CCU, 'tmp', 'H2O_dimer_scan_dftb', 'scan.dat')
 _OUT = os.path.join(_REPO, 'debug', 'profile_h2o_dimer_scan')
 
 if __name__ == '__main__':

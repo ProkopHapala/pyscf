@@ -6,20 +6,22 @@ tags: [opencl, dft, xc, gpu]
 
 ## Summary
 
-GPU offload of the RKS exchange–correlation grid integral (ρ projection → PBE vxc → vmat) and density-fitting Coulomb J is implemented in `pyscf/OpenCL/`, integrated into `pyscf/dft/rks.py` via `mf.backend` and `mf.setup_gpu()`. Production path is **Hermite on-the-fly** (`production_otf`): no full χ storage, pair-gather ρ/vmat kernels with radial Hermite eval in registers/local memory. Precomputed GTO paths (row-major, coalesced, radial-precomp) exist for parity/debug and large-nao cases. PBE on GPU is verified vs libxc; full SCF converges on benzene with ~3e-6 max |vxc| error (f32 ρ).
+GPU offload of the RKS exchange–correlation grid integral (ρ projection → PBE vxc → vmat) and density-fitting Coulomb J is implemented in `pyscf/OpenCL/`, integrated into `pyscf/dft/rks.py` via `mf.backend` and `mf.setup_gpu()`. **Best per-cycle XC path (benzene cc-pVDZ):** `production_otf_radial_vmat` — OTF Hermite ρ + radial-gather vmat (~21 ms vs ~29 ms full OTF). Default general path remains `production_otf` (no radial setup). Quintic spline (`production_otf_quintic`) halves setup table build. Stage timing uses `gpu_timing.py` (wall+`queue.finish()` and `clGetEventProfilingInfo`). Precomputed paths (coalesced, radial-precomp) exist for parity/debug. PBE on GPU verified vs libxc; max |vxc| ~3e-5 vs CPU on benzene (f32 ρ).
 
 ## Implementations
 
 | Location | Status | Notes |
 |----------|--------|-------|
-| `pyscf/OpenCL/xc_grid.py` — `XCGridPlan`, setup/run API | active | Orchestrates ρ, PBE, vmat; LDA+GGA; stage timing |
-| `pyscf/OpenCL/kernels.cl` — tiled ρ/vmat, pair kernels | active | 55 kernels; OTF pair, precomp pair/coalesced/radial, legacy block paths |
+| `pyscf/OpenCL/xc_grid.py` — `XCGridPlan`, setup/run API | active | ρ/PBE/vmat; `vmat_mode='radial_precomp'` hybrid; `spline_order`; `plan.last_timing` |
+| `pyscf/OpenCL/gpu_timing.py` — kernel profiling helpers | active | `profile_kernel` (wall+CL events), `profile_call`; requires `PROFILING_ENABLE` queue |
+| `pyscf/OpenCL/kernels.cl` — tiled ρ/vmat, pair kernels | active | OTF tiled/pair, quintic Hermite, radial precomp ρ/vmat, PBE, reductions |
 | `pyscf/OpenCL/pbe.cl` — GPU PBE vxc | active | f32 default; f64 path with D2H for high precision; unpolarized PBE only |
 | `pyscf/OpenCL/hermite_spline.py` + `radial_hermite.py` | active | Host radial table build; mapped u-grid, cubic/quintic |
 | `pyscf/OpenCL/ao_hermite.py` — GPU Hermite AO setup | active | Optional pre-SCF AO materialization (`ao_proj='hermite_gpu'`) |
 | `pyscf/OpenCL/grid_screen.py` — atom tile screening | active | Rcut from Hermite tails; sparse pair atom lists |
 | `pyscf/OpenCL/df_jk.py` — RI J/K on GPU | active | Separate from XC; `mf.with_df.backend=2` |
-| `pyscf/OpenCL/gpu_profiles.py` | active | Named presets; cookbook in `doc/opencl_gpu_paths_cookbook.md` |
+| `pyscf/OpenCL/gpu_profiles.py` | active | `production_otf_radial_vmat`, `production_otf_quintic`; cookbook in `doc/opencl_gpu_paths_cookbook.md` |
+| `expamples_prokop/profile_xc_stages_benzene.py` | active | Per-stage wall vs CL timing; benzene benchmark driver for `doc/GPU_benchmark.md` |
 | `pyscf/dft/rks.py` — `backend`, `setup_gpu`, `get_veff` | active | Entry point for SCF; backend 3 = CPU/GPU compare |
 | CPU reference — `pyscf/dft/numint.py` | active | libxc + CPU `eval_ao`; parity baseline |
 
@@ -30,7 +32,9 @@ GPU offload of the RKS exchange–correlation grid integral (ρ projection → P
 | GPU ρ (OTF / precomp) vs CPU `NumInt` | max rel ~1e-5 (f32) | `test_opencl_xc_rho_precomp.py`, `test_opencl_xc_e2e_mols.py` |
 | GPU PBE wv vs CPU libxc | max abs ~1e-4–1e-3 on ρ components | `test_opencl_xc_full_gpu_parity.py` |
 | GPU vmat vs CPU (given same wv) | max rel ~1e-5 | `test_opencl_xc_vmat_precomp.py` |
-| Full path ρ→PBE→vmat vs CPU vxc | max ~3e-6 (benzene cc-pVDZ) | `test_opencl_xc_full_gpu_parity.py`, Part 6 in optimization report |
+| Full path ρ→PBE→vmat vs CPU vxc | max ~3e-5 (benzene cc-pVDZ, f32) | `test_opencl_xc_onthefly.py`, `test_opencl_xc_full_gpu_parity.py` |
+| Hybrid OTF ρ + radial vmat vs CPU vxc | max ~3.15e-5 | `profile_xc_stages_benzene.py`, `production_otf_radial_vmat` |
+| Quintic OTF ρ vs cubic OTF | shell-dependent; memory-equivalent du | `test_quintic_rho_otf.py` |
 | SCF energy convergence | matches CPU at conv_tol 1e-8 | `profile_gpu_scf.py`, `test_opencl_xc_scf.py` |
 | Hermite AO vs exact GTO | shell-dependent; see quintic report | `test_opencl_hermite_ao.py`, `hermite_radial_study.py` |
 
@@ -42,6 +46,45 @@ GPU offload of the RKS exchange–correlation grid integral (ρ projection → P
 - `MAX_ITILE` / `MAX_AO_ATOM` compile-time caps — molecules with many atoms per tile need tile reconfig or kernel extension
 - K matrix on GPU via DF exists but PBE RKS production profile uses J only
 - `generate_pbe_cl.py` must be re-run when updating libxc PBE source
+
+---
+
+## CPU smallDFT — grid-parallel XC (nao ≲ 200)
+
+### Summary
+
+CPU fast path for RKS grid XC on small molecules: OpenMP ρ and vmat in `libsmalldft.so`, libcint F-contiguous AO layout, drop-in `pyscf.smallDFT.nr_rks`. Complements the OpenCL GPU path for systems where GPU offload is unavailable or AO is cached on CPU. Python `ThreadPoolExecutor` grid tiles are legacy fallback only.
+
+### Implementations
+
+| Location | Status | Notes |
+|----------|--------|-------|
+| `pyscf/smallDFT/nr_rks.py` — drop-in `nr_rks` | active | C dispatch when `libsmalldft` built; `GridWorkspace` AO cache |
+| `pyscf/lib/smalldft/small_grid.c` — `SMALL_rho_*`, `SMALL_vmat_*` | active | TILE=512, strided BLAS, private vmat + hermi fix |
+| `pyscf/smallDFT/rho.py`, `vmat.py` | active | `use_c=True` → ctypes; Python threads deprecated |
+| `pyscf/smallDFT/workspace.py` — `GridWorkspace` | active | prealloc ρ/vmat; `chi` from `eval_ao_native` |
+| `pyscf/smallDFT/patch.py` — `enable()` | experimental | monkey-patch `NumInt.nr_rks` |
+| `pyscf/dft/numint.py` — reference CPU | active | parity baseline; OMP in libcint/libdft |
+| OpenCL `pyscf/OpenCL/xc_grid.py` | active | GPU analogue; see OpenCL topical section above |
+
+### Parity Status
+
+| Pair | Tolerance / result | Test reference |
+|------|-------------------|----------------|
+| C ρ_gga vs Python `rho_gga` | ~1e-12 | `expamples_prokop/test_small_dft.py --rho` |
+| C vmat_gga vs Python | ~1e-14 | same |
+| `smallDFT.nr_rks` vs `numint.nr_rks` (PBE) | vmat ~1e-14 | `expamples_prokop/test_small_dft.py` |
+| benzene scaling ρ @8 CPU | 5.94× (sub-task) | `doc/CPU_benchmark.md` |
+
+### Open Issues
+
+- **`eval_gto` not grid-parallel** — ~53 ms flat; dominant when AO cached
+- **Fuse ρ+vmat** not implemented — two full χ passes per `get_veff`
+- **vmat scales 3.9×** on 8 CPU (memory-bound GEMM vs ρ 5.9×)
+- **Python thread path** — do not extend; C-only policy
+- **MGGA / UKS / sparse screening** — not ported; LDA+GGA RKS only
+
+Doc: `/home/prokop/git/pyscf/doc/smallDFT_cpu_path.md` · Benchmarks: `/home/prokop/git/pyscf/doc/CPU_benchmark.md`
 
 ---
 

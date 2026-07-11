@@ -232,6 +232,20 @@ def apply_scf_kw(mf, scf_kw):
         setattr(mf, k, v)
 
 
+def prepare_df_for_scf(mf):
+    '''Prepare invariant DF data and GPU buffers before mf.kernel().'''
+    dfobj = getattr(mf, 'with_df', None)
+    if dfobj is None:
+        return mf
+    if dfobj._cderi is None:
+        dfobj.build()
+    if dfobj.backend & 2:
+        from pyscf.OpenCL.df_jk import prepare_df_jk_plan
+        mf._gpu_df_jk_plan = prepare_df_jk_plan(dfobj, mf.mol.nao_nr())
+    mf._df_prepared = True
+    return mf
+
+
 def _ensure_splitk_tile_config(setup_kw, quiet=True):
     '''Recompile kernels with WGS_VMAT=128 for split-K pair vmat (benzene sweep winner).'''
     if setup_kw.get('vmat_grid_splits', 1) <= 1:
@@ -247,7 +261,12 @@ def _ensure_splitk_tile_config(setup_kw, quiet=True):
 
 
 def apply_gpu_profile(mf, name=DEFAULT_PROFILE, setup=True, dm=None):
-    '''Configure mf (and DF backend) from a named profile; optionally run OpenCL setup.'''
+    '''Configure mf and prepare invariant XC/DF state before SCF.
+
+    With ``setup=True``, grids, GPU XC state, DF tensors, and GPU DF-J
+    buffers are prepared before ``mf.kernel()``. Density-dependent XC/J/K
+    contractions remain inside each SCF cycle.
+    '''
     prof = get_profile(name)
     mf.backend = prof['mf_backend']
     apply_scf_kw(mf, prof.get('scf_kw', {}))
@@ -273,6 +292,8 @@ def apply_gpu_profile(mf, name=DEFAULT_PROFILE, setup=True, dm=None):
             mf._gpu_xc_path = 'onthefly'
         else:
             raise ValueError(f'profile {name!r}: xc_path={xc_path!r}')
+    if setup:
+        prepare_df_for_scf(mf)
     mf._gpu_profile_name = name
     return mf
 

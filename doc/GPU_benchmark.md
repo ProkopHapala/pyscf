@@ -13,6 +13,11 @@ Benzene (`ccpvdz`, grid level 3, `nao=114`, `ngrids=143560`, OMP=1). One timed *
 **Profiles:** `pyscf/OpenCL/gpu_profiles.py`  
 **Cookbook:** `/home/prokop/git/pyscf/doc/opencl_gpu_paths_cookbook.md`
 
+**Scope note:** this document is an isolated, single-thread CPU-XC benchmark
+for benzene. Do not use its 10–50x XC-only ratios as full-SCF speedups. The
+same-input four-thread pentacene/PTCDA cycle decomposition is in
+`doc/acceptance_2026-07-11.md` (`profile_gpu_amdahl_strict.py`).
+
 ---
 
 ## Test machine

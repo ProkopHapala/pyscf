@@ -11,7 +11,7 @@ Notes, architecture reports, and agent guidance for PySCF OpenCL DFT GPU work an
 
 ## OpenCL XC / DFT — architecture and execution
 
-- **opencl_gpu_paths_cookbook.md** — SCF integration map, valid backend combinations, named profiles (`gpu_profiles.py`), setup vs per-cycle work
+- **opencl_gpu_paths_cookbook.md** — SCF integration map, valid backend combinations, named profiles (`gpu_profiles.py`), and static pre-SCF XC/DF preparation
 - **opencl_xc_architecture.md** — central quantities, array layouts (DM, χ, ρ, wv, vmat), memory budgets, path comparison (OTF vs precomp)
 - **OpenCL_XC_execution.md** — one SCF cycle: three distinct ops (eval_ao, ρ projection, vmat), what runs once vs every `get_veff`
 - **opencl-xc-developer-guide.md** — living developer guide: hot path checklist, hoisting rules, debugging workflow
@@ -19,10 +19,11 @@ Notes, architecture reports, and agent guidance for PySCF OpenCL DFT GPU work an
 - **opencl_rho_precomp_layout.md** — ρ projection kernel memory layout and coalesced gather design (precomp GTO path)
 - **rho_vmat_vxc_GPU_optimization.report.md** — master optimization report (Parts 1–10): vmat tiling, pair kernels, parity audits, benzene/pentacene/PTCDA benchmarks, SCF profiling
 - **quintic_hermite_spline.md** — cubic vs quintic Hermite radial spline study, accuracy vs memory trade-offs
-- **GPU_benchmark.md** — benzene per-cycle XC stage timings (wall vs CL events); hybrid OTF ρ + radial vmat; split-K; test machine specs; tile sweep report
+- **GPU_benchmark.md** — benzene isolated-XC stage timings (wall vs CL events); hybrid OTF ρ + radial vmat; split-K; tile sweep report
 - **GPU_optimixation_experience.md** — lessons learned: strategies, caveats, disproved assumptions, generalization from GPU XC optimization
 - **dft_profiling_results.md** — CPU DFT baseline timings (`profile_dft.py`), grid-level and thread sweeps
 - **dimer_scan_benchmarks.md** — inter-fragment distance scans: `--n0` fragment split, all XC paths, E(z) parity results (H₂O, formic)
+- **acceptance_2026-07-11.md** — CPU/GPU rigor and performance acceptance report; RTX 3090 large-molecule strict Amdahl profile and static-preparation results
 
 ## OpenCL XC — chronological reports
 

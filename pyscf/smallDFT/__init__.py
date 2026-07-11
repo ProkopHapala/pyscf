@@ -2,9 +2,9 @@
 
 OpenMP ρ/vmat in libsmalldft replaces the hot loops of numint.nr_rks while
 keeping libcint AO layout (F-contiguous ngrids×nao). Python is orchestration
-only: eval_ao_native, libxc, ctypes dispatch. Cache AO per geometry via
-GridWorkspace; linear scaling applies to optimized sub-tasks (ρ, vmat), not
-eval_gto until that is ported.
+only: eval_ao_native, libxc, ctypes dispatch. libcint already parallelizes
+grid AO evaluation with OpenMP; GridWorkspace supplies its reusable raw buffer
+to avoid allocating and copying χ at each geometry update.
 
 See doc/smallDFT_cpu_path.md and doc/CPU_benchmark.md.
 

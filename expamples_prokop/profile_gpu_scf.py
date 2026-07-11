@@ -16,6 +16,7 @@ Usage:
 import argparse
 import cProfile
 import io
+import json
 import os
 import pstats
 import re
@@ -30,9 +31,10 @@ if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(line_buffering=True)
 
 _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-_XYZ = os.path.join(_REPO, 'data', 'xyz', 'benzene.xyz')
+_XYZ_DIR = os.path.join(_REPO, 'data', 'xyz')
 
 _timers = {}
+_timers_installed = False
 
 
 def log(msg):
@@ -56,38 +58,66 @@ def _wrap(label, fn):
         t0 = time.perf_counter()
         out = fn(*args, **kwargs)
         dt = time.perf_counter() - t0
-        rec = _timers.setdefault(label, {'calls': 0, 'wall': 0.0})
+        rec = _timers.setdefault(label, {'calls': 0, 'wall': 0.0, 'init': 0.0, 'cycle': 0.0, 'calls_ms': []})
+        phase = 'init' if rec['calls'] == 0 else 'cycle'
         rec['calls'] += 1
         rec['wall'] += dt
+        rec[phase] += dt
+        rec['calls_ms'].append(dt * 1e3)
         return out
     wrapped.__name__ = getattr(fn, '__name__', label)
     return wrapped
 
 
 def install_timers():
+    global _timers_installed
+    if _timers_installed:
+        return
     from pyscf.scf import hf as hf_mod
     from pyscf.dft import rks as rks_mod
+    from pyscf.dft import gen_grid
+    from pyscf.df import df as df_mod
+    from pyscf.df import df_jk as dfjk_mod
     hf_mod.kernel = _wrap('scf.kernel', hf_mod.kernel)
     rks_mod.get_veff = _wrap('rks.get_veff', rks_mod.get_veff)
     rks_mod.RKS.get_veff = rks_mod.get_veff
+    for name in ('get_hcore', 'get_ovlp', 'get_init_guess', 'get_fock', 'eig',
+                 'get_occ', 'make_rdm1', 'energy_tot', 'get_grad',
+                 'check_linear_dependency', 'pre_kernel'):
+        fn = getattr(hf_mod.SCF, name, None)
+        if fn is not None:
+            setattr(hf_mod.SCF, name, _wrap(f'scf.{name}', fn))
     _orig_get_jk = hf_mod.SCF.get_jk
-    hf_mod.SCF.get_jk = lambda self, *a, **kw: _wrap('scf.get_jk', _orig_get_jk)(self, *a, **kw)
-    from pyscf.df import df_jk as dfjk_mod
+    hf_mod.SCF.get_jk = _wrap('scf.get_jk', _orig_get_jk)
     dfjk_mod.get_jk = _wrap('df.get_jk', dfjk_mod.get_jk)
-    _orig_eig = hf_mod.SCF.eig
-    hf_mod.SCF.eig = lambda self, *a, **kw: _wrap('scf.eig', _orig_eig)(self, *a, **kw)
-    _orig_get_fock = hf_mod.SCF.get_fock
-    hf_mod.SCF.get_fock = lambda self, *a, **kw: _wrap('scf.get_fock', _orig_get_fock)(self, *a, **kw)
+    dfjk_mod._get_jk_cpu = _wrap('df._get_jk_cpu', dfjk_mod._get_jk_cpu)
+    df_mod.DF.build = _wrap('df.build', df_mod.DF.build)
+    gen_grid.Grids.build = _wrap('grid.build', gen_grid.Grids.build)
+    try:
+        from pyscf.OpenCL import df_jk as gpu_dfjk
+        gpu_dfjk.df_jk_gpu = _wrap('gpu_df_jk', gpu_dfjk.df_jk_gpu)
+        gpu_dfjk.DFJKPlan.__init__ = _wrap('gpu_df_plan_init', gpu_dfjk.DFJKPlan.__init__)
+        gpu_dfjk.DFJKPlan.get_jk = _wrap('gpu_df_jk_contract', gpu_dfjk.DFJKPlan.get_jk)
+        from pyscf.OpenCL import xc_grid
+        xc_grid.XCGridPlan.setup_onthefly = _wrap('gpu_xc_setup', xc_grid.XCGridPlan.setup_onthefly)
+        xc_grid.XCGridPlan.nr_rks_hermite_onthefly = _wrap('gpu_xc_outer', xc_grid.XCGridPlan.nr_rks_hermite_onthefly)
+    except ImportError:
+        pass
+    _timers_installed = True
 
 
 def print_timers():
     if not _timers:
         return
     log('\n--- Python wall timers (monkey-patch) ---')
-    log(f'{"label":<22} {"calls":>6} {"wall_ms":>10} {"per_call_ms":>12}')
+    log(f'{"label":<22} {"calls":>6} {"init_ms":>10} {"cycle_ms":>10} {"wall_ms":>10}')
     for label, rec in sorted(_timers.items(), key=lambda x: -x[1]['wall']):
-        pc = rec['wall'] / rec['calls'] * 1e3 if rec['calls'] else 0
-        log(f'{label:<22} {rec["calls"]:>6} {rec["wall"]*1e3:>10.1f} {pc:>12.1f}')
+        log(f'{label:<22} {rec["calls"]:>6} {rec["init"]*1e3:>10.1f} {rec["cycle"]*1e3:>10.1f} {rec["wall"]*1e3:>10.1f}')
+    log('  call sequence (ms):')
+    for label, rec in sorted(_timers.items(), key=lambda x: -x[1]['wall']):
+        if rec['calls'] > 1:
+            vals = ', '.join(f'{v:.1f}' for v in rec['calls_ms'])
+            log(f'    {label:<20} {vals}')
 
 
 def print_gpu_xc_acc(mf):
@@ -109,13 +139,14 @@ def print_gpu_xc_acc(mf):
     log(f'  {"host_xc_pcie":22s} total={host_total:9.1f} ms  per_cycle={host_total/n_cycles:7.1f} ms')
 
 
-def build_mf(basis, grid_level, use_df, conv_tol):
-    mol = gto.M(atom=read_xyz(_XYZ), basis=basis, verbose=0)
+def build_mf(mol_name, basis, grid_level, use_df, conv_tol, max_cycle, xyz_dir=_XYZ_DIR):
+    xyz_path = os.path.join(xyz_dir, f'{mol_name}.xyz')
+    mol = gto.M(atom=read_xyz(xyz_path), basis=basis, verbose=0)
     mf = dft.RKS(mol, xc='PBE')
     mf.grids.level = grid_level
     mf.conv_tol = conv_tol
     mf.conv_tol_grad = 1e-5
-    mf.max_cycle = 50
+    mf.max_cycle = max_cycle
     if use_df:
         mf = mf.density_fit()
     return mf
@@ -137,6 +168,8 @@ def configure_mode(mf, mode):
         mf.backend = 1
         if 'with_df' in mf.__dict__ and mf.with_df is not None:
             mf.with_df.backend = 1
+        from pyscf.OpenCL.gpu_profiles import prepare_df_for_scf
+        prepare_df_for_scf(mf)
         return mf
     from pyscf.OpenCL import init_device
     from pyscf.OpenCL.gpu_profiles import apply_gpu_profile
@@ -148,7 +181,6 @@ def configure_mode(mf, mode):
 
 
 def run_scf(mf, do_profile):
-    _timers.clear()
     mf.__dict__['_gpu_timing_acc'] = {}
     t0 = time.perf_counter()
     if do_profile:
@@ -165,18 +197,31 @@ def run_scf(mf, do_profile):
     wall = time.perf_counter() - t0
     n_cycles = getattr(mf, 'cycles', 0) or 1
     mf.__dict__['_gpu_profile_cycles'] = n_cycles
-    return dict(energy=e, wall_s=wall, converged=mf.converged, cycles=n_cycles, cprofile=cprofile_text)
+    def timer_ms(label, phase):
+        return _timers.get(label, {}).get(phase, 0.0) * 1e3
+    return dict(energy=e, wall_s=wall, converged=mf.converged, cycles=n_cycles,
+                init_veff_ms=timer_ms('rks.get_veff', 'init'),
+                cycle_veff_ms=timer_ms('rks.get_veff', 'cycle'),
+                init_j_ms=timer_ms('df.get_jk', 'init'),
+                cycle_j_ms=timer_ms('df.get_jk', 'cycle'),
+                init_eig_ms=timer_ms('scf.eig', 'init'),
+                cycle_eig_ms=timer_ms('scf.eig', 'cycle'),
+                timers={k: list(v.get('calls_ms', [])) for k, v in _timers.items()},
+                cprofile=cprofile_text)
 
 
 def main():
     ap = argparse.ArgumentParser(description='Full SCF profile: CPU vs GPU')
+    ap.add_argument('--mols', nargs='+', default=['benzene'], choices=['benzene', 'pentacene', 'PTCDA'])
     ap.add_argument('--mode', nargs='+', default=['cpu', 'gpu_otf', 'gpu_full'],
                     choices=['cpu', 'gpu_otf', 'gpu_coalesced', 'gpu_full'])
     ap.add_argument('--basis', default='ccpvdz')
     ap.add_argument('--grid-level', type=int, default=3)
     ap.add_argument('--conv-tol', type=float, default=1e-8)
+    ap.add_argument('--max-cycle', type=int, default=50, help='SCF iterations; use 1 for one-cycle Amdahl profiling')
     ap.add_argument('--no-df', action='store_true')
     ap.add_argument('--profile', action='store_true', help='cProfile last mode only')
+    ap.add_argument('--json', default=None, help='write detailed timer records to JSON')
     ap.add_argument('--threads', type=int, default=None)
     args = ap.parse_args()
 
@@ -189,12 +234,18 @@ def main():
     use_df = not args.no_df
     rows = []
 
-    for mode in args.mode:
+    for mol_name in args.mols:
+      for mode in args.mode:
         log(f'\n{"="*72}')
-        log(f'MODE: {mode}  basis={args.basis}  grid={args.grid_level}  DF={use_df}')
-        mf = build_mf(args.basis, args.grid_level, use_df, args.conv_tol)
+        log(f'MOLECULE: {mol_name}  MODE: {mode}  basis={args.basis}  grid={args.grid_level}  DF={use_df}')
+        t_build = time.perf_counter()
+        mf = build_mf(mol_name, args.basis, args.grid_level, use_df, args.conv_tol, args.max_cycle)
+        build_ms = (time.perf_counter() - t_build) * 1e3
         nao = mf.mol.nao_nr()
+        _timers.clear()
+        t_setup = time.perf_counter()
         configure_mode(mf, mode)
+        setup_ms = (time.perf_counter() - t_setup) * 1e3
         prof_name = _MODE_TO_PROFILE.get(mode)
         if prof_name:
             from pyscf.OpenCL.gpu_profiles import get_profile
@@ -202,9 +253,10 @@ def main():
             log(f'  profile={prof_name}  scf_tol={p.get("scf_kw")}  note={p.get("accuracy", {}).get("energy_note", "")}')
         log(f'  nao={nao}  backend={getattr(mf,"backend",1)}  df_backend={getattr(mf.with_df,"backend",1) if use_df else "n/a"}')
 
-        do_prof = args.profile and (mode == args.mode[-1])
+        do_prof = args.profile and (mode == args.mode[-1] and mol_name == args.mols[-1])
         out = run_scf(mf, do_prof)
-        rows.append(dict(mode=mode, **out))
+        rows.append(dict(molecule=mol_name, mode=mode, build_ms=build_ms, setup_ms=setup_ms, **out))
+        log(f'  molecular build={build_ms:.1f} ms  backend setup={setup_ms:.1f} ms')
         log(f'  converged={out["converged"]}  cycles={out["cycles"]}  E={out["energy"]:.10f}')
         log(f'  total wall={out["wall_s"]:.2f} s  per_cycle={out["wall_s"]/max(out["cycles"],1)*1e3:.1f} ms')
         print_timers()
@@ -215,15 +267,22 @@ def main():
 
     log(f'\n{"="*72}')
     log('SUMMARY')
-    log(f'{"mode":<16} {"cycles":>6} {"wall_s":>8} {"ms/cyc":>8} {"conv":>5}')
+    log(f'{"molecule":<12} {"mode":<16} {"cycles":>6} {"wall_s":>8} {"ms/cyc":>8} {"conv":>5}')
     for r in rows:
         ms = r['wall_s'] / max(r['cycles'], 1) * 1e3
-        log(f'{r["mode"]:<16} {r["cycles"]:>6} {r["wall_s"]:>8.2f} {ms:>8.1f} {str(r["converged"]):>5}')
-    if len(rows) >= 2 and rows[0]['mode'] == 'cpu':
-        cpu_ms = rows[0]['wall_s'] / max(rows[0]['cycles'], 1)
-        for r in rows[1:]:
-            gpu_ms = r['wall_s'] / max(r['cycles'], 1)
-            log(f'  {r["mode"]} speedup vs cpu: {cpu_ms/gpu_ms:.2f}x per cycle')
+        log(f'{r["molecule"]:<12} {r["mode"]:<16} {r["cycles"]:>6} {r["wall_s"]:>8.2f} {ms:>8.1f} {str(r["converged"]):>5}')
+    for mol_name in args.mols:
+        cpu = next((r for r in rows if r['molecule'] == mol_name and r['mode'] == 'cpu'), None)
+        if cpu is None:
+            continue
+        cpu_ms = cpu['wall_s'] / max(cpu['cycles'], 1) * 1e3
+        for r in (x for x in rows if x['molecule'] == mol_name and x['mode'] != 'cpu'):
+            gpu_ms = r['wall_s'] / max(r['cycles'], 1) * 1e3
+            log(f'  {mol_name} {r["mode"]} speedup vs cpu: {cpu_ms/gpu_ms:.2f}x per cycle')
+    if args.json:
+        with open(args.json, 'w') as f:
+            json.dump(rows, f, indent=2)
+        log(f'Wrote detailed profile: {args.json}')
 
 
 if __name__ == '__main__':

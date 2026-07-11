@@ -23,14 +23,14 @@ Impact / effort priority (H2O + benzene profiling)
 | 2 | Native χ[g0:g1,:] contiguous (PySCF layout, no transpose) | S (done) | avoids copy | F-contiguous (ngrids,nao) |
 | 3 | lib.num_threads(1) + grid n_workers | S (done) | required | nested OMP+threads was killing scaling |
 | 4 | Persistent ThreadPool, one tile per worker | S (done) | reduces overhead | tile_size = ngrids // n_workers |
-| 5 | Full nr_rks faster | — | limited | eval_gto ~50%; use precompute_ao + nw=4 |
-| 6 | eval_gto grid-parallel | M–L | biggest remaining win | C/Hermite gTile |
-| 7 | Fuse ρ+vmat single χ pass | M | saves one χ read | after P1–4 plateau |
-| 8 | C/OpenMP kernels (port OpenCL gTile) | L | best CPU ceiling | smallDFT/small_grid.c later |
+| 5 | Workspace AO raw-buffer reuse | S (done) | avoids χ allocation/copy | libcint already grid-parallel |
+| 6 | Improve RI-J / DF J | M | biggest converged-cycle win with DF | ~46 ms/cycle at 4 threads |
+| 7 | Tile rho → libxc → vmat pipeline | M | saves second χ pass | needs private tile vmat reduction |
+| 8 | vmat bandwidth tuning | M | CPU ceiling | measure on an unconstrained host |
 
-Bottleneck summary (nr_rks, 1 thread):
-  H2O:     eval_gto ~43%, libxc ~31%, dgemm ~13%
-  benzene: eval_gto ~50%, dgemm ~34%, libxc ~6%
+Bottleneck summary (benzene, cached AO, effective 4 threads):
+  XC:      rho ~43%, libxc ~18%, vmat ~39%
+  RKS+DF:  DF J ~46 ms/cycle, XC ~38 ms/cycle
 '''
 
 

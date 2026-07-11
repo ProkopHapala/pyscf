@@ -29,8 +29,16 @@ def to_chi_T(ao, deriv=0, out=None):
     return out
 
 
-def eval_ao_native(mol, coords, deriv=0, non0tab=None, cutoff=None, out=None):
-    ao = eval_ao(mol, coords, deriv=deriv, non0tab=non0tab, cutoff=cutoff)
+def eval_ao_native(mol, coords, deriv=0, non0tab=None, cutoff=None, out=None, buf=None):
+    '''Evaluate AO in libcint grid-major layout.
+
+    ``buf`` is a raw C-contiguous backing buffer for libcint.  It avoids a
+    transient AO allocation; unlike ``out`` it is not interpreted as an AO
+    array because libcint returns a transposed view into this storage.
+    '''
+    if out is not None and buf is not None:
+        raise ValueError('eval_ao_native accepts at most one of out and buf')
+    ao = eval_ao(mol, coords, deriv=deriv, non0tab=non0tab, cutoff=cutoff, out=buf)
     ao = ensure_native(ao, deriv=deriv)
     if out is None:
         return ao

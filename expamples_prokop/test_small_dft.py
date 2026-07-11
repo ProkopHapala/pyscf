@@ -3,6 +3,7 @@
 import sys
 import time
 
+import numpy
 from pyscf import gto, dft, lib
 from pyscf.smallDFT import nr_rks, profile_compare, shutdown_pool
 from pyscf.dft import numint
@@ -149,6 +150,33 @@ def _parity_gga_c(mol_atom, label):
     print(f'{label} PBE rho_gga C parity OK  max diff={diff:.2e}')
 
 
+def _parity_workspace_ao(mol_atom, label):
+    from pyscf.smallDFT.layout import eval_ao_native
+    from pyscf.smallDFT.workspace import GridWorkspace
+
+    mol = gto.M(atom=mol_atom, basis=BASIS)
+    mf = dft.RKS(mol, xc='PBE')
+    mf.grids.level = 3
+    mf.grids.build()
+    ref = eval_ao_native(mol, mf.grids.coords, deriv=1,
+                         non0tab=mf.grids.non0tab, cutoff=mf.grids.cutoff)
+    ws = GridWorkspace(mol, mf.grids, deriv=1)
+    chi = ws.eval_ao(mol, mf.grids)
+    diff = abs(ref - chi).max()
+    assert diff < 1e-14
+    assert numpy.shares_memory(chi, ws.ao_buf)
+    assert chi[0].flags.f_contiguous
+    mf.kernel()
+    dm = mf.make_rdm1()
+    ni = numint.NumInt()
+    n0, e0, v0 = ni.nr_rks(mol, mf.grids, 'PBE', dm)
+    n1, e1, v1 = nr_rks(ni, mol, mf.grids, 'PBE', dm, ws=ws)
+    assert abs(n0 - n1) < 1e-7
+    assert abs(e0 - e1) < 1e-7
+    assert abs(v0 - v1).max() < 1e-6
+    print(f'{label} workspace AO + nr_rks parity OK  AO={diff:.2e}  vmat={abs(v0-v1).max():.2e}')
+
+
 def _bench_rho_gga_c(mol_atom, label):
     from pyscf.smallDFT.layout import eval_ao_native
     from pyscf.smallDFT.rho import rho_gga
@@ -177,6 +205,8 @@ if __name__ == '__main__':
     _parity_lda_c(BENZENE, 'benzene')
     _parity_gga_c(MOL, 'H2O')
     _parity_gga_c(BENZENE, 'benzene')
+    _parity_workspace_ao(MOL, 'H2O')
+    _parity_workspace_ao(BENZENE, 'benzene')
     _bench(MOL, 'H2O')
     _bench(BENZENE, 'benzene')
     if '--rho' in sys.argv:

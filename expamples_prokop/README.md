@@ -41,6 +41,8 @@ Custom benchmarks and parity checks for the OpenCL XC/DF GPU path — not upstre
 - **profile_xc_stages_benzene.py** — per-stage XC timing table (wall + CL events); all paths including split-K; feeds `doc/GPU_benchmark.md`
 - **profile_scf_cycle.py** — full SCF cycle breakdown (J + XC per iteration)
 - **profile_gpu_scf.py** — full SCF convergence profile, per-cycle vxc accuracy
+- **profile_gpu_amdahl_strict.py** — non-overlapping same-input CPU/GPU SCF-cycle Amdahl profile; validates manual `veff` against `mf.get_veff`
+- **plot_gpu_scf_amdahl.py** — plot prepared end-to-end and repeated-cycle SCF timing data from the acceptance run
 - **profile_dft.py** — CPU DFT bottleneck profiler (cProfile + PySCF timers)
 - **sweep_splitk_tiles.py** — **recommended** tile sweep for split-K: `--neighbor` 1-step lattice walk from `--seed`
 - **sweep_opencl_tiles.py** — legacy brute-force `TileConfig` grid (NPTILE, NATILE, WGS_VMAT, …)

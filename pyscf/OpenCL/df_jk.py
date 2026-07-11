@@ -139,6 +139,17 @@ def get_df_jk_plan(dfobj, nao):
     return plan
 
 
+def prepare_df_jk_plan(dfobj, nao):
+    '''Build DF data and upload the GPU J/K plan before entering SCF.'''
+    if dfobj._cderi is None:
+        dfobj.build()
+    plan = get_df_jk_plan(dfobj, nao)
+    # PBE/RKS J-only calls use one density matrix. Allocate this invariant
+    # workspace before the SCF loop so the first get_j is a normal cycle call.
+    plan.ensure_nset(1)
+    return plan
+
+
 def df_jk_gpu(dfobj, dm, hermi=0, with_j=True, with_k=True):
     '''DF J/K contraction on GPU using tiled GEMM.
 

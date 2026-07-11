@@ -32,7 +32,7 @@ from pyscf.OpenCL.gpu_profiles import apply_gpu_profile, list_profiles
 
 mol = gto.M(atom='...', basis='cc-pVDZ')
 mf = dft.RKS(mol, xc='PBE').density_fit()
-apply_gpu_profile(mf, 'production_otf')   # sets backend, DF, conv_tol, setup_gpu
+apply_gpu_profile(mf, 'production_otf')   # prepares grids, DF tensor, GPU XC state before mf.kernel()
 mf.kernel()
 ```
 
@@ -44,6 +44,11 @@ mf.backend = 2
 mf.setup_gpu(profile='production_otf')
 mf.kernel()
 ```
+
+`setup=True` performs only geometry/basis/grid-invariant work: grid build, DF
+three-center tensor build, GPU XC tables/buffers, and (for GPU DF) the resident
+DF-J plan. These are once per geometry/setup, never once per SCF cycle. The
+cycle still recomputes density-dependent rho, PBE, vmat, and J/K.
 
 ---
 
@@ -274,11 +279,15 @@ print(mf._gpu_timing_acc)  # rho, xc, vmat, sync per get_veff
 | `expamples_prokop/test_opencl_xc_e2e_mols.py` | Speed + accuracy, arbitrary XYZ |
 | `expamples_prokop/test_opencl_xc_cpu_threads.py` | CPU thread scaling vs GPU |
 | `expamples_prokop/profile_gpu_scf.py` | Full converged SCF, cProfile + timers |
+| `expamples_prokop/profile_gpu_amdahl_strict.py` | Same-input, non-overlapping CPU/GPU cycle decomposition; validates manual `veff` |
 | `expamples_prokop/profile_xc_stages_benzene.py` | Per-stage wall vs CL timing; hybrid path comparison |
 | `expamples_prokop/test_quintic_rho_otf.py` | Quintic vs cubic OTF ρ parity |
 
 ```bash
 PYTHONPATH=/home/prokop/git/pyscf OMP_NUM_THREADS=15 python3 -u expamples_prokop/profile_gpu_scf.py --mode cpu gpu_otf gpu_full
+
+PYTHONPATH=/home/prokop/git/pyscf OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=4 \
+python3 -u expamples_prokop/profile_gpu_amdahl_strict.py --mols pentacene PTCDA --threads 4
 ```
 
 ---

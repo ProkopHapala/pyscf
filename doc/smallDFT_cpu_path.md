@@ -10,7 +10,10 @@ timestamp: 2026-07-08
 
 **smallDFT** is a CPU fast path for RKS grid XC on small molecules (`nao ≲ 200`, `ngrids ~ 30k–150k`). It replaces PySCF `numint.nr_rks` grid ρ/vmat with **grid-tile OpenMP kernels** in `libsmalldft.so`, keeping libcint AO layout (F-contiguous `(ngrids, nao)`). Python is thin orchestration: AO eval, libxc, ctypes dispatch. The deprecated Python `ThreadPoolExecutor` tile path remains as fallback when `libsmalldft` is not built.
 
-Linear CPU scaling is expected **only on optimized sub-tasks** (ρ, vmat), not on the full `nr_rks` call until `eval_gto` is grid-parallel.
+libcint already evaluates grid AO blocks with OpenMP. `GridWorkspace` now
+passes reusable raw storage directly to that evaluator, removing the transient
+χ allocation and copy at every geometry update. Full `nr_rks` scaling still
+depends on AO, libxc, and vmat balance, so it must be measured per host.
 
 ## Data flow (one SCF `get_veff` with AO cached)
 
@@ -45,7 +48,10 @@ flowchart LR
 
 **No Python copy** into kernels: ctypes passes the NumPy buffer pointer. BLAS uses `lda=ngrids` on χ tiles so grid slices need no pack buffer (unlike a naive row-major GEMM).
 
-`GridWorkspace.chi` must come from `eval_ao_native` — do not preallocate `(4, ngrids, nao)` yourself (breaks `chi[0]` F-contiguity).
+`GridWorkspace.chi` must come from `eval_ao_native`. The workspace owns a
+separate C-contiguous raw buffer which libcint fills; the returned χ view keeps
+`chi[0]` F-contiguous for the C kernels. Do not substitute a manually shaped χ
+array for this view.
 
 ## API
 
@@ -115,6 +121,7 @@ Tile size `TILE=512` (build-time override: `SMALLDFT_TILE=1024 pyscf/lib/smalldf
 | C vmat vs Python `vmat_gga` | ~1e-14 | same |
 | `smallDFT.nr_rks` vs `numint.nr_rks` (PBE) | vmat ~1e-14 | `test_small_dft.py` |
 | LDA C ρ | ~1e-13 | `test_small_dft.py` |
+| Reused workspace AO + `nr_rks` vs reference | AO exact; vmat ~1e-14 | `test_small_dft.py` |
 
 Run: `PYTHONPATH=/home/prokop/git/pyscf python3 expamples_prokop/test_small_dft.py`
 
@@ -138,9 +145,9 @@ Benchmark tables: `/home/prokop/git/pyscf/doc/CPU_benchmark.md` (includes one-SC
 
 | P | item | notes |
 |---|------|-------|
-| 1 | Fuse ρ+vmat in one χ pass | cut memory traffic ~2× |
-| 2 | Grid-parallel `eval_gto` | `eval_ao` ~53 ms flat; now dominant vs XC |
-| 3 | vmat bandwidth tuning | scales 3.9× not 6× on 8 CPU |
+| 1 | Improve RI-J / DF J | dominates the converged cycle after cached XC is accelerated |
+| 2 | Fuse tiled rho → libxc → vmat | requires tile-local vmat reduction; not a direct one-pass GGA fusion |
+| 3 | vmat bandwidth tuning | scales less than rho once all cores are available |
 | 4 | Attach `GridWorkspace` on `mf` in `patch.enable()` | zero setup boilerplate |
 
 ## Related docs

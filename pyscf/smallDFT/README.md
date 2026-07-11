@@ -28,8 +28,8 @@ OPENBLAS_NUM_THREADS=1 PYTHONPATH=/home/prokop/git/pyscf \
 - **nr_rks.py** — drop-in replacement for `numint.nr_rks`; dispatches to C when `libsmalldft` loaded
 - **rho.py** / **vmat.py** — ρ and vmat drivers; `use_c=True` → ctypes → OpenMP kernels
 - **_ctypes.py** — `libsmalldft` load + `SMALL_*` bindings
-- **workspace.py** — `GridWorkspace`: preallocated ρ/vmat buffers; `eval_ao()` sets χ from `eval_ao_native`
-- **layout.py** — keep libcint F-contiguous `(ngrids, nao)`; `eval_ao_native` entry point
+- **workspace.py** — `GridWorkspace`: preallocated ρ/vmat and raw AO storage; `eval_ao()` lets libcint fill it directly
+- **layout.py** — keep libcint F-contiguous `(ngrids, nao)`; `eval_ao_native(buf=...)` avoids transient AO allocation
 - **patch.py** — `enable()` / `disable()` monkey-patch on `NumInt.nr_rks`
 - **profile.py** — `profile_xc_bottleneck`, `profile_compare`, timing breakdowns
 - **parallel.py** — legacy Python `ThreadPoolExecutor` tiles (fallback only; do not extend)

@@ -575,6 +575,8 @@ class KohnShamDFT:
             self._gpu_xc_path = 'onthefly'
         else:
             raise ValueError(f'xc_path={xc_path!r}; use precomputed or onthefly')
+        from pyscf.OpenCL.gpu_profiles import prepare_df_for_scf
+        prepare_df_for_scf(self)
         return self
 
     def to_gpu(self):

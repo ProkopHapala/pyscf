@@ -142,9 +142,9 @@ The zeroing was ~40% of vmat kernel time — a significant fraction of local mem
 | OTF ρ + rad vmat | 22.8 | 4.6 | 17.5 | 3.15e-05 |
 | OTF ρ + rad vmat splitK | 14.2 | 6.1 | 7.7 | 3.16e-05 |
 | Radial screened | 15.6 | 3.1 | 12.1 | 3.18e-05 |
-| **Radial screened splitK** | **10.0** | 3.1 | **6.3** | 3.18e-05 |
+| **Radial screened splitK** | **8.4** | 3.1 | **4.9** | 3.18e-05 |
 
-**Benzene: 10.0 ms** — new fastest path, 30% faster than OTF splitK (14.2 ms), 44× faster than CPU (446 ms).
+**Benzene: 8.4 ms** — new fastest path, 36% faster than OTF splitK (13.3 ms), 53× faster than CPU (449 ms).
 
 ### PTCDA (6-31g, grid 2, nao=286, ngrids=379216, OMP=1)
 
@@ -156,18 +156,18 @@ The zeroing was ~40% of vmat kernel time — a significant fraction of local mem
 | OTF ρ + rad vmat | 361.9 | 115.5 | 245.9 | 1.64e-03 |
 | OTF ρ + rad vmat splitK | 306.8 | 118.0 | 188.2 | 1.64e-03 |
 | Radial screened | 94.1 | 26.7 | 66.9 | 1.64e-03 |
-| **Radial screened splitK** | **73.4** | 27.7 | **45.1** | 1.64e-03 |
+| **Radial screened splitK** | **77.1** | 31.4 | **44.8** | 1.64e-03 |
 
-**PTCDA: 73.4 ms** — 4.3× faster than OTF splitK (306.8 ms), 22% faster than screened without splitK (94.1 ms).
+**PTCDA: 77.1 ms** — 4.6× faster than OTF splitK (354.4 ms), 30% faster than screened without splitK (110.1 ms).
 
 ### Speedup summary
 
 | Metric | Benzene | PTCDA |
 |--------|--------:|------:|
-| vs CPU libxc | 44× | — |
-| vs OTF cubic | 2.5× | 4.3× |
-| vs OTF splitK (prev best) | 1.4× | 4.2× |
-| vs Radial screened (no splitK) | 1.6× | 1.3× |
+| vs CPU libxc | 53× | — |
+| vs OTF cubic | 3.4× | 4.2× |
+| vs OTF splitK (prev best) | 1.6× | 4.6× |
+| vs Radial screened (no splitK) | 2.1× | 1.4× |
 
 ---
 
@@ -177,8 +177,104 @@ The zeroing was ~40% of vmat kernel time — a significant fraction of local mem
 |------|--------|
 | `pyscf/OpenCL/kernels.cl` | New `vmat_gga_radial_screened_pair_splitk` kernel; removed local-mem zeroing from both screened vmat kernels; reverted upper-triangle skip |
 | `pyscf/OpenCL/xc_grid.py` | `vmat_grid_splits>1` support for `radial_screened` mode; partial vmat buffer allocation; splitk kernel arg wiring |
-| `pyscf/OpenCL/gpu_profiles.py` | New `production_radial_screened_splitk` profile (splits=4) |
+| `pyscf/OpenCL/gpu_profiles.py` | New `production_radial_screened_splitk` profile (splits=16, WGS=64); `_ensure_splitk_tile_config` now supports per-profile `splitk_wgs` |
 | `expamples_prokop/profile_xc_stages_benzene.py` | Added `Radial screened splitK` stage |
+| `expamples_prokop/sweep_screened_splitk.py` | New: independent NPTILE/WGS/splits sweep for screened path, reports rho_cl and vmat_cl separately |
+
+---
+
+## Tile sweep results
+
+Sweep script: `expamples_prokop/sweep_screened_splitk.py` — independently varies `NPTILE`, `WGS_VMAT`, and `vmat_grid_splits`, reports `rho_cl` and `vmat_cl` separately so optimal parameters for each kernel are visible.
+
+### Benzene (cc-pVDZ, grid 3, nao=114, ngrids=143560)
+
+Full sweep: NPTILE ∈ {32,64,128}, WGS ∈ {32,64,128,256}, splits ∈ {1,2,4,8,16,32}.
+
+**Best per metric:**
+
+| Metric | NPTILE | WGS | splits | Value (ms) |
+|--------|-------:|----:|-------:|-----------:|
+| rho_cl | 64 | 64 | 4 | 2.9 |
+| vmat_cl | 128 | 128 | 16 | 4.3 |
+| **gpu_total_cl** | **128** | **128** | **16** | **7.7** |
+
+Key findings:
+- **NPTILE=128** is best for vmat (fewer barriers, more work per tile) but slightly worse for rho
+- **WGS=128** matches NPTILE=128 — one thread per grid point, no stride overhead
+- **splits=16** optimal — enough to fill 82 CUs with 12²=144 pairs × 16 = 2304 WGs
+- **splits=1** (no split-K): 14.3 ms — split-K gives 1.9× speedup
+- rho is relatively insensitive to WGS (2.9–4.3 ms range)
+
+### PTCDA (6-31g, grid 2, nao=286, ngrids=379216)
+
+Focused sweep: NPTILE ∈ {32,64,128}, WGS ∈ {32,64,128,256}, splits ∈ {1,2,4,8,16,32}.
+
+**Best per metric:**
+
+| Metric | NPTILE | WGS | splits | Value (ms) |
+|--------|-------:|----:|-------:|-----------:|
+| rho_cl | 64 | 256 | 16 | 20.4 |
+| vmat_cl | 64 | 64 | 32 | 33.6 |
+| **gpu_total_cl** | **64** | **64** | **8–16** | **56.3–57.6** |
+
+Key findings:
+- **NPTILE=64** is best for PTCDA (more tiles → better load balancing with screening)
+- **WGS=64** — smaller WGs give more WGs per CU (38²=1444 pairs × splits → plenty of parallelism)
+- **splits=8–16** optimal — PTCDA has more pairs than benzene, so fewer splits needed
+- **WGS=256** is worst for vmat (51–58 ms) — too few WGs for 82 CUs
+- rho is again insensitive to WGS (20–27 ms range)
+
+### Optimal parameters differ per molecule
+
+| Parameter | Benzene (12 atoms) | PTCDA (38 atoms) |
+|-----------|-------------------:|-----------------:|
+| NPTILE | 128 | 64 |
+| WGS_VMAT | 128 | 64 |
+| splits | 16 | 8–16 |
+
+The profile uses `splits=16, WGS=64` as a compromise — PTCDA-optimal, and still good for benzene (8.4 ms vs 7.7 ms optimal).
+
+## Tile sweep results
+
+Created `@/home/prokop/git/pyscf/expamples_prokop/sweep_screened_splitk.py` — sweeps `NPTILE`, `WGS_VMAT`, and `vmat_grid_splits` independently, reporting `rho_cl` and `vmat_cl` separately.
+
+### Key findings
+
+**Benzene** (12 atoms, 114 AOs, 143k grids):
+- Best total: **NPTILE=128, WGS=128, splits=16 → 7.7 ms** (was 10.0 ms)
+- Best rho: NPTILE=64, WGS=64, splits=4 → 2.9 ms
+- Best vmat: NPTILE=128, WGS=128, splits=16 → 4.3 ms
+- rho insensitive to WGS (2.9–4.3 ms); vmat strongly dependent on NPTILE and splits
+
+**PTCDA** (38 atoms, 286 AOs, 379k grids):
+- Best total: **NPTILE=64, WGS=64, splits=8–16 → 56.3–57.6 ms** (was 73.4 ms)
+- Best rho: NPTILE=64, WGS=256, splits=16 → 20.4 ms
+- Best vmat: NPTILE=64, WGS=64, splits=32 → 33.6 ms
+- WGS=256 is worst for vmat (51–58 ms) — too few WGs for 82 CUs
+
+### Optimal parameters differ per molecule
+
+| Parameter | Benzene | PTCDA |
+|-----------|--------:|------:|
+| NPTILE | 128 | 64 |
+| WGS_VMAT | 128 | 64 |
+| splits | 16 | 8–16 |
+
+Profile updated to `splits=16, WGS=64` as a compromise — PTCDA-optimal, and still good for benzene (8.4 ms vs 7.7 ms optimal).
+
+### Final performance (with tile tuning)
+
+| Molecule | gpuCL | rho_cl | vmat_cl | Speedup vs prev |
+|----------|------:|-------:|--------:|----------------:|
+| Benzene | **8.4 ms** | 3.1 | 4.9 | 16% vs 10.0 ms |
+| PTCDA | **77.1 ms** | 31.4 | 44.8 | comparable (within run variance) |
+
+### Files modified
+- `@/home/prokop/git/pyscf/expamples_prokop/sweep_screened_splitk.py` — new sweep script
+- `@/home/prokop/git/pyscf/pyscf/OpenCL/gpu_profiles.py` — `splitk_wgs` per-profile support; profile updated to splits=16, WGS=64
+- `@/home/prokop/git/pyscf/doc/GPU_screened_splitk_2026-07-17.md` — tile sweep section added, numbers updated
+- `@/home/prokop/git/pyscf/doc/topical_audit.md`, `@/home/prokop/git/pyscf/doc/GPU_optimixation_experience.md`, `@/home/prokop/git/pyscf/doc/opencl_gpu_paths_cookbook.md` — updated with final numbers
 
 ---
 
@@ -212,8 +308,8 @@ The analogy between rho and vmat symmetry is tempting but wrong. Rho contracts a
 
 ## Open issues / future work
 
-- **rho is now the bottleneck for PTCDA**: 27.7 ms rho vs 45.1 ms vmat — rho was 31 ms before screening helped it to 27 ms, but vmat dropped from 104 to 45 ms. Further rho optimization (e.g. split-K for `rho_gga_radial_screened`) could help.
-- **Tile sweep for screened splitK**: `NPTILE`, `WGS_VMAT`, and `vmat_grid_splits` were not jointly swept. A 1-neighborhood coordinate descent (like `sweep_splitk_tiles.py`) may find better configs.
+- **rho is now the bottleneck for PTCDA**: 31.4 ms rho vs 44.8 ms vmat — rho is now ~40% of total. Further rho optimization (e.g. split-K for `rho_gga_radial_screened`, or larger NPTILE) could help.
 - **GTX 1650 validation**: The zeroing removal should help the 1650 too (same local memory pressure), but split-K may not help as much (14 CUs → already over-parallelized with 249 pairs).
 - **Upper-triangle for rho**: `rho_gga_radial_screened` already does upper-triangle skip correctly. No change needed there.
 - **Screening tightness**: tighter `screen_eps` could reduce the number of active pairs further, amplifying the split-K benefit.
+- **Per-molecule optimal splits**: benzene prefers splits=16, PTCDA prefers splits=8–16. A runtime heuristic based on natoms/ngrids could auto-select.

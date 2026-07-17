@@ -142,7 +142,7 @@ GPU_PROFILES = {
         'mf_backend': 2,
         'df_backend': 1,
         'xc_path': 'onthefly',
-        'setup_kw': {'xc_eval': 'gpu', 'gpu_xc': 'auto', 'rho_mode': 'radial_screened', 'vmat_mode': 'radial_screened', 'vmat_grid_splits': 4},
+        'setup_kw': {'xc_eval': 'gpu', 'gpu_xc': 'auto', 'rho_mode': 'radial_screened', 'vmat_mode': 'radial_screened', 'vmat_grid_splits': 16, 'splitk_wgs': 64},
         'scf_kw': {'conv_tol': 1e-8, 'conv_tol_grad': 1e-5, 'overlap_j_xc': True},
         'accuracy': {
             'vxc_max_vs_cpu': 'verify vs OTF (~1e-5 expected; screen_eps dependent)',
@@ -330,17 +330,25 @@ def assert_df_incore(mf, where='assert_df_incore'):
 
 
 def _ensure_splitk_tile_config(setup_kw, quiet=True):
-    '''Recompile kernels with WGS_VMAT=128 for split-K pair vmat (benzene sweep winner).'''
+    '''Recompile kernels with profile-specified WGS_VMAT for split-K pair vmat.
+
+    Default WGS_VMAT=128 (OTF split-K benzene sweep winner).
+    Screened split-K uses WGS_VMAT=64 (screened sweep winner for PTCDA).
+    Override via setup_kw['splitk_wgs'].
+    '''
     if setup_kw.get('vmat_grid_splits', 1) <= 1:
         return
     from pyscf.OpenCL import init_device, reset_opencl
     from pyscf.OpenCL.tile_config import get_active_tile_config, TileConfig
     tc = get_active_tile_config()
-    target_wgs = 128
+    target_wgs = setup_kw.pop('splitk_wgs', 128)
     if tc.WGS_VMAT == target_wgs:
         return
+    changes = {'WGS_VMAT': target_wgs}
+    if target_wgs < tc.NPTILE * tc.NATILE:
+        changes['NATILE'] = 1  # NATILE only affects tiled rho, not screened
     reset_opencl()
-    init_device(tile_config=replace(tc, WGS_VMAT=target_wgs), force_rebuild=True, quiet=quiet)
+    init_device(tile_config=replace(tc, **changes), force_rebuild=True, quiet=quiet)
 
 
 def apply_gpu_profile(mf, name=DEFAULT_PROFILE, setup=True, dm=None,

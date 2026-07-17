@@ -166,7 +166,7 @@ Not a separate “path” — applies on top of any variant above.
 | **`production_otf_radial_vmat`** | OTF | — | — | gpu | CPU | 1e-8 | 1e-5 | ~3e-5 | OTF ρ + radial vmat (~21 ms benzene) |
 | **`production_otf_radial_vmat_splitk`** | OTF | — | — | gpu | CPU | 1e-8 | 1e-5 | ~3e-5 | split-K radial vmat (~14 ms benzene) |
 | **`production_radial_screened`** | OTF | — | — | gpu | CPU | 1e-8 | 1e-5 | ~3e-5 | screened radial ρ+vmat (~16 ms benzene, ~94 ms PTCDA) |
-| **`production_radial_screened_splitk`** | OTF | — | — | gpu | CPU | 1e-8 | 1e-5 | ~3e-5 | **fastest per-cycle** — split-K screened vmat (~10 ms benzene, ~73 ms PTCDA) |
+| **`production_radial_screened_splitk`** | OTF | — | — | gpu | CPU | 1e-8 | 1e-5 | ~3e-5 | **fastest per-cycle** — split-K screened vmat (~8 ms benzene, ~77 ms PTCDA) |
 | `production_otf_quintic` | OTF | — | — | gpu | CPU | 1e-8 | 1e-5 | ~3e-5 | quintic spline; half setup table |
 | `production_coalesced` | precomp | coalesced | auto | gpu | CPU | 1e-8 | 1e-5 | ~3e-6 | small/fixed geom |
 | `production_radial` | precomp | radial | hermite_gpu | gpu | CPU | 1e-8 | 1e-5 | ~3e-6 | low χ memory |

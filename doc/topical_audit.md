@@ -6,7 +6,7 @@ tags: [opencl, dft, xc, gpu]
 
 ## Summary
 
-GPU offload of the RKS exchange–correlation grid integral (ρ projection → PBE vxc → vmat) and density-fitting Coulomb J is implemented in `pyscf/OpenCL/`, integrated into `pyscf/dft/rks.py` via `mf.backend` and `mf.setup_gpu()`. Profile setup now hoists static grid/DF/GPU-plan work before `mf.kernel()`; only density-dependent XC/J/K work remains per SCF cycle. **Best per-cycle XC path (benzene cc-pVDZ, RTX 3090):** `production_radial_screened_splitk` — screened radial ρ + split-K screened vmat (~10 ms gpu CL vs ~14 ms OTF splitK vs ~25 ms full OTF). **Best for PTCDA (6-31g, RTX 3090):** same profile at ~73 ms gpu CL (vs ~307 ms OTF splitK, ~94 ms screened without splitK). Non-split `production_radial_screened` and `production_otf_radial_vmat_splitk` remain valid. Default general path: `production_otf` (no radial setup). Stage timing: `gpu_timing.py` (wall+`queue.finish()` and `clGetEventProfilingInfo`). PBE on GPU verified vs libxc; max |vxc| ~3e-5 on benzene (f32 ρ). Screened split-K session: `doc/GPU_screened_splitk_2026-07-17.md`.
+GPU offload of the RKS exchange–correlation grid integral (ρ projection → PBE vxc → vmat) and density-fitting Coulomb J is implemented in `pyscf/OpenCL/`, integrated into `pyscf/dft/rks.py` via `mf.backend` and `mf.setup_gpu()`. Profile setup now hoists static grid/DF/GPU-plan work before `mf.kernel()`; only density-dependent XC/J/K work remains per SCF cycle. **Best per-cycle XC path (benzene cc-pVDZ, RTX 3090):** `production_radial_screened_splitk` — screened radial ρ + split-K screened vmat (~8 ms gpu CL vs ~13 ms OTF splitK vs ~25 ms full OTF). **Best for PTCDA (6-31g, RTX 3090):** same profile at ~77 ms gpu CL (vs ~354 ms OTF splitK, ~110 ms screened without splitK). Non-split `production_radial_screened` and `production_otf_radial_vmat_splitk` remain valid. Default general path: `production_otf` (no radial setup). Stage timing: `gpu_timing.py` (wall+`queue.finish()` and `clGetEventProfilingInfo`). PBE on GPU verified vs libxc; max |vxc| ~3e-5 on benzene (f32 ρ). Screened split-K session: `doc/GPU_screened_splitk_2026-07-17.md`.
 
 ## Implementations
 
@@ -40,6 +40,7 @@ GPU offload of the RKS exchange–correlation grid integral (ρ projection → P
 | Hybrid OTF ρ + radial vmat vs CPU vxc | max ~3.15e-5 | `profile_xc_stages_benzene.py`, `production_otf_radial_vmat` |
 | Split-K OTF ρ + radial vmat vs CPU vxc | max ~3.16e-5 | `profile_xc_stages_benzene.py`, `production_otf_radial_vmat_splitk` |
 | Screened radial ρ + split-K screened vmat vs CPU vxc | max ~3.18e-5 (benzene), ~1.64e-3 (PTCDA) | `profile_xc_stages_benzene.py`, `production_radial_screened_splitk` |
+| Tile sweep for screened split-K | NPTILE=128/WGS=128/splits=16 (benzene), NPTILE=64/WGS=64/splits=8–16 (PTCDA) | `sweep_screened_splitk.py`, `debug/sweep_screened/*.csv` |
 | Quintic OTF ρ vs cubic OTF | shell-dependent; memory-equivalent du | `test_quintic_rho_otf.py` |
 | SCF energy convergence | matches CPU at conv_tol 1e-8 | `profile_gpu_scf.py`, `test_opencl_xc_scf.py` |
 | Hermite AO vs exact GTO | shell-dependent; see quintic report | `test_opencl_hermite_ao.py`, `hermite_radial_study.py` |

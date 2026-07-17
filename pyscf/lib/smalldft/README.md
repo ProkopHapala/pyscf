@@ -32,10 +32,13 @@ OPENBLAS_NUM_THREADS=1 PYTHONPATH=/home/prokop/git/pyscf \
 
 ## Files
 
-- **small_grid.c** — `SMALL_rho_lda`, `SMALL_rho_gga`, `SMALL_vmat_lda`, `SMALL_vmat_gga`
+- **small_grid.c** — `SMALL_rho_*`, `SMALL_vmat_*` (full-χ cache path)
+- **stream_grid.c** — `SMALL_stream_*` (block χ; no full-grid materialization)
 - **small_grid.h** — C API declarations
 - **CMakeLists.txt** — cmake target linked to `np_helper` + BLAS + OpenMP
 - **build.sh** — quick standalone gcc build without full PySCF cmake
+
+Python switch: `prepare_smalldft_for_scf(..., ao_mode='cache'|'stream')`.
 
 ## Related docs
 

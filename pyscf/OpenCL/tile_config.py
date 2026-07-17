@@ -20,7 +20,7 @@ class TileConfig:
     MAX_AO_ATOM: int = 16
     MAX_SHELL: int = 6
     WGS_VMAT: int = 256
-    MAX_ITILE: int = 32  # rho private prepass: ceil(natoms/NATILE) must be <= this
+    MAX_ITILE: int = 32  # legacy; OTF rho streams i-tiles (no private MAX_ITILE dumps)
 
     def __post_init__(self):
         for name in ('NPTILE', 'NATILE', 'MAX_AO_ATOM', 'WGS_VMAT'):

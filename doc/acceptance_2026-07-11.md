@@ -175,7 +175,8 @@ larger error of the relaxed-tolerance `gpu_full` path.
    3090; the one-iteration full-SCF path is now measured, but not yet accepted
    as a production converged workflow.
 2. Improve RI-J / DF J, which becomes the converged-cycle bottleneck when
-   cached XC is accelerated.
+   cached XC is accelerated. **Also:** force/verify `DF.storage='incore'` —
+   silent HDF5 outcore inflates J 5–10× (`doc/df_storage_and_benchmark_hygiene.md`).
 3. Evaluate a tiled rho → libxc → vmat pipeline; a direct GGA fusion cannot
    construct vmat before rho and libxc have produced vxc.
 4. Wire `grid_screen.py` active-atom lists into OTF OpenCL kernels.
@@ -186,6 +187,8 @@ larger error of the relaxed-tolerance `gpu_full` path.
    stage; current measurements identify vmat and setup/transfer costs instead.
 7. Investigate the documented H₂O `gpu_gto` dimer deviation before calling the
    exact-GTO path production-ready.
+8. Use `profile_amdahl_budget.py` three-clock accounting (setup / cycle / job)
+   on every large-mol claim; do not quote XC-only ratios as full-SCF speedups.
 
 ## Conclusion
 

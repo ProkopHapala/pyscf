@@ -53,6 +53,24 @@ class DF(lib.StreamObject):
             basis set will be employed for hybrid and RSH functionals.
             If optimal auxiliary basis sets are not available, the PySCF built-in
             even-tempered Gaussian basis set will be used.
+        storage : str
+            Where to keep the 3-center Cholesky tensor ``_cderi`` after
+            :meth:`build`.  **Explicit control for reproducible benchmarks**
+            (see ``doc/df_storage_and_benchmark_hygiene.md``).
+
+            * ``'auto'`` (default) — PySCF legacy: incore ndarray if
+              ``nao_pair*naux*8`` fits in ``0.9 * (max_memory - used)``;
+              otherwise HDF5 under a ``NamedTemporaryFile`` (outcore).
+              Competing RAM (AO cache, GPU buffers) can flip auto→outcore
+              silently and inflate per-cycle J by 5–10× via disk I/O.
+            * ``'incore'`` — force RAM ndarray.  Raises ``MemoryError`` if the
+              tensor does not fit the remaining ``max_memory`` budget (fail
+              loud; do not silently spill to disk).
+            * ``'outcore'`` — force HDF5 file storage even when RAM would
+              suffice (useful to measure I/O cost deliberately).
+
+            Setting ``_cderi_to_save`` to a path string still forces file
+            output (same as outcore with a user-chosen filename).
         _cderi_to_save : str
             If _cderi_to_save is specified, the DF integral tensor will be
             saved in this file.
@@ -98,7 +116,7 @@ class DF(lib.StreamObject):
     _compatible_format = getattr(__config__, 'df_df_DF_compatible_format', False)
     _dataname = 'j3c'
 
-    _keys = {'mol', 'auxmol', 'backend'}
+    _keys = {'mol', 'auxmol', 'backend', 'storage'}
 
     def __init__(self, mol, auxbasis=None):
         self.mol = mol
@@ -106,6 +124,8 @@ class DF(lib.StreamObject):
         self.verbose = mol.verbose
         self.max_memory = mol.max_memory
         self._auxbasis = auxbasis
+        # 'auto' | 'incore' | 'outcore' — see class docstring / hygiene doc
+        self.storage = 'auto'
 
 ##################################################
 # Following are not input options
@@ -140,10 +160,38 @@ class DF(lib.StreamObject):
         else:
             log.info('auxbasis = auxmol.basis = %s', self.auxmol.basis)
         log.info('max_memory = %s', self.max_memory)
+        log.info('storage = %s  (auto|incore|outcore; see doc/df_storage_and_benchmark_hygiene.md)',
+                 getattr(self, 'storage', 'auto'))
         if isinstance(self._cderi, str):
             log.info('_cderi = %s  where DF integrals are loaded (readonly).',
                      self._cderi)
         return self
+
+    def cderi_nbytes_estimate(self):
+        '''Bytes for a full f64 packed ``_cderi`` (naux, nao_pair).'''
+        mol = self.mol
+        auxmol = self.auxmol
+        if auxmol is None:
+            auxmol = addons.make_auxmol(mol, self.auxbasis)
+        nao = mol.nao_nr()
+        naux = auxmol.nao_nr()
+        nao_pair = nao * (nao + 1) // 2
+        return int(nao_pair) * int(naux) * 8
+
+    def describe_cderi(self):
+        '''Return ``(kind, detail, nbytes_or_0)`` for the live ``_cderi``.
+
+        ``kind`` is one of: ``'none'``, ``'incore'``, ``'outcore'``.
+        Use this in benchmarks to prove J was not reading HDF5.
+        '''
+        c = self._cderi
+        if c is None:
+            return 'none', 'None', 0
+        if isinstance(c, numpy.ndarray):
+            return 'incore', f'ndarray{c.shape} {c.dtype}', int(c.nbytes)
+        # NamedTemporaryFile / path / h5 handle
+        name = getattr(c, 'name', None) or (c if isinstance(c, str) else type(c).__name__)
+        return 'outcore', f'{type(c).__name__}:{name}', 0
 
     def build(self):
         t0 = (logger.process_clock(), logger.perf_counter())
@@ -163,9 +211,33 @@ class DF(lib.StreamObject):
 
         is_custom_storage = isinstance(self._cderi_to_save, str)
         max_memory = self.max_memory - lib.current_memory()[0]
+        need_mb = nao_pair * naux * 8 / 1e6
+        storage = getattr(self, 'storage', 'auto')
+        if storage not in ('auto', 'incore', 'outcore'):
+            raise ValueError(
+                f"DF.storage must be 'auto'|'incore'|'outcore', got {storage!r}")
+
+        # Explicit policy (benchmark SSOT). '_cderi_to_save' path ⇒ always file.
+        if is_custom_storage or storage == 'outcore':
+            use_incore = False
+        elif storage == 'incore':
+            if need_mb >= .9 * max_memory:
+                raise MemoryError(
+                    f'DF.storage=incore needs ~{need_mb:.0f} MB for _cderi but only '
+                    f'{max_memory:.0f} MB remains under max_memory={self.max_memory} '
+                    f'(process already using {lib.current_memory()[0]:.0f} MB). '
+                    f'Raise mol.max_memory / mf.with_df.max_memory, free AO/GPU '
+                    f'buffers, or set storage="auto"/"outcore". '
+                    f'See doc/df_storage_and_benchmark_hygiene.md')
+            use_incore = True
+        else:  # auto — legacy PySCF threshold
+            use_incore = (need_mb < .9 * max_memory)
+
         int3c = mol._add_suffix('int3c2e')
         int2c = mol._add_suffix('int2c2e')
-        if (nao_pair*naux*8/1e6 < .9*max_memory and not is_custom_storage):
+        if use_incore:
+            log.info('DF build → incore ndarray (~%.1f MB); storage=%s',
+                     need_mb, storage)
             self._cderi = incore.cholesky_eri(mol, int3c=int3c, int2c=int2c,
                                               auxmol=auxmol,
                                               max_memory=max_memory, verbose=log)
@@ -179,7 +251,8 @@ class DF(lib.StreamObject):
             else:
                 cderi_name = cderi.name
             if self._cderi is None:
-                log.info('_cderi_to_save = %s', cderi_name)
+                log.info('DF build → outcore HDF5 %s (~%.1f MB); storage=%s',
+                         cderi_name, need_mb, storage)
             else:
                 # If cderi needs to be saved in
                 log.warn('Value of _cderi is ignored. DF integrals will be '

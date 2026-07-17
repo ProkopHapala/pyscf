@@ -1,29 +1,38 @@
-'''Drop-in nr_rks with grid-parallel ρ/vmat (parallel axis = grid index).'''
+'''Drop-in nr_rks with grid-parallel ρ/vmat (parallel axis = grid index).
+
+ao_mode:
+  'cache'  — full χ in GridWorkspace (default; fastest multi-cycle when RAM fits)
+  'stream' — block_loop eval_ao + C stream kernels; no full χ (~GB saved on PTCDA)
+'''
 import numpy
 from pyscf import lib
 
 from .layout import ensure_native
 from .rho import rho_lda, rho_gga
 from .vmat import vmat_lda, vmat_gga
-from .parallel import default_n_workers, shutdown_pool, get_pool
-from ._ctypes import has_c_lib
+from .parallel import default_n_workers
+from ._ctypes import (
+    has_c_lib, c_stream_rho_lda, c_stream_rho_gga,
+    c_stream_vmat_lda_acc, c_stream_vmat_gga_acc, c_stream_vmat_hermi,
+)
 
-NAO_MAX_DEFAULT = 200
+NAO_MAX_DEFAULT = 400  # PTCDA 6-31g ≈ 286; was 200 (benzene-era policy)
 
 
 def nr_rks(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
            max_memory=2000, verbose=None, n_workers=None, tile_size=None,
-           precompute_ao=False, blas_threads=None, ws=None):
+           precompute_ao=False, blas_threads=None, ws=None, ao_mode=None):
     '''RKS XC for small systems.
 
     Grid-parallel ρ/vmat: each thread owns a contiguous grid slice χ[g0:g1,:].
     BLAS is pinned to 1 thread by default so grid workers do not oversubscribe.
 
     ws: optional GridWorkspace with preallocated buffers (call ws.eval_ao once
-        per geometry before the SCF loop).
+        per geometry before the SCF loop). Used only for ao_mode='cache'.
 
-    blas_threads: if set, use this many OMP threads inside each tile GEMM instead
-        of grid-level threading (try blas_threads=4, n_workers=1 for comparison).
+    ao_mode: 'cache' | 'stream' | None
+        None → 'stream' if ni._smallDFT_ao_mode == 'stream', else 'cache' when
+        ws/precompute_ao set, else 'stream' (block_loop, no full χ).
     '''
     xctype = ni._xc_type(xc_code)
     if xctype not in ('LDA', 'GGA', 'HF'):
@@ -52,14 +61,24 @@ def nr_rks(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
     deriv = 0 if xctype == 'LDA' else 1
     omp_saved = lib.num_threads()
     use_c = has_c_lib() and blas_threads is None
-    pool = None  # C/OpenMP path only; Python thread pool deprecated
+    pool = None
+
+    if ao_mode is None:
+        ao_mode = getattr(ni, '_smallDFT_ao_mode', None)
+    if ao_mode is None:
+        if precompute_ao or ws is not None:
+            ao_mode = 'cache'
+        else:
+            ao_mode = 'stream'
+    if ao_mode not in ('cache', 'stream'):
+        raise ValueError(f"ao_mode must be 'cache' or 'stream', got {ao_mode!r}")
 
     try:
-        if precompute_ao or ws is not None:
+        if ao_mode == 'cache':
             if ws is not None and ws.matches(nao, grids.coords.shape[0], deriv):
-                chi = ws.chi
-                if precompute_ao:
+                if ws.chi is None or precompute_ao:
                     ws.eval_ao(mol, grids)
+                chi = ws.chi
             elif precompute_ao:
                 from .layout import eval_ao_native
                 non0tab = grids.non0tab if grids.mol is mol else None
@@ -81,18 +100,23 @@ def nr_rks(ni, mol, grids, xc_code, dms, relativity=0, hermi=1,
                 excsum[i] = numpy.dot(nelec_weight(rho, weight, xctype), exc)
                 vmat[i] = v_i
         else:
+            # stream: never allocate full χ; C block kernels + hermi once (GGA)
             for i in range(nset):
                 dm = numpy.asarray(dms[i], order='C')
+                v_acc = numpy.zeros((nao, nao), dtype=numpy.double)
                 for ao, mask, weight, _coords in ni.block_loop(
                         mol, grids, nao, deriv, max_memory=max_memory):
                     chi = ensure_native(ao, deriv=deriv)
-                    rho, exc, v_part = _xc_vmat_for_dm(
+                    rho, exc = _stream_block_xc(
                         ni, xc_code, xctype, dm, chi, weight, deriv,
-                        nw, tile_size, pool, ws=ws, use_c=use_c,
-                        omp_threads=omp_saved)
+                        v_acc, use_c=use_c, omp_threads=omp_saved)
                     nelec[i] += rho_nelec(rho, weight, xctype)
                     excsum[i] += numpy.dot(nelec_weight(rho, weight, xctype), exc)
-                    vmat[i] += v_part
+                if xctype == 'GGA' and use_c:
+                    c_stream_vmat_hermi(v_acc)
+                elif xctype == 'GGA':
+                    v_acc = v_acc + v_acc.T
+                vmat[i] = v_acc
     finally:
         lib.num_threads(omp_saved)
 
@@ -111,6 +135,44 @@ def nelec_weight(rho, weight, xctype):
     if xctype == 'LDA':
         return rho * weight
     return rho[0] * weight
+
+
+def _stream_block_xc(ni, xc_code, xctype, dm, chi, weight, deriv, v_acc,
+                     use_c=False, omp_threads=None):
+    '''ρ + libxc on one AO block; accumulate vmat (GGA hermi deferred).'''
+    nt = omp_threads or default_n_workers()
+    if use_c and deriv == 0:
+        rho = numpy.empty(chi.shape[0], dtype=numpy.double)
+        lib.num_threads(nt)
+        c_stream_rho_lda(rho, chi, dm, nthreads=nt)
+    elif use_c and deriv == 1:
+        rho = numpy.empty((4, chi.shape[1]), dtype=numpy.double, order='C')
+        lib.num_threads(nt)
+        c_stream_rho_gga(rho, chi, dm, nthreads=nt, hermi=1)
+    elif deriv == 0:
+        rho = rho_lda(dm, chi, use_c=False)
+    else:
+        rho = rho_gga(dm, chi, hermi=1, use_c=False)
+
+    exc, vxc = ni.eval_xc_eff(xc_code, rho, deriv=1, xctype=xctype, spin=0)[:2]
+    wv = weight * vxc
+
+    if xctype == 'LDA':
+        if use_c:
+            lib.num_threads(nt)
+            c_stream_vmat_lda_acc(v_acc, chi, wv, nthreads=nt)
+        else:
+            v_acc += vmat_lda(chi, wv, use_c=False)
+    else:
+        wv = numpy.asarray(wv, order='C').copy()
+        wv[0] *= .5
+        if use_c:
+            lib.num_threads(nt)
+            c_stream_vmat_gga_acc(v_acc, chi, wv, nthreads=nt)
+        else:
+            v_acc += vmat_gga(chi, wv, use_c=False, hermi_sum=False)
+
+    return rho, exc
 
 
 def _xc_vmat_for_dm(ni, xc_code, xctype, dm, chi, weight, deriv, n_workers, tile_size,

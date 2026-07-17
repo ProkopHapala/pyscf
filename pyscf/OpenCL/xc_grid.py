@@ -1252,15 +1252,18 @@ class XCGridPlan:
     def _nr_rks_precomputed_gpu_dense(self, dm, profile=False):
         return self._nr_rks_precomputed_gpu(dm, profile=profile)
 
-    def setup_onthefly(self, r0_ang=0.002, du=0.02, rmax_ang=None, xc_eval='gpu', gpu_xc='auto', spline_order='cubic', vmat_mode='otf', vmat_grid_splits=1):
+    def setup_onthefly(self, r0_ang=0.002, du=0.02, rmax_ang=None, xc_eval='gpu', gpu_xc='auto', spline_order='cubic', vmat_mode='otf', vmat_grid_splits=1, rho_mode='hermite', screen_eps=1e-7):
         '''One-time prep before SCF: OpenCL compile, Hermite tables, GPU buffers, kernel args.
 
         xc_eval: 'gpu' (default, PBE on device) | 'cpu' (libxc debug with rho D2H).
         spline_order: 'cubic' | 'quintic' (analytic GTO tangents; quintic uses 2× coarser du).
-        vmat_mode: 'otf' (Hermite in vmat kernel) | 'radial_precomp' (gather R,dR for vmat only).
+        rho_mode: 'hermite' (OTF) | 'radial_screened' (NEW screened radial rho kernels).
+        vmat_mode: 'otf' | 'radial_precomp' | 'radial_screened' (NEW screened radial vmat).
         vmat_grid_splits: split radial-precomp vmat over grid chunks; 1 keeps the original kernel.
+        screen_eps: radial-tail cutoff for grid_screen (radial_screened only).
         '''
         from . import init_device
+        from .grid_screen import compute_atom_rcut, build_gtile_atom_lists
         init_device(quiet=getattr(self, '_otf_ready', False))
         self.ctx = get_ctx()
         self.queue = get_queue()
@@ -1278,13 +1281,21 @@ class XCGridPlan:
         atom_ao0, atom_nao = _atom_ao_layout(ao_eval)
         tc = get_active_tile_config()
         NPTILE, NATILE, WGS_VMAT = tc.NPTILE, tc.NATILE, tc.WGS_VMAT
+        rho_mode = str(rho_mode).lower()
+        if rho_mode not in ('hermite', 'radial_screened'):
+            raise ValueError(f"rho_mode must be 'hermite' or 'radial_screened'; got {rho_mode!r}")
+        if rho_mode == 'radial_screened' and self.xctype != 'GGA':
+            raise NotImplementedError('rho_mode=radial_screened requires GGA')
         use_pair = (NATILE == 1)
         n_iTiles = round_up(natoms, NATILE) // NATILE
-        if not use_pair and n_iTiles > tc.MAX_ITILE:
-            raise NotImplementedError(
-                f'rho prepass MAX_ITILE={tc.MAX_ITILE} too small for natoms={natoms} '
-                f'(need {n_iTiles}); recompile with larger OPENCL_MAX_ITILE')
-        if use_pair:
+        if rho_mode == 'radial_screened':
+            rho_knl = 'rho_gga_radial_screened'
+            rho_global = (round_up(ngrids, NPTILE),)
+            rho_local = (NPTILE,)
+            vmat_global_otf = (natoms, natoms * WGS_VMAT)
+            vmat_local_otf = (1, WGS_VMAT)
+            vmat_knl_otf = 'vmat_gga_pair'
+        elif use_pair:
             rho_knl = 'rho_lda_pair' if self.xctype == 'LDA' else 'rho_gga_pair'
             rho_global = (round_up(ngrids, NPTILE), 1)
             rho_local = (NPTILE, 1)
@@ -1300,10 +1311,10 @@ class XCGridPlan:
             vmat_local_otf = (1, WGS_VMAT)
             vmat_knl_otf = 'vmat_lda_tiled' if self.xctype == 'LDA' else 'vmat_gga_tiled'
         vmat_mode = str(vmat_mode).lower()
-        if vmat_mode not in ('otf', 'radial_precomp'):
-            raise ValueError(f"vmat_mode must be 'otf' or 'radial_precomp'; got {vmat_mode!r}")
-        if vmat_mode == 'radial_precomp' and self.xctype != 'GGA':
-            raise NotImplementedError('vmat_mode=radial_precomp requires GGA')
+        if vmat_mode not in ('otf', 'radial_precomp', 'radial_screened'):
+            raise ValueError(f"vmat_mode must be 'otf', 'radial_precomp', or 'radial_screened'; got {vmat_mode!r}")
+        if vmat_mode in ('radial_precomp', 'radial_screened') and self.xctype != 'GGA':
+            raise NotImplementedError(f'vmat_mode={vmat_mode} requires GGA')
         coords4 = np.zeros((ngrids, 4), dtype=np.float32)
         coords4[:, :3] = self.grids.coords
         buf_coords4 = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, coords4.nbytes, coords4)
@@ -1312,10 +1323,31 @@ class XCGridPlan:
             raise ValueError(f'vmat_grid_splits must be >= 1; got {vmat_grid_splits}')
         if vmat_grid_splits > 1 and vmat_mode != 'radial_precomp':
             raise NotImplementedError('vmat_grid_splits>1 is implemented only for vmat_mode=radial_precomp')
+        need_radial = (rho_mode == 'radial_screened') or (vmat_mode in ('radial_precomp', 'radial_screened'))
+        need_screen = (rho_mode == 'radial_screened') or (vmat_mode == 'radial_screened')
         buf_rad_val = buf_rad_dr = buf_vmat_partial = None
         buf_atom_coords_h = buf_radial_l_h = buf_atom_radial_offset_h = buf_atom_radial_list_h = None
+        buf_gtile_atom_off = buf_gtile_atom_list = None
+        buf_pair_gtile_off = buf_pair_gtile_list = None
+        screen_stats = None
+        screen_cap = None
         t_rad = 0.0
-        if vmat_mode == 'radial_precomp':
+        ibytes = np.dtype(np.int32).itemsize
+        n_gtile = round_up(ngrids, NPTILE) // NPTILE
+        n_pairs = natoms * (natoms + 1) // 2
+        # Screen CSR: prealloc worst-case capacity (geometry refill = enqueue_copy only).
+        if need_screen:
+            cap_atom_list = max(n_gtile * natoms, 1)
+            cap_pair_list = max(n_pairs * n_gtile, 1)
+            screen_cap = {
+                'n_gtile': n_gtile, 'n_pairs': n_pairs,
+                'cap_atom_list': cap_atom_list, 'cap_pair_list': cap_pair_list,
+            }
+            buf_gtile_atom_off = cl.Buffer(self.ctx, mf.READ_ONLY, (n_gtile + 1) * ibytes)
+            buf_gtile_atom_list = cl.Buffer(self.ctx, mf.READ_ONLY, cap_atom_list * ibytes)
+            buf_pair_gtile_off = cl.Buffer(self.ctx, mf.READ_ONLY, (n_pairs + 1) * ibytes)
+            buf_pair_gtile_list = cl.Buffer(self.ctx, mf.READ_ONLY, cap_pair_list * ibytes)
+        if need_radial:
             nradial = ao_eval.plan.nradial
             buf_rad_val = cl.Buffer(self.ctx, mf.READ_ONLY, nradial * ngrids * fbytes)
             buf_rad_dr = cl.Buffer(self.ctx, mf.READ_ONLY, nradial * ngrids * fbytes)
@@ -1326,6 +1358,33 @@ class XCGridPlan:
             t_rad0 = _time.perf_counter()
             ao_eval.build_radial_on_grid_gpu(buf_coords4, buf_rad_val, buf_rad_dr, ngrids)
             t_rad = _time.perf_counter() - t_rad0
+        if need_screen:
+            atom_rcut = compute_atom_rcut(ao_eval.plan, eps=screen_eps, margin_bohr=0.5)
+            screen = build_gtile_atom_lists(
+                self.grids.coords, ao_eval.atom_coords[:, :3], atom_rcut, NPTILE, natoms, pair_screen=True)
+            screen_stats = screen['stats']
+            gao = np.ascontiguousarray(screen['gtile_atom_off'], dtype=np.int32)
+            gal = np.ascontiguousarray(screen['gtile_atom_list'], dtype=np.int32)
+            pgo = np.ascontiguousarray(screen['pair_gtile_off'], dtype=np.int32)
+            pgl = np.ascontiguousarray(screen['pair_gtile_list'], dtype=np.int32)
+            if gal.size > screen_cap['cap_atom_list'] or pgl.size > screen_cap['cap_pair_list']:
+                raise RuntimeError(
+                    f'screen CSR exceeds prealloc cap: atom_list {gal.size}/{screen_cap["cap_atom_list"]} '
+                    f'pair_list {pgl.size}/{screen_cap["cap_pair_list"]}')
+            cl.enqueue_copy(self.queue, buf_gtile_atom_off, gao)
+            if gal.size:
+                cl.enqueue_copy(self.queue, buf_gtile_atom_list, gal)
+            cl.enqueue_copy(self.queue, buf_pair_gtile_off, pgo)
+            if pgl.size:
+                cl.enqueue_copy(self.queue, buf_pair_gtile_list, pgl)
+            self.queue.finish()
+            screen_cap['n_atom_list'] = int(gal.size)
+            screen_cap['n_pair_list'] = int(pgl.size)
+        if vmat_mode == 'radial_screened':
+            vmat_knl = 'vmat_gga_radial_screened_pair'
+            vmat_global = (natoms, natoms * WGS_VMAT)
+            vmat_local = (1, WGS_VMAT)
+        elif vmat_mode == 'radial_precomp':
             vmat_knl = 'vmat_gga_radial_precomp_pair_splitk' if vmat_grid_splits > 1 else 'vmat_gga_radial_precomp_pair'
             vmat_global = (natoms, natoms * WGS_VMAT, vmat_grid_splits) if vmat_grid_splits > 1 else (natoms, natoms * WGS_VMAT)
             vmat_local = (1, WGS_VMAT, 1) if vmat_grid_splits > 1 else (1, WGS_VMAT)
@@ -1367,10 +1426,23 @@ class XCGridPlan:
                 raise
         xc_gpu_bufs = _alloc_xc_gpu_bufs(self.ctx, ngrids, xc_gpu_prec) if xc_eval_mode == 'gpu' else {}
         k_rho = cl.Kernel(self.prg, rho_knl)
-        k_rho.set_args(buf_coords4, *hermite_bufs[1:], buf_dm_cart, buf_atom_ao0, buf_atom_nao, buf_rho, *hermite_params)
+        if rho_mode == 'radial_screened':
+            k_rho.set_args(buf_coords4, buf_atom_coords_h, buf_rad_val, buf_rad_dr,
+                           buf_radial_l_h, buf_atom_radial_offset_h, buf_atom_radial_list_h,
+                           buf_dm_cart, buf_atom_ao0, buf_atom_nao,
+                           buf_gtile_atom_off, buf_gtile_atom_list, buf_rho,
+                           np.int32(ncart), np.int32(ngrids), np.int32(natoms))
+        else:
+            k_rho.set_args(buf_coords4, *hermite_bufs[1:], buf_dm_cart, buf_atom_ao0, buf_atom_nao, buf_rho, *hermite_params)
         k_vmat = cl.Kernel(self.prg, vmat_knl)
         k_vmat_reduce = None
-        if vmat_mode == 'radial_precomp':
+        if vmat_mode == 'radial_screened':
+            k_vmat.set_args(buf_coords4, buf_atom_coords_h, buf_rad_val, buf_rad_dr,
+                            buf_radial_l_h, buf_atom_radial_offset_h, buf_atom_radial_list_h,
+                            buf_atom_ao0, buf_atom_nao, buf_wv,
+                            buf_pair_gtile_off, buf_pair_gtile_list, buf_vmat,
+                            np.int32(ncart), np.int32(ngrids), np.int32(natoms))
+        elif vmat_mode == 'radial_precomp':
             if vmat_grid_splits > 1:
                 k_vmat.set_args(buf_coords4, buf_atom_coords_h, buf_rad_val, buf_rad_dr,
                                 buf_radial_l_h, buf_atom_radial_offset_h, buf_atom_radial_list_h,
@@ -1387,11 +1459,14 @@ class XCGridPlan:
             k_vmat.set_scalar_arg_dtypes([None] * 11 + [np.float32, np.float32, np.int32, np.int32, np.int32, np.int32, np.int32])
             k_vmat.set_args(buf_coords4, *hermite_bufs[1:], buf_atom_ao0, buf_atom_nao, buf_wv, buf_vmat, *hermite_params)
         self.otf = {
-            'ao_eval': ao_eval, 'ncart': ncart, 'natoms': natoms, 'vmat_mode': vmat_mode, 'vmat_grid_splits': vmat_grid_splits,
-            'setup_radial_gpu': t_rad,
+            'ao_eval': ao_eval, 'ncart': ncart, 'natoms': natoms,
+            'rho_mode': rho_mode, 'vmat_mode': vmat_mode, 'vmat_grid_splits': vmat_grid_splits,
+            'setup_radial_gpu': t_rad, 'screen_stats': screen_stats, 'screen_cap': screen_cap,
             'buf_rad_val': buf_rad_val, 'buf_rad_dr': buf_rad_dr,
             'buf_atom_coords_h': buf_atom_coords_h, 'buf_radial_l_h': buf_radial_l_h,
             'buf_atom_radial_offset_h': buf_atom_radial_offset_h, 'buf_atom_radial_list_h': buf_atom_radial_list_h,
+            'buf_gtile_atom_off': buf_gtile_atom_off, 'buf_gtile_atom_list': buf_gtile_atom_list,
+            'buf_pair_gtile_off': buf_pair_gtile_off, 'buf_pair_gtile_list': buf_pair_gtile_list,
             'c2s': c2s, 'weight': self.grids.weights, 'weight32': weight32,
             'buf_weight': buf_weight, 'buf_weight64': buf_weight64,
             'buf_coords4': buf_coords4, 'buf_dm_cart': buf_dm_cart,
@@ -1510,7 +1585,7 @@ class XCGridPlan:
                 buf.release()
         ot = getattr(self, 'otf', None)
         if ot is not None:
-            for key in ('buf_coords4', 'buf_dm_cart', 'buf_dm_sph', 'buf_vmat_sph', 'buf_c2s_scratch', 'buf_rad_val', 'buf_rad_dr', 'buf_atom_ao0', 'buf_atom_nao', 'buf_rho', 'buf_wv', 'buf_vmat', 'buf_vmat_partial', 'buf_nelec_exc', 'buf_reduce0', 'buf_reduce1'):
+            for key in ('buf_coords4', 'buf_dm_cart', 'buf_dm_sph', 'buf_vmat_sph', 'buf_c2s_scratch', 'buf_rad_val', 'buf_rad_dr', 'buf_atom_ao0', 'buf_atom_nao', 'buf_rho', 'buf_wv', 'buf_vmat', 'buf_vmat_partial', 'buf_nelec_exc', 'buf_reduce0', 'buf_reduce1', 'buf_gtile_atom_off', 'buf_gtile_atom_list', 'buf_pair_gtile_off', 'buf_pair_gtile_list'):
                 buf = ot.get(key)
                 if buf is not None:
                     buf.release()

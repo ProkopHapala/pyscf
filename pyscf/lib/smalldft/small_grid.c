@@ -63,25 +63,19 @@ void SMALL_rho_lda(double *rho, const double *chi, const double *dm,
 {
         int nth = _nthreads(nthreads);
         int ig0;
+        const size_t need_max = (size_t)TILE * (size_t)nao;
 
 #ifdef _OPENMP
 #pragma omp parallel num_threads(nth) default(none) \
-        shared(rho, chi, dm, nao, ngrids) private(ig0)
+        shared(rho, chi, dm, nao, ngrids, need_max) private(ig0)
 #endif
 {
-        double *c0 = NULL;
-        size_t bufsz = 0;
+        double *c0 = (double *)malloc(need_max * sizeof(double));
 #ifdef _OPENMP
 #pragma omp for schedule(static)
 #endif
         for (ig0 = 0; ig0 < ngrids; ig0 += TILE) {
                 int tile = MIN(TILE, ngrids - ig0);
-                size_t need = (size_t)tile * nao;
-                if (bufsz < need) {
-                        free(c0);
-                        c0 = (double *)malloc(need * sizeof(double));
-                        bufsz = need;
-                }
                 _rho_tile_lda(rho, chi, dm, c0, tile, nao, ig0, ngrids);
         }
         free(c0);
@@ -95,30 +89,23 @@ void SMALL_rho_gga(double *rho, const double *chi, const double *dm,
 {
         int nth = _nthreads(nthreads);
         const size_t ao_size = (size_t)ngrids * nao;
+        const size_t need_max = (size_t)TILE * (size_t)nao;
         int ig0, t, k;
 
         (void)hermi;
 
 #ifdef _OPENMP
 #pragma omp parallel num_threads(nth) default(none) \
-        shared(rho, chi, dm, nao, ngrids, ao_size) private(ig0, t, k)
+        shared(rho, chi, dm, nao, ngrids, ao_size, need_max) private(ig0, t, k)
 #endif
 {
         const double two = 2.;
-        double *c0 = NULL;
-        size_t bufsz = 0;
+        double *c0 = (double *)malloc(need_max * sizeof(double));
 #ifdef _OPENMP
 #pragma omp for schedule(static)
 #endif
         for (ig0 = 0; ig0 < ngrids; ig0 += TILE) {
                 int tile = MIN(TILE, ngrids - ig0);
-                size_t need = (size_t)tile * nao;
-
-                if (bufsz < need) {
-                        free(c0);
-                        c0 = (double *)malloc(need * sizeof(double));
-                        bufsz = need;
-                }
 
                 _rho_tile_lda(rho, chi, dm, c0, tile, nao, ig0, ngrids);
 
@@ -147,10 +134,9 @@ void SMALL_rho_gga(double *rho, const double *chi, const double *dm,
 }
 }
 
-static void _hermi_sum_inplace(double *vmat, int nao)
+static void _hermi_sum_inplace(double *vmat, int nao, double *tmp)
 {
         int i, j, n2 = nao * nao;
-        double *tmp = (double *)malloc((size_t)n2 * sizeof(double));
         for (i = 0; i < n2; i++) {
                 tmp[i] = vmat[i];
         }
@@ -159,7 +145,6 @@ static void _hermi_sum_inplace(double *vmat, int nao)
                         vmat[i*nao + j] = tmp[i*nao + j] + tmp[j*nao + i];
                 }
         }
-        free(tmp);
 }
 
 void SMALL_vmat_lda(double *vmat, const double *chi, const double *wv,
@@ -167,30 +152,23 @@ void SMALL_vmat_lda(double *vmat, const double *chi, const double *wv,
 {
         int nth = _nthreads(nthreads);
         int ig0, n2 = nao * nao;
+        const size_t need_max = (size_t)TILE * (size_t)nao;
 
 #ifdef _OPENMP
 #pragma omp parallel num_threads(nth) default(none) \
-        shared(vmat, chi, wv, nao, ngrids, n2) private(ig0)
+        shared(vmat, chi, wv, nao, ngrids, n2, need_max) private(ig0)
 #endif
 {
         const double one = 1.;
         const double zero = 0.;
         double *v_priv = (double *)calloc((size_t)n2, sizeof(double));
-        double *chi_w = NULL;
-        size_t bufsz = 0;
+        double *chi_w = (double *)malloc(need_max * sizeof(double));
 #ifdef _OPENMP
 #pragma omp for schedule(static)
 #endif
         for (ig0 = 0; ig0 < ngrids; ig0 += TILE) {
                 int tile = MIN(TILE, ngrids - ig0);
                 int t, mu;
-                size_t need = (size_t)tile * nao;
-
-                if (bufsz < need) {
-                        free(chi_w);
-                        chi_w = (double *)malloc(need * sizeof(double));
-                        bufsz = need;
-                }
 
                 for (mu = 0; mu < nao; mu++) {
                         const double *chi_mu = chi + ig0 + (size_t)mu * ngrids;
@@ -227,30 +205,23 @@ void SMALL_vmat_gga(double *vmat, const double *chi, const double *wv,
 {
         int nth = _nthreads(nthreads);
         const size_t ao_size = (size_t)ngrids * nao;
+        const size_t need_max = (size_t)TILE * (size_t)nao;
         int ig0, n2 = nao * nao;
 
 #ifdef _OPENMP
 #pragma omp parallel num_threads(nth) default(none) \
-        shared(vmat, chi, wv, nao, ngrids, ao_size, n2) private(ig0)
+        shared(vmat, chi, wv, nao, ngrids, ao_size, n2, need_max) private(ig0)
 #endif
 {
         const double one = 1.;
         double *v_priv = (double *)calloc((size_t)n2, sizeof(double));
-        double *aow = NULL;
-        size_t bufsz = 0;
+        double *aow = (double *)malloc(need_max * sizeof(double));
 #ifdef _OPENMP
 #pragma omp for schedule(static)
 #endif
         for (ig0 = 0; ig0 < ngrids; ig0 += TILE) {
                 int tile = MIN(TILE, ngrids - ig0);
                 int t, mu;
-                size_t need = (size_t)tile * nao;
-
-                if (bufsz < need) {
-                        free(aow);
-                        aow = (double *)malloc(need * sizeof(double));
-                        bufsz = need;
-                }
 
                 for (mu = 0; mu < nao; mu++) {
                         double *aow_mu = aow + (size_t)mu * tile;
@@ -288,7 +259,9 @@ void SMALL_vmat_gga(double *vmat, const double *chi, const double *wv,
         free(v_priv);
 }
         if (hermi) {
-                _hermi_sum_inplace(vmat, nao);
+                double *tmp = (double *)malloc((size_t)n2 * sizeof(double));
+                _hermi_sum_inplace(vmat, nao, tmp);
+                free(tmp);
         }
 }
 

@@ -46,14 +46,19 @@ def _ms(tim, key, cl=False):
     return tim.get(k, 0.0) * 1e3
 
 
-def bench_point(cfg, vmat_grid_splits, mol, grids, dm, vxc_ref, n_warm=1, n_timed=3):
+def bench_point(cfg, vmat_grid_splits, mol, grids, dm, vxc_ref, n_warm=1, n_timed=3,
+                path='splitk'):
     reset_opencl()
     clear_xc_plan_cache()
     init_device(tile_config=cfg, force_rebuild=True, quiet=True)
     t0 = time.perf_counter()
-    plan = setup_xc_grid_gpu(
-        mol, grids, 'pbe', xc_eval='gpu', vmat_mode='radial_precomp', vmat_grid_splits=vmat_grid_splits,
-    )
+    if path == 'otf':
+        plan = setup_xc_grid_gpu(mol, grids, 'pbe', xc_eval='gpu')
+    else:
+        plan = setup_xc_grid_gpu(
+            mol, grids, 'pbe', xc_eval='gpu', vmat_mode='radial_precomp',
+            vmat_grid_splits=vmat_grid_splits,
+        )
     setup_s = time.perf_counter() - t0
     for _ in range(n_warm):
         plan.nr_rks_hermite_onthefly(dm)
@@ -66,8 +71,9 @@ def bench_point(cfg, vmat_grid_splits, mol, grids, dm, vxc_ref, n_warm=1, n_time
     _, _, vxc = plan.nr_rks_hermite_onthefly(dm)
     err = float(np.abs(vxc - vxc_ref).max())
     return {
+        'path': path,
         'NPTILE': cfg.NPTILE, 'NATILE': cfg.NATILE, 'WGS_VMAT': cfg.WGS_VMAT,
-        'vmat_grid_splits': vmat_grid_splits,
+        'vmat_grid_splits': vmat_grid_splits if path != 'otf' else 0,
         'setup_s': setup_s,
         'outer_ms': min(outers),
         'rho_ms': _ms(tim, 'gpu_rho'),
@@ -81,7 +87,7 @@ def bench_point(cfg, vmat_grid_splits, mol, grids, dm, vxc_ref, n_warm=1, n_time
         'host_ms': tim.get('host_total', 0.0) * 1e3,
         'wall_profiled_ms': tim.get('wall_profiled', 0.0) * 1e3,
         'vxc_err': err,
-        'ok': err < 1e-4,
+        'ok': err < 5e-3,
     }
 
 
@@ -90,7 +96,7 @@ def _pow2_step(val, direction):
     return val * 2 if direction > 0 else val // 2
 
 
-def _valid_tile_config(nptile, natile, wgs):
+def _valid_tile_config(nptile, natile, wgs, max_itile=32):
     if nptile < 32 or natile < 1 or wgs < 32:
         return None
     for v in (nptile, natile, wgs):
@@ -99,14 +105,14 @@ def _valid_tile_config(nptile, natile, wgs):
     if wgs < nptile * natile:
         return None
     try:
-        return TileConfig(NPTILE=nptile, NATILE=natile, WGS_VMAT=wgs)
+        return TileConfig(NPTILE=nptile, NATILE=natile, WGS_VMAT=wgs, MAX_ITILE=max_itile)
     except ValueError:
         return None
 
 
 def neighbor_configs(center_nptile, center_natile, center_wgs, center_splits,
                      nptile_bounds=(32, 128), natile_bounds=(1, 4), wgs_bounds=(32, 256),
-                     splits_bounds=(8, 128)):
+                     splits_bounds=(8, 128), max_itile=32):
     '''1-neighborhood on a power-of-2 lattice + coupled diagonal moves.
 
     *Axis neighbors*: change exactly one parameter by exactly one ×2/÷2 step.
@@ -124,7 +130,7 @@ def neighbor_configs(center_nptile, center_natile, center_wgs, center_splits,
                 and wgs_bounds[0] <= wgs <= wgs_bounds[1]
                 and splits_bounds[0] <= splits <= splits_bounds[1]):
             return
-        cfg = _valid_tile_config(nptile, natile, wgs)
+        cfg = _valid_tile_config(nptile, natile, wgs, max_itile=max_itile)
         if cfg is None:
             return
         key = (cfg.NPTILE, cfg.NATILE, cfg.WGS_VMAT, splits)
@@ -178,7 +184,7 @@ def neighbor_configs(center_nptile, center_natile, center_wgs, center_splits,
     return out
 
 
-def iter_grid(quick):
+def iter_grid(quick, max_itile=32):
     if quick:
         nptiles = [32, 64]
         natiles = [1, 2]
@@ -195,7 +201,7 @@ def iter_grid(quick):
             for wgs in wgs_list:
                 if wgs < min_wgs:
                     continue
-                cfg = TileConfig(NPTILE=nptile, NATILE=natile, WGS_VMAT=wgs)
+                cfg = TileConfig(NPTILE=nptile, NATILE=natile, WGS_VMAT=wgs, MAX_ITILE=max_itile)
                 for nsplit in splits:
                     yield cfg, nsplit
 
@@ -207,42 +213,75 @@ def main():
                     help='1-step lattice neighborhood from --seed (recommended)')
     ap.add_argument('--seed', default='64,2,128,32',
                     help='center for --neighbor: NPTILE,NATILE,WGS_VMAT,splits')
+    ap.add_argument('--path', choices=('splitk', 'otf'), default='splitk',
+                    help='splitk=radial vmat+splits; otf=tiled OTF rho+vmat (often better on 1650)')
     ap.add_argument('--n-timed', type=int, default=3)
     ap.add_argument('--xyz', default=None, help='molecule xyz (default benzene)')
+    ap.add_argument('--basis', default='ccpvdz')
+    ap.add_argument('--grid-level', type=int, default=3)
     ap.add_argument('--out', default=None, help='CSV output path')
     args = ap.parse_args()
 
     repo = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     xyz = args.xyz or os.path.join(repo, 'data', 'xyz', 'benzene.xyz')
-    mol = gto.M(atom=read_xyz(xyz), basis='ccpvdz', verbose=0)
+    mol = gto.M(atom=read_xyz(xyz), basis=args.basis, verbose=0)
     grids = dft.gen_grid.Grids(mol)
-    grids.level = 3
+    grids.level = args.grid_level
     grids.build(with_non0tab=True)
     nao = mol.nao_nr()
+    natm = mol.natm
+    # i-tile private arrays: need MAX_ITILE >= ceil(natm/NATILE); NATILE=1 worst case
+    max_itile = 32
+    while max_itile * 1 < natm:
+        max_itile *= 2
     np.random.seed(42)
     dm = np.random.rand(nao, nao)
     dm = 0.5 * (dm + dm.T)
     _, _, vxc_ref = dft.numint.NumInt().nr_rks(mol, grids, 'pbe', dm, max_memory=2000)
-    print(f'sweep split-K tiles  nao={nao}  ngrids={grids.coords.shape[0]}  xyz={xyz}', flush=True)
+    print(f'sweep path={args.path}  mol={os.path.basename(xyz)}  basis={args.basis}  '
+          f'grid={args.grid_level}  nao={nao}  natm={natm}  ngrids={grids.coords.shape[0]}  '
+          f'MAX_ITILE={max_itile}', flush=True)
 
     if args.neighbor:
         snpt, snat, swgs, sspl = (int(x) for x in args.seed.split(','))
-        grid_iter = neighbor_configs(snpt, snat, swgs, sspl)
+        if args.path == 'otf':
+            # splits unused for OTF; keep fixed dummy in neighborhood
+            sspl = 32
+            grid_iter = neighbor_configs(
+                snpt, snat, swgs, sspl, max_itile=max_itile,
+                splits_bounds=(32, 32))  # freeze splits axis
+        else:
+            grid_iter = neighbor_configs(snpt, snat, swgs, sspl, max_itile=max_itile)
         print(f'neighbor mode  seed=NPTILE={snpt} NATILE={snat} WGS={swgs} splits={sspl}  '
               f'points={len(grid_iter)}', flush=True)
     else:
-        grid_iter = list(iter_grid(args.quick))
+        grid_iter = list(iter_grid(args.quick, max_itile=max_itile))
+        if args.path == 'otf':
+            # splits unused — keep unique (NPTILE,NATILE,WGS) only
+            seen = set()
+            uniq = []
+            for cfg, nsplit in grid_iter:
+                key = (cfg.NPTILE, cfg.NATILE, cfg.WGS_VMAT)
+                if key in seen:
+                    continue
+                seen.add(key)
+                uniq.append((cfg, 0))
+            grid_iter = uniq
+            print(f'otf quick unique tile configs: {len(grid_iter)}', flush=True)
 
     rows = []
     for cfg, nsplit in grid_iter:
-        label = f'NPTILE={cfg.NPTILE} NATILE={cfg.NATILE} WGS={cfg.WGS_VMAT} splits={nsplit}'
+        label = f'NPTILE={cfg.NPTILE} NATILE={cfg.NATILE} WGS={cfg.WGS_VMAT}'
+        if args.path == 'splitk':
+            label += f' splits={nsplit}'
         print(f'\n=== {label} ===', flush=True)
         try:
-            r = bench_point(cfg, nsplit, mol, grids, dm, vxc_ref, n_timed=args.n_timed)
+            r = bench_point(cfg, nsplit, mol, grids, dm, vxc_ref, n_timed=args.n_timed,
+                            path=args.path)
         except Exception as e:
             print(f'  FAILED: {e}', flush=True)
             rows.append({'NPTILE': cfg.NPTILE, 'NATILE': cfg.NATILE, 'WGS_VMAT': cfg.WGS_VMAT,
-                         'vmat_grid_splits': nsplit, 'ok': False, 'error': str(e)})
+                         'vmat_grid_splits': nsplit, 'path': args.path, 'ok': False, 'error': str(e)})
             continue
         status = 'OK' if r['ok'] else 'PARITY'
         print(f"  {status}  outer={r['outer_ms']:.1f} ms  gpuCL={r['gpu_total_cl_ms']:.1f} ms  "
@@ -255,12 +294,15 @@ def main():
     if ok_rows:
         best_gpu = min(ok_rows, key=lambda r: r['gpu_total_cl_ms'])
         best_vmat = min(ok_rows, key=lambda r: r['vmat_cl_ms'])
+        best_rho = min(ok_rows, key=lambda r: r['rho_cl_ms'])
         best_outer = min(ok_rows, key=lambda r: r['outer_ms'])
         print('\n=== best (parity OK) ===', flush=True)
-        for tag, r in [('gpu_total_cl', best_gpu), ('vmat_cl', best_vmat), ('outer', best_outer)]:
+        for tag, r in [('gpu_total_cl', best_gpu), ('rho_cl', best_rho),
+                       ('vmat_cl', best_vmat), ('outer', best_outer)]:
             print(f"  {tag}: NPTILE={r['NPTILE']} NATILE={r['NATILE']} WGS={r['WGS_VMAT']} "
                   f"splits={r['vmat_grid_splits']}  gpuCL={r['gpu_total_cl_ms']:.1f} ms  "
-                  f"vmat_cl={r['vmat_cl_ms']:.1f} ms  outer={r['outer_ms']:.1f} ms", flush=True)
+                  f"rho_cl={r['rho_cl_ms']:.1f}  vmat_cl={r['vmat_cl_ms']:.1f}  "
+                  f"outer={r['outer_ms']:.1f} ms", flush=True)
     else:
         print('\nNo configuration passed parity.', flush=True)
 

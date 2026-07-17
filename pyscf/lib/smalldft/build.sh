@@ -2,7 +2,7 @@
 # Quick build of libsmalldft.so (no full PySCF cmake required).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SRC="$ROOT/smalldft/small_grid.c"
+SRC_DIR="$ROOT/smalldft"
 OUT="$ROOT/libsmalldft.so"
 INC="$ROOT"
 # Fallback: pip-installed np_helper for linking
@@ -31,7 +31,7 @@ fi
 gcc -shared -fPIC -O3 -fopenmp -std=c99 \
     -I"$INC" \
     "${TILE_FLAG[@]}" \
-    "$SRC" -o "$OUT" \
+    "$SRC_DIR/small_grid.c" "$SRC_DIR/stream_grid.c" -o "$OUT" \
     -L"$LIBDIR" -lnp_helper -Wl,-rpath,"$LIBDIR" -lgomp \
     "${BLAS_EXTRA[@]}"
-echo "built $OUT"
+echo "built $OUT (small_grid.c + stream_grid.c)"

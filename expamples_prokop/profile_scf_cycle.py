@@ -7,6 +7,9 @@ First get_veff / nr_rks / get_jk call = scf_init; second = scf_cycle.
 
 Pre-SCF (outside kernel): Grids.build, optional GridWorkspace.eval_ao.
 
+For DF+smallDFT production path use --path smallDFT_ws --df --df-storage incore
+(via prepare_smalldft_for_scf). See doc/df_storage_and_benchmark_hygiene.md.
+
 Usage:
   OPENBLAS_NUM_THREADS=1 PYTHONPATH=/home/prokop/git/pyscf \\
     python3 expamples_prokop/profile_scf_cycle.py --mol benzene --threads 8

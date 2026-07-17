@@ -63,6 +63,12 @@ def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
     Returns:
         matrix Veff = J + Vxc.  Veff can be a list matrices, if the input
         dm is a list of density matrices.
+
+    Overlap (``ks.overlap_j_xc``, default True when applicable):
+        For ``backend==2`` (NVIDIA OpenCL GPU XC) with CPU DF-J
+        (``with_df.backend==1``), pure DFT (no hybrid/NLC), CPU ``get_j`` runs
+        concurrently with GPU XC. Wall ≈ max(t_XC, t_J) instead of t_XC+t_J.
+        Set ``mf.overlap_j_xc = False`` to force serial for debugging.
     '''
     if mol is None: mol = ks.mol
     if dm is None: dm = ks.make_rdm1()
@@ -75,51 +81,17 @@ def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
 
     ni = ks._numint
     backend = getattr(ks, 'backend', 1)  # 1=CPU, 2=GPU, 3=both
-    if hermi == 2:  # because rho = 0
-        n, exc, vxc = 0, 0, 0
-    else:
-        max_memory = ks.max_memory - lib.current_memory()[0]
-        if backend & 2:
-            plan = getattr(ks, '_xc_gpu_plan', None)
-            xc_path = getattr(ks, '_gpu_xc_path', 'onthefly')
-            if plan is None:
-                raise RuntimeError('Call mf.setup_gpu() before kernel() when backend uses GPU (backend & 2)')
-            profile = ks.__dict__.get('_gpu_profile', False)
-            if xc_path == 'precomputed':
-                if not getattr(plan, '_pcg_ready', False):
-                    raise RuntimeError('Call mf.setup_gpu() before kernel() when backend uses GPU (backend & 2)')
-                n_gpu, exc_gpu, vxc_gpu = plan.nr_rks_precomputed_gto(dm, profile=profile)
-            else:
-                if not getattr(plan, '_otf_ready', False):
-                    raise RuntimeError('Call mf.setup_gpu() before kernel() when backend uses GPU (backend & 2)')
-                n_gpu, exc_gpu, vxc_gpu = plan.nr_rks_hermite_onthefly(dm, profile=profile)
-            if profile and getattr(plan, 'last_timing', None):
-                acc = ks.__dict__.setdefault('_gpu_timing_acc', {})
-                for k, v in plan.last_timing.items():
-                    acc[k] = acc.get(k, 0.0) + v
-        if backend & 1:
-            n, exc, vxc = ni.nr_rks(mol, ks.grids, ks.xc, dm, max_memory=max_memory)
-        if backend == 3:
-            err_n = abs(n - n_gpu) / max(abs(n), 1e-10)
-            err_exc = abs(exc - exc_gpu) / max(abs(exc), 1e-10)
-            err_vxc = numpy.abs(vxc - vxc_gpu).max()
-            logger.info(ks, 'GPU/CPU comparison: nelec_err=%.2e exc_err=%.2e vxc_max_err=%.2e',
-                        err_n, err_exc, err_vxc)
-        elif backend == 2:
-            n, exc, vxc = n_gpu, exc_gpu, vxc_gpu
-        logger.debug(ks, 'nelec by numeric integration = %s', n)
-        if ks.do_nlc():
-            if ni.libxc.is_nlc(ks.xc):
-                xc = ks.xc
-            else:
-                assert ni.libxc.is_nlc(ks.nlc)
-                xc = ks.nlc
-            n, enlc, vnlc = ni.nr_nlc_vxc(mol, ks.nlcgrids, xc, dm,
-                                          max_memory=max_memory)
-            exc += enlc
-            vxc += vnlc
-            logger.debug(ks, 'nelec with nlc grids = %s', n)
-        t0 = logger.timer(ks, 'vxc', *t0)
+    hybrid = hermi != 2 and ni.libxc.is_hybrid_xc(ks.xc)
+    df_backend = getattr(getattr(ks, 'with_df', None), 'backend', 1)
+    # GPU XC (NVIDIA OpenCL) || CPU f64 DF-J — independent given dm / Δdm.
+    overlap_j = (
+        backend == 2
+        and hermi != 2
+        and not hybrid
+        and not ks.do_nlc()
+        and df_backend == 1
+        and getattr(ks, 'overlap_j_xc', True)
+    )
 
     incremental_jk = (ks._eri is None and ks.direct_scf and
                       getattr(vhf_last, 'vj', None) is not None)
@@ -127,38 +99,104 @@ def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
         _dm = numpy.asarray(dm) - numpy.asarray(dm_last)
     else:
         _dm = dm
-    if not ni.libxc.is_hybrid_xc(ks.xc):
-        vk = None
-        vj = ks.get_j(mol, _dm, hermi)
-        if incremental_jk:
-            vj += vhf_last.vj
-        vxc += vj
-    else:
-        omega, alpha, hyb = ni.rsh_and_hybrid_coeff(ks.xc, spin=mol.spin)
-        if omega == 0:
-            vj, vk = ks.get_jk(mol, _dm, hermi)
-            vk *= hyb
-        elif alpha == 0: # LR=0, only SR exchange
-            vj = ks.get_j(mol, _dm, hermi)
-            vk = ks.get_k(mol, _dm, hermi, omega=-omega)
-            vk *= hyb
-        elif hyb == 0: # SR=0, only LR exchange
-            vj = ks.get_j(mol, _dm, hermi)
-            vk = ks.get_k(mol, _dm, hermi, omega=omega)
-            vk *= alpha
-        else: # SR and LR exchange with different ratios
-            vj, vk = ks.get_jk(mol, _dm, hermi)
-            vk *= hyb
-            vklr = ks.get_k(mol, _dm, hermi, omega=omega)
-            vklr *= (alpha - hyb)
-            vk += vklr
-        if incremental_jk:
-            vj += vhf_last.vj
-            vk += vhf_last.vk
-        vxc += vj - vk * .5
 
-        if ground_state:
-            exc -= numpy.einsum('ij,ji', dm, vk).real * .5 * .5
+    def _gpu_xc():
+        plan = getattr(ks, '_xc_gpu_plan', None)
+        xc_path = getattr(ks, '_gpu_xc_path', 'onthefly')
+        if plan is None:
+            raise RuntimeError('Call mf.setup_gpu() before kernel() when backend uses GPU (backend & 2)')
+        profile = ks.__dict__.get('_gpu_profile', False)
+        if xc_path == 'precomputed':
+            if not getattr(plan, '_pcg_ready', False):
+                raise RuntimeError('Call mf.setup_gpu() before kernel() when backend uses GPU (backend & 2)')
+            n_gpu, exc_gpu, vxc_gpu = plan.nr_rks_precomputed_gto(dm, profile=profile)
+        else:
+            if not getattr(plan, '_otf_ready', False):
+                raise RuntimeError('Call mf.setup_gpu() before kernel() when backend uses GPU (backend & 2)')
+            n_gpu, exc_gpu, vxc_gpu = plan.nr_rks_hermite_onthefly(dm, profile=profile)
+        if profile and getattr(plan, 'last_timing', None):
+            acc = ks.__dict__.setdefault('_gpu_timing_acc', {})
+            for k, v in plan.last_timing.items():
+                acc[k] = acc.get(k, 0.0) + v
+        return n_gpu, exc_gpu, vxc_gpu
+
+    j_future = None
+    _j_pool = None
+    try:
+        if overlap_j:
+            from concurrent.futures import ThreadPoolExecutor
+            # CPU DF-J on worker; GPU XC on this thread (owns OpenCL queue).
+            _j_pool = ThreadPoolExecutor(max_workers=1)
+            j_future = _j_pool.submit(ks.get_j, mol, _dm, hermi)
+
+        if hermi == 2:  # because rho = 0
+            n, exc, vxc = 0, 0, 0
+        else:
+            max_memory = ks.max_memory - lib.current_memory()[0]
+            if backend & 2:
+                n_gpu, exc_gpu, vxc_gpu = _gpu_xc()
+            if backend & 1:
+                n, exc, vxc = ni.nr_rks(mol, ks.grids, ks.xc, dm, max_memory=max_memory)
+            if backend == 3:
+                err_n = abs(n - n_gpu) / max(abs(n), 1e-10)
+                err_exc = abs(exc - exc_gpu) / max(abs(exc), 1e-10)
+                err_vxc = numpy.abs(vxc - vxc_gpu).max()
+                logger.info(ks, 'GPU/CPU comparison: nelec_err=%.2e exc_err=%.2e vxc_max_err=%.2e',
+                            err_n, err_exc, err_vxc)
+            elif backend == 2:
+                n, exc, vxc = n_gpu, exc_gpu, vxc_gpu
+            logger.debug(ks, 'nelec by numeric integration = %s', n)
+            if ks.do_nlc():
+                if ni.libxc.is_nlc(ks.xc):
+                    xc = ks.xc
+                else:
+                    assert ni.libxc.is_nlc(ks.nlc)
+                    xc = ks.nlc
+                n, enlc, vnlc = ni.nr_nlc_vxc(mol, ks.nlcgrids, xc, dm,
+                                              max_memory=max_memory)
+                exc += enlc
+                vxc += vnlc
+                logger.debug(ks, 'nelec with nlc grids = %s', n)
+            t0 = logger.timer(ks, 'vxc', *t0)
+
+        if not hybrid:
+            vk = None
+            if j_future is not None:
+                vj = j_future.result()
+            else:
+                vj = ks.get_j(mol, _dm, hermi)
+            if incremental_jk:
+                vj += vhf_last.vj
+            vxc += vj
+        else:
+            omega, alpha, hyb = ni.rsh_and_hybrid_coeff(ks.xc, spin=mol.spin)
+            if omega == 0:
+                vj, vk = ks.get_jk(mol, _dm, hermi)
+                vk *= hyb
+            elif alpha == 0: # LR=0, only SR exchange
+                vj = ks.get_j(mol, _dm, hermi)
+                vk = ks.get_k(mol, _dm, hermi, omega=-omega)
+                vk *= hyb
+            elif hyb == 0: # SR=0, only LR exchange
+                vj = ks.get_j(mol, _dm, hermi)
+                vk = ks.get_k(mol, _dm, hermi, omega=omega)
+                vk *= alpha
+            else: # SR and LR exchange with different ratios
+                vj, vk = ks.get_jk(mol, _dm, hermi)
+                vk *= hyb
+                vklr = ks.get_k(mol, _dm, hermi, omega=omega)
+                vklr *= (alpha - hyb)
+                vk += vklr
+            if incremental_jk:
+                vj += vhf_last.vj
+                vk += vhf_last.vk
+            vxc += vj - vk * .5
+
+            if ground_state:
+                exc -= numpy.einsum('ij,ji', dm, vk).real * .5 * .5
+    finally:
+        if _j_pool is not None:
+            _j_pool.shutdown(wait=False)
 
     if ground_state:
         ecoul = numpy.einsum('ij,ji', dm, vj).real * .5

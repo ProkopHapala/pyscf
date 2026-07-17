@@ -8,7 +8,13 @@ timestamp: 2026-07-08
 
 ## Summary
 
-**smallDFT** is a CPU fast path for RKS grid XC on small molecules (`nao ≲ 200`, `ngrids ~ 30k–150k`). It replaces PySCF `numint.nr_rks` grid ρ/vmat with **grid-tile OpenMP kernels** in `libsmalldft.so`, keeping libcint AO layout (F-contiguous `(ngrids, nao)`). Python is thin orchestration: AO eval, libxc, ctypes dispatch. The deprecated Python `ThreadPoolExecutor` tile path remains as fallback when `libsmalldft` is not built.
+**smallDFT** is a CPU fast path for RKS grid XC on molecules with `nao ≲ 400`
+(`ngrids ~ 30k–150k`; PTCDA 6-31g ≈ 286). It replaces PySCF `numint.nr_rks`
+grid ρ/vmat with **grid-tile OpenMP kernels** in `libsmalldft.so`, keeping
+libcint AO layout (F-contiguous `(ngrids, nao)`). Python is thin orchestration:
+AO eval, libxc, ctypes dispatch. Prefer
+`prepare_smalldft_for_scf(mf, storage='incore')` for DF+AO setup
+(`doc/df_storage_and_benchmark_hygiene.md`).
 
 libcint already evaluates grid AO blocks with OpenMP. `GridWorkspace` now
 passes reusable raw storage directly to that evaluator, removing the transient
@@ -59,21 +65,25 @@ array for this view.
 
 ```python
 from pyscf import gto, dft, lib
-from pyscf.dft import numint
-from pyscf.smallDFT import nr_rks, GridWorkspace, has_c_lib
+from pyscf.smallDFT import prepare_smalldft_for_scf
 
-lib.num_threads(4)          # OpenMP for C kernels + libcint/libxc
+lib.num_threads(4)
 mol = gto.M(atom=..., basis='6-31g')
-mf = dft.RKS(mol, xc='PBE'); mf.grids.level = 3; mf.grids.build()
-mf.kernel(); dm = mf.make_rdm1()
-ni = numint.NumInt()
+mf = dft.RKS(mol, xc='PBE').density_fit()
+mf.grids.level = 2
+prepare_smalldft_for_scf(mf, storage='incore', max_memory_mb=8000)
+mf.kernel()
+```
 
-# SCF-style: cache AO once per geometry
+Legacy manual API (AO workspace only)::
+
+```python
+from pyscf.smallDFT import nr_rks, GridWorkspace
+from pyscf.dft import numint
 ws = GridWorkspace(mol, mf.grids, deriv=1)
 ws.eval_ao(mol, mf.grids)
-nelec, exc, vmat = nr_rks(ni, mol, mf.grids, 'PBE', dm, n_workers=4, ws=ws)
-
-print('C kernels:', has_c_lib())  # True after build
+nelec, exc, vmat = nr_rks(numint.NumInt(), mol, mf.grids, 'PBE', dm,
+                          n_workers=4, ws=ws)
 ```
 
 ### Monkey-patch dispatch
@@ -141,14 +151,42 @@ Benchmark tables: `/home/prokop/git/pyscf/doc/CPU_benchmark.md` (includes one-SC
 - **Keep libcint χ layout** — no transpose to `(nao, ngrids)`; BLAS strides match F-order tiles.
 - **AO cached across SCF** — `GridWorkspace` + `ws.eval_ao()` once per geometry; biggest win after ρ/vmat are fast.
 
+### AO: ref `block_loop` vs full-grid cache (2026-07-17)
+
+Reference `nr_rks` does **not** keep χ. Each SCF cycle:
+
+```
+for grid block [ip0:ip1]:          # sized to fit max_memory
+    eval_ao(coords[ip0:ip1])     # small buf + shell screening (non0tab)
+    ρ → libxc → vmat on that block
+    discard / reuse AO buf
+```
+
+So AO is recomputed **every iteration** even though χ depends only on geometry/basis/grid (not DM).
+
+smallDFT caches full GGA χ `(4, ngrids, nao)` once (~3.5 GB on PTCDA 6-31g grid2). That removes AO from the cycle path.
+
+**Fill cost (2026-07-17, 4 OMP, 16 GiB laptop, single χ — dual χ OOMs):**
+
+| path | wall | notes |
+|------|------|-------|
+| ref `block_loop` (discard AO) | ~266 ms | never writes 3.5 GB |
+| `ws.eval_ao(blocked=False)` one-shot | **~475 ms** | default; writes full χ once |
+| `ws.eval_ao(blocked=True)` | ~518 ms | same screening + `copyto`; **not faster** than one-shot |
+
+Blocked fill of the cache cannot match ref’s discard pass: materializing χ always pays the ~GB write. Keep one-shot as default. **RAM alternative:** `ao_mode='stream'` (`stream_grid.c`) — block_loop AO + C ρ/vmat, no full χ.
+
 ## Open issues / next work
 
 | P | item | notes |
 |---|------|-------|
-| 1 | Improve RI-J / DF J | dominates the converged cycle after cached XC is accelerated |
-| 2 | Fuse tiled rho → libxc → vmat | requires tile-local vmat reduction; not a direct one-pass GGA fusion |
-| 3 | vmat bandwidth tuning | scales less than rho once all cores are available |
-| 4 | Attach `GridWorkspace` on `mf` in `patch.enable()` | zero setup boilerplate |
+| done | DF `storage='incore'` + `prepare_smalldft_for_scf` | avoids HDF5 J cliff; see hygiene doc |
+| done | C tile scratch prealloc | once per thread, no grow loop |
+| done | Blocked fill of AO cache | implemented; one-shot remains default (faster) |
+| done | Stream ρ/vmat (`ao_mode='stream'`) | `stream_grid.c`; GGA OK (local); PTCDA cycle ~2.8 s vs cache ~0.9 s vs ref ~3.1 s |
+| 2 | GPU / faster AO for scans | few-cycle jobs; geometry changes often |
+| 3 | Attach workspace via `patch.enable()` alone | `prepare_smalldft_for_scf` already does full setup |
+| low | Fuse tiled rho → libxc → vmat | deprioritized |
 
 ## Related docs
 

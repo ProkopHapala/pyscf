@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Per-stage XC timing for benzene — wall+finish vs OpenCL event profiling.
+"""Per-stage XC timing — wall+finish vs OpenCL event profiling.
 
 Usage:
   PYTHONPATH=/home/prokop/git/pyscf OMP_NUM_THREADS=1 python3 -u \\
     expamples_prokop/profile_xc_stages_benzene.py
+  PYTHONPATH=... python3 -u expamples_prokop/profile_xc_stages_benzene.py \\
+    --mol PTCDA --basis 6-31g --grid-level 2
 """
+import argparse
 import os
 import re
 import time
@@ -13,7 +16,7 @@ import numpy as np
 from pyscf import dft, gto, lib
 
 _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-_XYZ = os.path.join(_REPO, 'data', 'xyz', 'benzene.xyz')
+_XYZ_DIR = os.path.join(_REPO, 'data', 'xyz')
 
 MODES = (
     ('CPU libxc', None),
@@ -22,6 +25,7 @@ MODES = (
     ('Radial precomp', 'production_radial'),
     ('OTF ρ + rad vmat', 'production_otf_radial_vmat'),
     ('OTF ρ + rad vmat splitK', 'production_otf_radial_vmat_splitk'),
+    ('Radial screened', 'production_radial_screened'),
 )
 
 
@@ -122,25 +126,35 @@ def print_detail(label, tim):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--mol', default='benzene', help='xyz stem under data/xyz/')
+    ap.add_argument('--basis', default='ccpvdz')
+    ap.add_argument('--grid-level', type=int, default=3)
+    ap.add_argument('--skip-cpu', action='store_true')
+    args = ap.parse_args()
+
     lib.num_threads(1)
     os.environ['OMP_NUM_THREADS'] = '1'
-    mol = gto.M(atom=read_xyz(_XYZ), basis='ccpvdz', verbose=0)
+    xyz = os.path.join(_XYZ_DIR, f'{args.mol}.xyz')
+    mol = gto.M(atom=read_xyz(xyz), basis=args.basis, verbose=0)
     grids = dft.gen_grid.Grids(mol)
-    grids.level = 3
+    grids.level = args.grid_level
     grids.build(with_non0tab=True)
     nao = mol.nao_nr()
     ngrids = grids.coords.shape[0]
     np.random.seed(42)
     dm = np.random.rand(nao, nao)
     dm = 0.5 * (dm + dm.T)
-    print(f'benzene  nao={nao}  ngrids={ngrids}  basis=ccpvdz  OMP=1')
-    print('Profiling: wall = perf_counter after queue.finish(); CL = clGetEventProfilingInfo on kernels\n', flush=True)
+    print(f'{args.mol}  nao={nao}  natm={mol.natm}  ngrids={ngrids}  '
+          f'basis={args.basis}  grid={args.grid_level}  OMP=1')
+    print('Profiling: wall = perf_counter after queue.finish(); CL = OpenCL event profiling\n', flush=True)
 
     ni = dft.numint.NumInt()
     _, _, vxc_ref = ni.nr_rks(mol, grids, 'pbe', dm, max_memory=2000)
 
     rows = []
-    for label, profile in MODES:
+    modes = MODES if not args.skip_cpu else [m for m in MODES if m[1] is not None]
+    for label, profile in modes:
         print(f'--- {label} ---', flush=True)
         try:
             if profile is None:
@@ -148,17 +162,20 @@ def main():
             else:
                 row = run_gpu(profile, mol, grids, dm, vxc_ref)
             rows.append((label, row))
-            print(f"  outer={row['wall_outer']:.1f} ms  sum={row['wall_sum']:.1f} ms  gpu_CL={row['gpu_cl']:.1f} ms  |vxc|={row['vxc_err']:.2e}", flush=True)
+            print(f"  outer={row['wall_outer']:.1f} ms  sum={row['wall_sum']:.1f} ms  "
+                  f"gpu_CL={row['gpu_cl']:.1f} ms  |vxc|={row['vxc_err']:.2e}", flush=True)
             if row.get('timing'):
                 print_detail(label, row['timing'])
         except Exception as e:
             import traceback
             print(f'  FAILED: {e}', flush=True)
             traceback.print_exc()
-            rows.append((label, {k: float('nan') for k in ('setup', 'wall_outer', 'wall_sum', 'gpu_cl', 'rho_w', 'rho_cl', 'vmat_w', 'vmat_cl', 'xc_w', 'host_w', 'vxc_err')}))
+            rows.append((label, {k: float('nan') for k in (
+                'setup', 'wall_outer', 'wall_sum', 'gpu_cl', 'rho_w', 'rho_cl',
+                'vmat_w', 'vmat_cl', 'xc_w', 'host_w', 'vxc_err')}))
 
     print('\n=== timing comparison (ms per veff XC call) ===', flush=True)
-    print('outer = whole function wall; sum = staged wall_profiled; CL = OpenCL event sum for kernels', flush=True)
+    print('outer = whole function wall; sum = staged wall_profiled; CL = kernel events', flush=True)
     print_table(rows)
 
 

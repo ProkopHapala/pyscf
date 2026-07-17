@@ -4,7 +4,8 @@ OpenCL GPU backend for DFT grid XC (ρ, PBE vxc, vmat) and density-fitting J/K. 
 
 - **xc_grid.py** — `XCGridPlan` orchestrator: OTF and precomputed ρ/vmat paths, GPU PBE, stage timing (`last_timing`), hybrid `vmat_mode`
 - **gpu_timing.py** — accurate GPU profiling: `queue.finish()` wall times + `clGetEventProfilingInfo` kernel events
-- **gpu_profiles.py** — named production presets plus `prepare_df_for_scf`: with profile setup enabled, static grids/DF tensors/GPU DF buffers are prepared before `mf.kernel()`
+- **gpu_profiles.py** — named production presets plus `prepare_df_for_scf` / `assert_df_incore`: with profile setup enabled, static grids/DF tensors/GPU DF buffers are prepared before `mf.kernel()`; pass `df_storage='incore'` for deterministic benches (`doc/df_storage_and_benchmark_hygiene.md`)
+- **rks.get_veff** — GPU XC (NVIDIA OpenCL) can overlap CPU f64 DF-J when `mf.overlap_j_xc=True` (default for `production_otf`-style CPU DF)
 - **kernels.cl** — tiled/pair ρ and vmat kernels, radial precomp gather, **split-K vmat + reduce**, quintic Hermite, PBE wv, reductions
 - **pbe.cl** — generated PBE vxc (from libxc via `generate_pbe_cl.py`)
 - **ao_hermite.py** — GPU Hermite AO evaluator; `build_radial_on_grid_gpu` for hybrid/radial vmat

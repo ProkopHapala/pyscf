@@ -132,11 +132,53 @@ def build_gtile_atom_lists(coords, atom_coords, atom_rcut, nptile, natoms, pair_
         'dense_pair_loops_per_gtile': natoms * natoms,
         'sparse_pair_factor': (natoms * natoms) / max(npair_total / max(n_gtile, 1), 1e-9),
     }
-    return {
+    out = {
         'gtile_atom_off': np.asarray(gtile_atom_off, dtype=np.int32),
         'gtile_atom_list': np.asarray(gtile_atom_list, dtype=np.int32),
         'gtile_pair_off': np.asarray(gtile_pair_off, dtype=np.int32),
         'gtile_pair_ij': np.asarray(gtile_pair_ij, dtype=np.int32),
         'atom_rcut': atom_rcut.astype(np.float32),
         'stats': stats,
+    }
+    if pair_screen:
+        out.update(invert_gtile_pairs_to_pair_gtiles(
+            out['gtile_pair_off'], out['gtile_pair_ij'], natoms, n_gtile))
+    return out
+
+
+def upper_pair_id(ia, ja, natoms):
+    '''Packed index for ia <= ja in [0, natoms*(natoms+1)/2).'''
+    if ia > ja:
+        ia, ja = ja, ia
+    return ia * natoms - ia * (ia + 1) // 2 + ja
+
+
+def invert_gtile_pairs_to_pair_gtiles(gtile_pair_off, gtile_pair_ij, natoms, n_gtile):
+    '''Invert gTile→(ia<=ja) lists into pair→gTile CSR for screened vmat.
+
+    Returns:
+      pair_gtile_off  (n_pairs+1,) int32
+      pair_gtile_list (n_active_pair_tiles,) int32 gTile indices
+      n_pairs         int = natoms*(natoms+1)//2
+    '''
+    n_pairs = natoms * (natoms + 1) // 2
+    buckets = [[] for _ in range(n_pairs)]
+    gtile_pair_off = np.asarray(gtile_pair_off, dtype=np.int32)
+    gtile_pair_ij = np.asarray(gtile_pair_ij, dtype=np.int32)
+    for gt in range(n_gtile):
+        p0 = int(gtile_pair_off[gt])
+        p1 = int(gtile_pair_off[gt + 1])
+        for p in range(p0, p1):
+            ia = int(gtile_pair_ij[2 * p])
+            ja = int(gtile_pair_ij[2 * p + 1])
+            buckets[upper_pair_id(ia, ja, natoms)].append(gt)
+    pair_gtile_off = np.zeros(n_pairs + 1, dtype=np.int32)
+    pair_gtile_list = []
+    for pid in range(n_pairs):
+        pair_gtile_list.extend(buckets[pid])
+        pair_gtile_off[pid + 1] = len(pair_gtile_list)
+    return {
+        'pair_gtile_off': pair_gtile_off,
+        'pair_gtile_list': np.asarray(pair_gtile_list, dtype=np.int32),
+        'n_pairs': n_pairs,
     }

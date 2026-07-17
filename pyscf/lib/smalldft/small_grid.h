@@ -28,6 +28,17 @@ void SMALL_vmat_lda(double *vmat, const double *chi, const double *wv,
 void SMALL_vmat_gga(double *vmat, const double *chi, const double *wv,
                     int nao, int ngrids, int nthreads, int hermi);
 
+/* --- stream path (block χ; do not use for full-grid cache) --- */
+void SMALL_stream_rho_lda(double *rho, const double *chi, const double *dm,
+                          int nao, int nblk, int nthreads);
+void SMALL_stream_rho_gga(double *rho, const double *chi, const double *dm,
+                          int nao, int nblk, int nthreads, int hermi);
+void SMALL_stream_vmat_lda_acc(double *vmat, const double *chi, const double *wv,
+                               int nao, int nblk, int nthreads);
+void SMALL_stream_vmat_gga_acc(double *vmat, const double *chi, const double *wv,
+                               int nao, int nblk, int nthreads);
+void SMALL_stream_vmat_hermi(double *vmat, int nao);
+
 #ifdef __cplusplus
 }
 #endif

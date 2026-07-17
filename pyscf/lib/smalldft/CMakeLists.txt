@@ -1,6 +1,6 @@
 # Copyright 2026 The PySCF Developers. All Rights Reserved.
 
-add_library(smalldft SHARED small_grid.c)
+add_library(smalldft SHARED small_grid.c stream_grid.c)
 add_dependencies(smalldft np_helper)
 
 set_target_properties(smalldft PROPERTIES

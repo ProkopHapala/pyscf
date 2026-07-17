@@ -251,11 +251,14 @@ Verified after `SMALL_vmat_gga` (Jul 2026):
 |---|------|-----------------|-------|
 | done | Stride-1 ρ accumulation | 20 ms → 10 ms @8 CPU | loop order changed to `mu` outer, grid `t` inner |
 | done | F-order `aow` / `chi_w` tile buffers | 16 ms → 11 ms @8 CPU | `dgemm("T","N")`; `TILE=512` still best |
-| 1 | Fuse ρ+PBE+vmat single χ tile pass | remove second χ pass + Python libxc call | requires C PBE or libxc C API per tile |
-| 2 | Grid-parallel `eval_gto` / `eval_ao` | reduce once/geometry setup | ~58 ms flat today |
-| 3 | Preallocated C scratch workspace | remove malloc/free per call | supports first-touch and persistent buffers |
-| 4 | `patch.enable()` + `GridWorkspace` on `mf` | zero boilerplate | production ergonomics |
-| 5 | DF J on GPU / faster RI | matters when `--df` | 30 ms/cycle @8 CPU benzene |
+| done | DF `storage='incore'` + prepare order | J stays ~60 ms on PTCDA | hygiene doc; was ~480 ms outcore |
+| done | C tile scratch prealloc | malloc once/thread | `small_grid.c` |
+| done | Stream ρ/vmat (`ao_mode='stream'`) | no 3.5 GB χ; GGA OK | `stream_grid.c`; slower multi-cycle |
+| 2 | GPU / cheaper AO for scans | few-cycle / geometry scans | cache invalidates each geometry |
+| 3 | `patch.enable()` ergonomics | less boilerplate | `prepare_smalldft_for_scf` exists |
+| low | Fuse ρ+PBE+vmat single χ tile | secondary | deprioritized |
+
+**Amdahl PTCDA one-cycle (2026-07-17, 4 OMP, DF incore, separate processes):** cycle veff **cpu_ref 3053 → cpu_stream 2785 → cpu_small(cache) 886 → gpu_otf 1997**. E match cpu paths. Stream saves ~3.5 GB RAM, pays AO every cycle. Driver: `profile_amdahl_budget.py --modes cpu_stream`. Do not allocate two χ buffers on 16 GiB / 0 swap.
 
 ---
 

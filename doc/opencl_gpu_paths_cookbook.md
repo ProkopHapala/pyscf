@@ -50,6 +50,17 @@ three-center tensor build, GPU XC tables/buffers, and (for GPU DF) the resident
 DF-J plan. These are once per geometry/setup, never once per SCF cycle. The
 cycle still recomputes density-dependent rho, PBE, vmat, and J/K.
 
+**DF storage (benchmark hygiene):** default PySCF may spill `_cderi` to HDF5 when
+RAM is tight (`storage='auto'`). For deterministic timings set
+`mf.with_df.storage='incore'` or `apply_gpu_profile(..., df_storage='incore',
+require_df_incore=True)`. Full note: `doc/df_storage_and_benchmark_hygiene.md`.
+
+**CPU DF-J ∥ GPU XC overlap:** for `backend==2` and CPU DF (`with_df.backend==1`),
+pure DFT, `get_veff` runs NVIDIA OpenCL XC on the main thread and f64 DF-J on a
+worker thread concurrently (`mf.overlap_j_xc=True` by default). Wall ≈
+`max(t_XC, t_J)`. Disable with `mf.overlap_j_xc=False`. Not used for hybrid/NLC
+or GPU DF (`fast_full_gpu`).
+
 ---
 
 ## 2. Sub-step variant table

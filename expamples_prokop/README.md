@@ -39,6 +39,7 @@ Custom benchmarks and parity checks for the OpenCL XC/DF GPU path — not upstre
 ## SCF profiling and tuning
 
 - **profile_xc_stages_benzene.py** — per-stage XC timing table (wall + CL events); all paths including split-K; feeds `doc/GPU_benchmark.md`
+- **profile_amdahl_budget.py** — setup vs cycle vs full-job budget; `--df-storage incore|outcore|auto` (default incore); see `doc/df_storage_and_benchmark_hygiene.md`
 - **profile_scf_cycle.py** — full SCF cycle breakdown (J + XC per iteration)
 - **profile_gpu_scf.py** — full SCF convergence profile, per-cycle vxc accuracy
 - **profile_gpu_amdahl_strict.py** — non-overlapping same-input CPU/GPU SCF-cycle Amdahl profile; validates manual `veff` against `mf.get_veff`

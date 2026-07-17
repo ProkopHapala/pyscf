@@ -1,12 +1,20 @@
 '''Named GPU/CPU execution profiles for OpenCL DFT (RKS + DF).
 
 Cookbook: doc/opencl_gpu_paths_cookbook.md
+DF storage / benchmark hygiene: doc/df_storage_and_benchmark_hygiene.md
 
 Usage:
     mf = dft.RKS(mol, xc='PBE').density_fit()
-    from pyscf.OpenCL.gpu_profiles import apply_gpu_profile
+    from pyscf.OpenCL.gpu_profiles import apply_gpu_profile, prepare_df_for_scf
     apply_gpu_profile(mf, 'production_otf')
+    # or CPU-only explicit DF prep with forced RAM tensor:
+    # prepare_df_for_scf(mf, storage='incore', require_incore=True)
     mf.kernel()
+
+Open issues / caveats:
+- DF.storage='auto' can silently spill to HDF5 when AO/GPU buffers eat max_memory;
+  benchmarks should use storage='incore' + require_incore=True.
+- prepare_df_for_scf only hoists lifetime; it does not change contraction math.
 '''
 from __future__ import annotations
 
@@ -60,12 +68,12 @@ GPU_PROFILES = {
     },
     'production_otf': {
         'label': 'production_otf',
-        'description': 'Hermite OTF rho/vmat + GPU PBE; CPU DF J. Default for medium/large molecules. For faster veff XC use production_otf_radial_vmat.',
+        'description': 'Hermite OTF rho/vmat + GPU PBE; CPU DF J (f64), overlapped with GPU XC via mf.overlap_j_xc. Default for medium/large molecules. For faster veff XC use production_otf_radial_vmat.',
         'mf_backend': 2,
         'df_backend': 1,
         'xc_path': 'onthefly',
         'setup_kw': {'xc_eval': 'gpu', 'gpu_xc': 'auto'},
-        'scf_kw': {'conv_tol': 1e-8, 'conv_tol_grad': 1e-5},
+        'scf_kw': {'conv_tol': 1e-8, 'conv_tol_grad': 1e-5, 'overlap_j_xc': True},
         'accuracy': {
             'vxc_max_vs_cpu': '~3e-6',
             'energy_note': 'Converges; final E within ~1e-6 Ha of CPU.',
@@ -111,6 +119,20 @@ GPU_PROFILES = {
         'accuracy': {
             'vxc_max_vs_cpu': '~3e-5',
             'energy_note': 'Split grid dimension in vmat_gga_radial_precomp_pair_splitk; reduce partial vmat on GPU.',
+            'converges_default_scf': True,
+        },
+    },
+    'production_radial_screened': {
+        'label': 'production_radial_screened',
+        'description': 'NEW: radial-precomp R,dR + grid_screen active atoms/pairs for rho+vmat; GPU PBE; CPU DF J. Targets PTCDA-scale sparsity.',
+        'mf_backend': 2,
+        'df_backend': 1,
+        'xc_path': 'onthefly',
+        'setup_kw': {'xc_eval': 'gpu', 'gpu_xc': 'auto', 'rho_mode': 'radial_screened', 'vmat_mode': 'radial_screened'},
+        'scf_kw': {'conv_tol': 1e-8, 'conv_tol_grad': 1e-5, 'overlap_j_xc': True},
+        'accuracy': {
+            'vxc_max_vs_cpu': 'verify vs OTF (~1e-5 expected; screen_eps dependent)',
+            'energy_note': 'Kernels: rho_gga_radial_screened + vmat_gga_radial_screened_pair',
             'converges_default_scf': True,
         },
     },
@@ -232,18 +254,65 @@ def apply_scf_kw(mf, scf_kw):
         setattr(mf, k, v)
 
 
-def prepare_df_for_scf(mf):
-    '''Prepare invariant DF data and GPU buffers before mf.kernel().'''
+def prepare_df_for_scf(mf, storage=None, require_incore=False):
+    '''Prepare invariant DF data and GPU buffers before ``mf.kernel()``.
+
+    This does **not** invent a new DF algorithm. It only makes lifetime and
+    storage policy explicit so the first SCF cycle is not polluted by a
+    hidden ``df.build()`` (and so benchmarks do not silently flip to HDF5).
+
+    Parameters
+    ----------
+    mf : SCF
+        Must already have ``mf.with_df`` (``density_fit()``).
+    storage : {None, 'auto', 'incore', 'outcore'}
+        If set, assigns ``mf.with_df.storage`` before build. ``None`` leaves
+        the current value (default ``'auto'``). See
+        ``doc/df_storage_and_benchmark_hygiene.md``.
+    require_incore : bool
+        After build, raise ``RuntimeError`` unless ``_cderi`` is an in-RAM
+        ndarray. Use in deterministic timing scripts.
+
+    Returns
+    -------
+    mf
+    '''
     dfobj = getattr(mf, 'with_df', None)
     if dfobj is None:
         return mf
+    if storage is not None:
+        dfobj.storage = storage
     if dfobj._cderi is None:
         dfobj.build()
+    kind, detail, nbytes = dfobj.describe_cderi()
+    if require_incore and kind != 'incore':
+        raise RuntimeError(
+            f'prepare_df_for_scf(require_incore=True) but _cderi is {kind} '
+            f'({detail}). Raise max_memory, set storage="incore", or free '
+            f'competing buffers. See doc/df_storage_and_benchmark_hygiene.md')
     if dfobj.backend & 2:
         from pyscf.OpenCL.df_jk import prepare_df_jk_plan
         mf._gpu_df_jk_plan = prepare_df_jk_plan(dfobj, mf.mol.nao_nr())
     mf._df_prepared = True
+    mf._df_storage_kind = kind
+    mf._df_cderi_detail = detail
+    mf._df_cderi_nbytes = nbytes
     return mf
+
+
+def assert_df_incore(mf, where='assert_df_incore'):
+    '''Fail loud if DF tensor is missing or on disk (benchmark guard).'''
+    dfobj = getattr(mf, 'with_df', None)
+    if dfobj is None:
+        raise RuntimeError(f'{where}: mf has no with_df')
+    kind, detail, _ = dfobj.describe_cderi()
+    if kind != 'incore':
+        raise RuntimeError(
+            f'{where}: expected incore _cderi, got {kind} ({detail}). '
+            f'storage={getattr(dfobj, "storage", None)!r} '
+            f'max_memory={dfobj.max_memory}. '
+            f'See doc/df_storage_and_benchmark_hygiene.md')
+    return kind, detail
 
 
 def _ensure_splitk_tile_config(setup_kw, quiet=True):
@@ -260,12 +329,16 @@ def _ensure_splitk_tile_config(setup_kw, quiet=True):
     init_device(tile_config=replace(tc, WGS_VMAT=target_wgs), force_rebuild=True, quiet=quiet)
 
 
-def apply_gpu_profile(mf, name=DEFAULT_PROFILE, setup=True, dm=None):
+def apply_gpu_profile(mf, name=DEFAULT_PROFILE, setup=True, dm=None,
+                      df_storage=None, require_df_incore=False):
     '''Configure mf and prepare invariant XC/DF state before SCF.
 
     With ``setup=True``, grids, GPU XC state, DF tensors, and GPU DF-J
     buffers are prepared before ``mf.kernel()``. Density-dependent XC/J/K
     contractions remain inside each SCF cycle.
+
+    ``df_storage`` / ``require_df_incore`` are forwarded to
+    :func:`prepare_df_for_scf` (see ``doc/df_storage_and_benchmark_hygiene.md``).
     '''
     prof = get_profile(name)
     mf.backend = prof['mf_backend']
@@ -293,7 +366,7 @@ def apply_gpu_profile(mf, name=DEFAULT_PROFILE, setup=True, dm=None):
         else:
             raise ValueError(f'profile {name!r}: xc_path={xc_path!r}')
     if setup:
-        prepare_df_for_scf(mf)
+        prepare_df_for_scf(mf, storage=df_storage, require_incore=require_df_incore)
     mf._gpu_profile_name = name
     return mf
 

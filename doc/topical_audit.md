@@ -20,7 +20,9 @@ GPU offload of the RKS exchange–correlation grid integral (ρ projection → P
 | `pyscf/OpenCL/ao_hermite.py` — GPU Hermite AO setup | active | Optional pre-SCF AO materialization (`ao_proj='hermite_gpu'`) |
 | `pyscf/OpenCL/grid_screen.py` — atom tile screening | active | Rcut from Hermite tails; sparse pair atom lists |
 | `pyscf/OpenCL/df_jk.py` — RI J/K on GPU | active | Separate from XC; `mf.with_df.backend=2` |
-| `pyscf/OpenCL/gpu_profiles.py` | active | named profiles plus static `prepare_df_for_scf`; cookbook in `doc/opencl_gpu_paths_cookbook.md` |
+| `pyscf/OpenCL/gpu_profiles.py` | active | named profiles plus static `prepare_df_for_scf`; `df_storage` / `require_df_incore`; cookbook + `doc/df_storage_and_benchmark_hygiene.md` |
+| `pyscf/df/df.py` — `DF.storage` | active | `'auto'\|'incore'\|'outcore'`; `describe_cderi()`; fail-loud incore |
+| `expamples_prokop/profile_amdahl_budget.py` | active | setup vs cycle vs full-job budget; `--df-storage` default `incore` |
 | `expamples_prokop/profile_xc_stages_benzene.py` | active | Per-stage wall vs CL timing; benzene benchmark driver for `doc/GPU_benchmark.md` |
 | `expamples_prokop/profile_gpu_amdahl_strict.py` | active | Same-input, additive CPU/GPU full-cycle profile; strict reference for large-molecule Amdahl claims |
 | `expamples_prokop/sweep_splitk_tiles.py` | active | `--neighbor` tile/WGS/splits sweep for split-K profile |
@@ -46,11 +48,15 @@ GPU offload of the RKS exchange–correlation grid integral (ρ projection → P
 - XC limited to **LDA + GGA PBE** on GPU eval path; other functionals fall back to CPU libxc (`xc_eval='cpu'`)
 - **Meta-GGA / hybrid / range-separated** not ported
 - Large molecules (nao≈300+): precomp χ can exceed GPU memory; OTF path required
-- Tile defaults tuned on **benzene** — re-validate on other molecules before hard-locking (`sweep_splitk_tiles.py --neighbor`)
+- Tile defaults tuned on **benzene / RTX 3090** — re-validate on other GPUs (`doc/GPU_benchmark_1650.md` for GTX 1650; `sweep_splitk_tiles.py --quick`)
 - `WGS_VMAT` optimal value is **profile-specific** (128 for split-K; 256 default for OTF tiled)
+- On **GTX 1650**, OTF often beats split-K; local mem 48 KiB blocks `NATILE=4` / large tiles; PTCDA SCF prefers CPU `smallDFT` cache over GPU XC
 - `MAX_ITILE` / `MAX_AO_ATOM` compile-time caps — molecules with many atoms per tile need tile reconfig or kernel extension
 - K matrix on GPU via DF exists but PBE RKS production profile uses J only
 - `generate_pbe_cl.py` must be re-run when updating libxc PBE source
+- **DF `storage='auto'`** can silently spill `_cderi` to HDF5 when AO/GPU buffers compete for `max_memory` — always check `describe_cderi()` in large-mol benches (`doc/df_storage_and_benchmark_hygiene.md`)
+- **AO modes:** `ao_mode='cache'` (full χ) or `'stream'` (`stream_grid.c`, no full χ; GGA local OK) via `prepare_smalldft_for_scf`
+- **`get_veff` overlap:** GPU XC ∥ CPU DF-J when `overlap_j_xc=True` (`pyscf/dft/rks.py`); NVIDIA OpenCL + host f64 J
 
 ---
 

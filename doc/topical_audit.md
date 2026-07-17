@@ -6,15 +6,15 @@ tags: [opencl, dft, xc, gpu]
 
 ## Summary
 
-GPU offload of the RKS exchange–correlation grid integral (ρ projection → PBE vxc → vmat) and density-fitting Coulomb J is implemented in `pyscf/OpenCL/`, integrated into `pyscf/dft/rks.py` via `mf.backend` and `mf.setup_gpu()`. Profile setup now hoists static grid/DF/GPU-plan work before `mf.kernel()`; only density-dependent XC/J/K work remains per SCF cycle. **Best per-cycle XC path (benzene cc-pVDZ, RTX 3090):** `production_otf_radial_vmat_splitk` — OTF Hermite ρ + split-K radial-gather vmat (~12 ms gpu CL vs ~21 ms non-split hybrid vs ~29 ms full OTF). Non-split hybrid `production_otf_radial_vmat` remains valid. Default general path: `production_otf` (no radial setup). Stage timing: `gpu_timing.py` (wall+`queue.finish()` and `clGetEventProfilingInfo`). PBE on GPU verified vs libxc; max |vxc| ~3e-5 on benzene (f32 ρ).
+GPU offload of the RKS exchange–correlation grid integral (ρ projection → PBE vxc → vmat) and density-fitting Coulomb J is implemented in `pyscf/OpenCL/`, integrated into `pyscf/dft/rks.py` via `mf.backend` and `mf.setup_gpu()`. Profile setup now hoists static grid/DF/GPU-plan work before `mf.kernel()`; only density-dependent XC/J/K work remains per SCF cycle. **Best per-cycle XC path (benzene cc-pVDZ, RTX 3090):** `production_radial_screened_splitk` — screened radial ρ + split-K screened vmat (~10 ms gpu CL vs ~14 ms OTF splitK vs ~25 ms full OTF). **Best for PTCDA (6-31g, RTX 3090):** same profile at ~73 ms gpu CL (vs ~307 ms OTF splitK, ~94 ms screened without splitK). Non-split `production_radial_screened` and `production_otf_radial_vmat_splitk` remain valid. Default general path: `production_otf` (no radial setup). Stage timing: `gpu_timing.py` (wall+`queue.finish()` and `clGetEventProfilingInfo`). PBE on GPU verified vs libxc; max |vxc| ~3e-5 on benzene (f32 ρ). Screened split-K session: `doc/GPU_screened_splitk_2026-07-17.md`.
 
 ## Implementations
 
 | Location | Status | Notes |
 |----------|--------|-------|
-| `pyscf/OpenCL/xc_grid.py` — `XCGridPlan`, setup/run API | active | ρ/PBE/vmat; `vmat_mode='radial_precomp'`; `vmat_grid_splits` split-K; `plan.last_timing` |
+| `pyscf/OpenCL/xc_grid.py` — `XCGridPlan`, setup/run API | active | ρ/PBE/vmat; `vmat_mode='radial_precomp'` + `'radial_screened'`; `vmat_grid_splits` split-K for both; `plan.last_timing` |
 | `pyscf/OpenCL/gpu_timing.py` — kernel profiling helpers | active | `profile_kernel` (wall+CL events), `profile_call`; requires `PROFILING_ENABLE` queue |
-| `pyscf/OpenCL/kernels.cl` — tiled ρ/vmat, pair kernels | active | OTF tiled/pair, quintic Hermite, radial precomp, **split-K vmat + reduce**, PBE, reductions |
+| `pyscf/OpenCL/kernels.cl` — tiled ρ/vmat, pair kernels | active | OTF tiled/pair, quintic Hermite, radial precomp, **split-K vmat + reduce**, **screened radial ρ/vmat + split-K screened vmat**, PBE, reductions |
 | `pyscf/OpenCL/pbe.cl` — GPU PBE vxc | active | f32 default; f64 path with D2H for high precision; unpolarized PBE only |
 | `pyscf/OpenCL/hermite_spline.py` + `radial_hermite.py` | active | Host radial table build; mapped u-grid, cubic/quintic |
 | `pyscf/OpenCL/ao_hermite.py` — GPU Hermite AO setup | active | Optional pre-SCF AO materialization (`ao_proj='hermite_gpu'`) |
@@ -39,6 +39,7 @@ GPU offload of the RKS exchange–correlation grid integral (ρ projection → P
 | Full path ρ→PBE→vmat vs CPU vxc | max ~3e-5 (benzene cc-pVDZ, f32) | `test_opencl_xc_onthefly.py`, `test_opencl_xc_full_gpu_parity.py` |
 | Hybrid OTF ρ + radial vmat vs CPU vxc | max ~3.15e-5 | `profile_xc_stages_benzene.py`, `production_otf_radial_vmat` |
 | Split-K OTF ρ + radial vmat vs CPU vxc | max ~3.16e-5 | `profile_xc_stages_benzene.py`, `production_otf_radial_vmat_splitk` |
+| Screened radial ρ + split-K screened vmat vs CPU vxc | max ~3.18e-5 (benzene), ~1.64e-3 (PTCDA) | `profile_xc_stages_benzene.py`, `production_radial_screened_splitk` |
 | Quintic OTF ρ vs cubic OTF | shell-dependent; memory-equivalent du | `test_quintic_rho_otf.py` |
 | SCF energy convergence | matches CPU at conv_tol 1e-8 | `profile_gpu_scf.py`, `test_opencl_xc_scf.py` |
 | Hermite AO vs exact GTO | shell-dependent; see quintic report | `test_opencl_hermite_ao.py`, `hermite_radial_study.py` |

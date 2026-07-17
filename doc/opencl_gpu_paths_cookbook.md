@@ -164,7 +164,9 @@ Not a separate “path” — applies on top of any variant above.
 | `debug_xc_libxc` | precomp | coalesced | auto | **cpu** | CPU | 1e-8 | 1e-5 | ~3e-6 | converges |
 | **`production_otf`** | OTF | — | — | gpu | CPU | 1e-8 | 1e-5 | ~3e-5 | default OTF (ρ+vmat Hermite) |
 | **`production_otf_radial_vmat`** | OTF | — | — | gpu | CPU | 1e-8 | 1e-5 | ~3e-5 | OTF ρ + radial vmat (~21 ms benzene) |
-| **`production_otf_radial_vmat_splitk`** | OTF | — | — | gpu | CPU | 1e-8 | 1e-5 | ~3e-5 | **fastest per-cycle** — split-K radial vmat (~12 ms benzene) |
+| **`production_otf_radial_vmat_splitk`** | OTF | — | — | gpu | CPU | 1e-8 | 1e-5 | ~3e-5 | split-K radial vmat (~14 ms benzene) |
+| **`production_radial_screened`** | OTF | — | — | gpu | CPU | 1e-8 | 1e-5 | ~3e-5 | screened radial ρ+vmat (~16 ms benzene, ~94 ms PTCDA) |
+| **`production_radial_screened_splitk`** | OTF | — | — | gpu | CPU | 1e-8 | 1e-5 | ~3e-5 | **fastest per-cycle** — split-K screened vmat (~10 ms benzene, ~73 ms PTCDA) |
 | `production_otf_quintic` | OTF | — | — | gpu | CPU | 1e-8 | 1e-5 | ~3e-5 | quintic spline; half setup table |
 | `production_coalesced` | precomp | coalesced | auto | gpu | CPU | 1e-8 | 1e-5 | ~3e-6 | small/fixed geom |
 | `production_radial` | precomp | radial | hermite_gpu | gpu | CPU | 1e-8 | 1e-5 | ~3e-6 | low χ memory |
@@ -172,7 +174,7 @@ Not a separate “path” — applies on top of any variant above.
 | **`fast_full_gpu`** | OTF | — | — | gpu | **GPU** | **1e-6** | **1e-4** | ~8e-6/veff | ~7e-5 Ha (~0.04 kcal/mol) |
 | `legacy_tiled_rowmajor` | precomp | tiled | auto | gpu | CPU | 1e-8 | 1e-5 | ~3e-6 | use coalesced instead |
 
-**Default:** `production_otf` (general). **Fastest XC per cycle (benzene, RTX 3090):** `production_otf_radial_vmat_splitk` — see `doc/GPU_benchmark.md` and `doc/GPU_optimixation_experience.md`.
+**Default:** `production_otf` (general). **Fastest XC per cycle (RTX 3090):** `production_radial_screened_splitk` — see `doc/GPU_screened_splitk_2026-07-17.md` and `doc/GPU_benchmark.md`.
 
 ### Hybrid OTF ρ + radial vmat
 
@@ -224,7 +226,8 @@ flowchart TD
     C --> I{Optimize veff XC speed?}
     G --> I
     H --> I
-    I -->|yes, max veff XC speed| M[production_otf_radial_vmat_splitk]
+    I -->|yes, max veff XC speed| M[production_radial_screened_splitk]
+    I -->|yes, no screening (small mol)| N[production_otf_radial_vmat_splitk]
     I -->|yes, same accuracy| L[production_otf_radial_vmat]
     I -->|yes, relaxed SCF tol OK| J[fast_full_gpu]
     I -->|no| K[keep CPU DF J + default tol]
@@ -322,6 +325,8 @@ See **Path naming glossary** in `doc/rho_vmat_vxc_GPU_optimization.report.md` §
 | `gpu_hermite_otf` | `production_otf` |
 | `gpu_otf_radial_vmat` | `production_otf_radial_vmat` |
 | `gpu_otf_radial_vmat_splitk` | `production_otf_radial_vmat_splitk` |
+| `gpu_radial_screened` | `production_radial_screened` |
+| `gpu_radial_screened_splitk` | `production_radial_screened_splitk` |
 | `gpu_otf_quintic` | `production_otf_quintic` |
 | `gpu_precomp_coalesced` | `production_coalesced` |
 | `gpu_precomp_radial` | `production_radial` |

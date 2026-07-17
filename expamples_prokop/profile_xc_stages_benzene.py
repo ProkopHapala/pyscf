@@ -26,6 +26,7 @@ MODES = (
     ('OTF ρ + rad vmat', 'production_otf_radial_vmat'),
     ('OTF ρ + rad vmat splitK', 'production_otf_radial_vmat_splitk'),
     ('Radial screened', 'production_radial_screened'),
+    ('Radial screened splitK', 'production_radial_screened_splitk'),
 )
 
 

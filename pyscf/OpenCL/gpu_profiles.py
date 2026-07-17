@@ -136,6 +136,20 @@ GPU_PROFILES = {
             'converges_default_scf': True,
         },
     },
+    'production_radial_screened_splitk': {
+        'label': 'production_radial_screened_splitk',
+        'description': 'NEW: screened radial rho + split-K screened vmat (gTile list sharded across WGs); GPU PBE; CPU DF J. Better occupancy on large-CU GPUs (3090: 82 CUs).',
+        'mf_backend': 2,
+        'df_backend': 1,
+        'xc_path': 'onthefly',
+        'setup_kw': {'xc_eval': 'gpu', 'gpu_xc': 'auto', 'rho_mode': 'radial_screened', 'vmat_mode': 'radial_screened', 'vmat_grid_splits': 4},
+        'scf_kw': {'conv_tol': 1e-8, 'conv_tol_grad': 1e-5, 'overlap_j_xc': True},
+        'accuracy': {
+            'vxc_max_vs_cpu': 'verify vs OTF (~1e-5 expected; screen_eps dependent)',
+            'energy_note': 'Kernels: rho_gga_radial_screened + vmat_gga_radial_screened_pair_splitk + reduce_split_vmat',
+            'converges_default_scf': True,
+        },
+    },
     'production_coalesced': {
         'label': 'production_coalesced',
         'description': 'Precomp chi[iAO,iG] + coalesced rho/vmat + GPU PBE; CPU DF J. Best for small/fixed geometry.',

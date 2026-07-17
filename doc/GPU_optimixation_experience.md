@@ -19,9 +19,21 @@ Distilled from the benzene XC optimization arc (OTF → hybrid radial vmat → s
 | CPU libxc reference | — (~450 ms host) | baseline |
 | OTF cubic (ρ + vmat tiled) | ~28 ms | GPU port |
 | Hybrid OTF ρ + radial vmat | ~21 ms | **precompute in setup, gather in hot loop** |
-| Split-K radial vmat + tile tune | **~12 ms** | **shard serial dimension + 1-neighborhood sweep** |
+| Split-K radial vmat + tile tune | ~14 ms | **shard serial dimension + 1-neighborhood sweep** |
+| Screened radial + split-K + zeroing removal | **~10 ms** | **screening (asymptotic work) + split-K on CSR gTile list + dead-write elimination** |
 
-vmat went from ~23 ms → ~16 ms → **~7 ms**. ρ stayed ~4–5 ms throughout — until vmat was fixed, optimizing ρ would have been mis-prioritized.
+vmat went from ~23 ms → ~16 ms → ~7 ms → **~6 ms**. ρ went from ~5 ms → ~3 ms with screening. Session details: `doc/GPU_screened_splitk_2026-07-17.md`.
+
+### PTCDA (6-31g, grid 2, RTX 3090)
+
+| Stage of work | Per-cycle gpu CL | Main lever |
+|---------------|----------------:|------------|
+| OTF cubic | ~314 ms | baseline GPU |
+| OTF split-K | ~307 ms | split-K on dense grid |
+| Screened radial (no split-K) | ~94 ms | **screening: ~5.8× fewer active pairs** |
+| Screened split-K + zeroing removal | **~73 ms** | **split-K on CSR gTile list + dead-write elimination** |
+
+PTCDA vmat: 194 ms → 188 ms (OTF splitK) → 67 ms (screened) → **45 ms** (screened splitK + zeroing removal).
 
 ---
 

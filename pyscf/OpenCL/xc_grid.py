@@ -1321,8 +1321,8 @@ class XCGridPlan:
         vmat_grid_splits = int(vmat_grid_splits)
         if vmat_grid_splits < 1:
             raise ValueError(f'vmat_grid_splits must be >= 1; got {vmat_grid_splits}')
-        if vmat_grid_splits > 1 and vmat_mode != 'radial_precomp':
-            raise NotImplementedError('vmat_grid_splits>1 is implemented only for vmat_mode=radial_precomp')
+        if vmat_grid_splits > 1 and vmat_mode not in ('radial_precomp', 'radial_screened'):
+            raise NotImplementedError('vmat_grid_splits>1 is implemented only for vmat_mode in (radial_precomp, radial_screened)')
         need_radial = (rho_mode == 'radial_screened') or (vmat_mode in ('radial_precomp', 'radial_screened'))
         need_screen = (rho_mode == 'radial_screened') or (vmat_mode == 'radial_screened')
         buf_rad_val = buf_rad_dr = buf_vmat_partial = None
@@ -1381,9 +1381,14 @@ class XCGridPlan:
             screen_cap['n_atom_list'] = int(gal.size)
             screen_cap['n_pair_list'] = int(pgl.size)
         if vmat_mode == 'radial_screened':
-            vmat_knl = 'vmat_gga_radial_screened_pair'
-            vmat_global = (natoms, natoms * WGS_VMAT)
-            vmat_local = (1, WGS_VMAT)
+            if vmat_grid_splits > 1:
+                vmat_knl = 'vmat_gga_radial_screened_pair_splitk'
+                vmat_global = (natoms, natoms * WGS_VMAT, vmat_grid_splits)
+                vmat_local = (1, WGS_VMAT, 1)
+            else:
+                vmat_knl = 'vmat_gga_radial_screened_pair'
+                vmat_global = (natoms, natoms * WGS_VMAT)
+                vmat_local = (1, WGS_VMAT)
         elif vmat_mode == 'radial_precomp':
             vmat_knl = 'vmat_gga_radial_precomp_pair_splitk' if vmat_grid_splits > 1 else 'vmat_gga_radial_precomp_pair'
             vmat_global = (natoms, natoms * WGS_VMAT, vmat_grid_splits) if vmat_grid_splits > 1 else (natoms, natoms * WGS_VMAT)
@@ -1409,7 +1414,7 @@ class XCGridPlan:
         buf_rho = cl.Buffer(self.ctx, mf.READ_WRITE, 4 * ngrids * fbytes)
         buf_wv = cl.Buffer(self.ctx, mf.READ_WRITE, 4 * ngrids * fbytes)
         buf_vmat = cl.Buffer(self.ctx, mf.READ_WRITE, ncart * ncart * fbytes)
-        if vmat_mode == 'radial_precomp' and vmat_grid_splits > 1:
+        if vmat_mode in ('radial_precomp', 'radial_screened') and vmat_grid_splits > 1:
             buf_vmat_partial = cl.Buffer(self.ctx, mf.READ_WRITE, vmat_grid_splits * ncart * ncart * fbytes)
         buf_dm_sph = cl.Buffer(self.ctx, mf.READ_ONLY, self.nao * self.nao * fbytes)
         buf_vmat_sph = cl.Buffer(self.ctx, mf.READ_WRITE, self.nao * self.nao * fbytes)
@@ -1437,11 +1442,20 @@ class XCGridPlan:
         k_vmat = cl.Kernel(self.prg, vmat_knl)
         k_vmat_reduce = None
         if vmat_mode == 'radial_screened':
-            k_vmat.set_args(buf_coords4, buf_atom_coords_h, buf_rad_val, buf_rad_dr,
-                            buf_radial_l_h, buf_atom_radial_offset_h, buf_atom_radial_list_h,
-                            buf_atom_ao0, buf_atom_nao, buf_wv,
-                            buf_pair_gtile_off, buf_pair_gtile_list, buf_vmat,
-                            np.int32(ncart), np.int32(ngrids), np.int32(natoms))
+            if vmat_grid_splits > 1:
+                k_vmat.set_args(buf_coords4, buf_atom_coords_h, buf_rad_val, buf_rad_dr,
+                                buf_radial_l_h, buf_atom_radial_offset_h, buf_atom_radial_list_h,
+                                buf_atom_ao0, buf_atom_nao, buf_wv,
+                                buf_pair_gtile_off, buf_pair_gtile_list, buf_vmat_partial,
+                                np.int32(ncart), np.int32(ngrids), np.int32(natoms), np.int32(vmat_grid_splits))
+                k_vmat_reduce = cl.Kernel(self.prg, 'reduce_split_vmat')
+                k_vmat_reduce.set_args(buf_vmat_partial, buf_vmat, np.int32(ncart), np.int32(vmat_grid_splits))
+            else:
+                k_vmat.set_args(buf_coords4, buf_atom_coords_h, buf_rad_val, buf_rad_dr,
+                                buf_radial_l_h, buf_atom_radial_offset_h, buf_atom_radial_list_h,
+                                buf_atom_ao0, buf_atom_nao, buf_wv,
+                                buf_pair_gtile_off, buf_pair_gtile_list, buf_vmat,
+                                np.int32(ncart), np.int32(ngrids), np.int32(natoms))
         elif vmat_mode == 'radial_precomp':
             if vmat_grid_splits > 1:
                 k_vmat.set_args(buf_coords4, buf_atom_coords_h, buf_rad_val, buf_rad_dr,
